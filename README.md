@@ -54,6 +54,7 @@ STAGE 2: ./run_stage2_post_embed.sh biology
 
 ### 4. `add_concept_briefs.py`
 - Generates a 2-3 sentence (40–60 word) factual `brief` for each concept.
+- Strips internal document/chunk IDs from briefs and flattens them to a single line.
 
 ### 5. `link_entity_overlap.py`
 - Discovers latent edges between concepts sharing common named entities (genes, tools, pathways, proteins).
@@ -66,8 +67,8 @@ STAGE 2: ./run_stage2_post_embed.sh biology
 - Uses an LLM with Concept A's brief, Concept B's brief, and the forward relation to generate a 1-sentence description for the reverse relation.
 
 ### 8. `export_markdown_wiki.py`
-- Generates clean Markdown files in `concepts/<sluggified_title>.md`.
-- **Frontmatter**:
+- Generates clean Markdown files in `concepts_md/<sluggified_title>.md`.
+- **Frontmatter**: `brief` is a single-line summary without internal provenance IDs; `sources` contains document-level IDs.
   ```yaml
   ---
   title: "Closed-Eye Hallucination"
@@ -77,13 +78,13 @@ STAGE 2: ./run_stage2_post_embed.sh biology
   entities:
     - "Phosphenes"
     - "Visual cortex"
-  source_chunks:
-    - "canon_doc01::chunk_004"
+  sources:
+    - "canon_doc01"
   ---
   ```
-- **Body**: Each paragraph ends with its chunk citation:
+- **Body**: Every paragraph carries document-level citations. Chunk suffixes are removed, and paragraphs missing an inline citation use the concept's known source documents:
   ```markdown
-  Closed-eye hallucination is a visual perception phenomenon occurring when the eyes are closed... [canon_doc01::chunk_004]
+  Closed-eye hallucination is a visual perception phenomenon occurring when the eyes are closed... [canon_doc01]
   ```
 - **# Related Section**:
   ```markdown
