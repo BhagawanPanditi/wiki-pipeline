@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
+from citation_utils import clean_brief_text
+
 # ── Server Configuration ─────────────────────────────────────────────────────
 from pipeline_config import load_global_config
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
@@ -37,7 +39,8 @@ RULES FOR BRIEF GENERATION:
 1. LENGTH: Exactly 2 to 3 dense, well-formed complete sentences (~40 to 60 words).
 2. CONTENT: Capture the core definition, primary technical mechanism, key parameters, or biological function.
 3. RETENTION: Retain exact specific numbers, metrics, or biological/technical codes where relevant.
-4. NO NOISE: SILENTLY OMIT all paper citations, DOIs, author names, and conversational introductory filler (e.g. "This concept is...").
+4. NO CITATIONS: SILENTLY OMIT all paper citations, DOIs, author names, and internal provenance IDs such as [canon_abc123] or [canon_abc123::chunk_001]. The brief must contain no canon_ IDs or chunk IDs.
+5. NO NOISE: SILENTLY OMIT conversational introductory filler (e.g. "This concept is...") and return the brief as a single line.
 
 OUTPUT FORMAT:
 Return valid JSON:
@@ -90,14 +93,15 @@ async def generate_brief_llm(
             )
             raw = response.choices[0].message.content
             parsed = ConceptBriefSchema.model_validate_json(clean_json_string(raw))
-            if parsed.brief and len(parsed.brief.strip()) > 10:
-                return parsed.brief.strip()
+            cleaned_brief = clean_brief_text(parsed.brief)
+            if len(cleaned_brief) > 10:
+                return cleaned_brief
         except Exception:
             if attempt == 9:
-                return get_sentence_fallback(description, max_sentences=2)
+                return clean_brief_text(get_sentence_fallback(description, max_sentences=2))
             await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
 
-    return get_sentence_fallback(description, max_sentences=2)
+    return clean_brief_text(get_sentence_fallback(description, max_sentences=2))
 
 # ── Main Pipeline ────────────────────────────────────────────────────────────
 class ConceptBriefPipeline:
@@ -136,9 +140,7 @@ class ConceptBriefPipeline:
             # Rule: If description is <= 40 words or <= 2 sentences, reuse description directly (with citations stripped)
             sentences = [s for s in re.split(r'(?<=[.!?])\s+', desc) if s.strip()]
             if len(words) <= 40 or len(sentences) <= 2:
-                clean_desc = re.sub(r'\[[a-zA-Z0-9_-]+(?:::chunk_\d+)?\]', '', desc)
-                clean_desc = re.sub(r'\s{2,}', ' ', clean_desc).strip()
-                concept["brief"] = clean_desc
+                concept["brief"] = clean_brief_text(desc)
                 already_briefed += 1
             else:
                 tasks_to_generate.append(concept)

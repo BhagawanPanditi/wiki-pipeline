@@ -23,8 +23,13 @@ import re
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, List, Set, Any
+from typing import List
 from tqdm import tqdm
+
+from citation_utils import (
+    clean_brief_text,
+    clean_chunk_citations as normalize_chunk_citations,
+)
 
 
 def sluggify(title: str) -> str:
@@ -43,30 +48,20 @@ def escape_yaml_string(s: str) -> str:
 
 
 def extract_doc_id(sc: str) -> str:
-    """Extracts document ID from chunk citation (canon_123::chunk_001 -> canon_123)."""
-    return sc.split("::")[0].strip() if "::" in sc else sc.strip()
+    """Extract a document ID from a source chunk (canon_123::chunk_001 -> canon_123)."""
+    if not isinstance(sc, str) or not sc.strip():
+        return ""
+    return sc.split("::", 1)[0].strip()
 
 
 def clean_brief(brief: str) -> str:
-    """Removes all citations and bracket references from the brief."""
-    if not brief:
-        return ""
-    # Strip any citation brackets e.g. [canon_...::chunk_...] or [canon_...]
-    cleaned = re.sub(r'\[(?:canon_[a-zA-Z0-9_-]+(?:::chunk_\d+)?)\]', '', brief)
-    # Also strip any generic [chunk_...] or similar
-    cleaned = re.sub(r'\[[a-zA-Z0-9_-]+::chunk_\d+\]', '', cleaned)
-    # Clean up double spaces
-    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
-    return cleaned
+    """Remove provenance IDs and flatten the brief to one line."""
+    return clean_brief_text(brief)
 
 
 def clean_chunk_citations(text: str) -> str:
-    """Converts all [canon_xxx::chunk_yyy] or [doc::chunk] to [doc], and strips isolated ::chunk_xxx."""
-    # Convert [doc::chunk_xxx] -> [doc]
-    text = re.sub(r'\[([a-zA-Z0-9_-]+)::chunk_\d+\]', r'[\1]', text)
-    # Convert any loose citations
-    text = re.sub(r'\[([a-zA-Z0-9_-]+)::[a-zA-Z0-9_]+\]', r'[\1]', text)
-    return text
+    """Convert chunk-level citations such as [canon_x::chunk_001] to [canon_x]."""
+    return normalize_chunk_citations(text)
 
 
 def deduplicate_paragraph_citations(text: str) -> str:
@@ -84,15 +79,14 @@ def deduplicate_paragraph_citations(text: str) -> str:
 
 def format_description_paragraphs(description: str, source_docs: List[str]) -> str:
     """
-    Formats the concept description:
-    1. Replaces [doc_id::chunk_XXX] with clean document citations [doc_id].
-    2. Deduplicates multiple chunk citations pointing to the same document in the paragraph.
-    3. Separates 'Additionally, it is associated with...' stub resolution sentences
-       into their own clean trailing paragraph with a gap.
-    """
-    # First, globally convert all chunk citations to doc citations
-    clean_desc = clean_chunk_citations(description)
+    Format the description with document-level citations on every paragraph.
 
+    Chunk citations are first reduced to document citations. If a paragraph has
+    no inline citation, known concept source documents are added as a fallback;
+    this is done per paragraph rather than only when the entire description is
+    uncited. Stub-resolution sentences remain in their own trailing paragraph.
+    """
+    clean_desc = clean_chunk_citations(description)
     raw_paras = clean_desc.split("\n\n")
     cleaned_paras = []
     additionally_sentences = []
@@ -102,35 +96,52 @@ def format_description_paragraphs(description: str, source_docs: List[str]) -> s
         if not p_str:
             continue
 
-        # Check for inline or appended "Additionally..." stub absorption sentences
+        # Check for inline or appended "Additionally..." stub absorption sentences.
         add_matches = list(re.finditer(r'(?:^|\s+)(Additionally,\s+.*?)(?=(?:\s+Additionally,)|$)', p_str))
         if add_matches:
             first_add_idx = add_matches[0].start()
             main_text = p_str[:first_add_idx].strip()
-            for m in add_matches:
-                additionally_sentences.append(m.group(1).strip())
+            additionally_sentences.extend(m.group(1).strip() for m in add_matches)
         else:
             main_text = p_str
 
         if main_text:
-            conv_text = deduplicate_paragraph_citations(main_text)
-            cleaned_paras.append(conv_text)
+            cleaned_paras.append(deduplicate_paragraph_citations(main_text))
 
-    # If no inline citations were found anywhere in the main paragraphs, append doc-level citations to the last paragraph
-    if cleaned_paras and source_docs and not any(re.search(r'\[[a-zA-Z0-9_-]+\]', cp) for cp in cleaned_paras):
-        doc_cites = " ".join(f"[{d}]" for d in source_docs)
-        cleaned_paras[-1] = f"{cleaned_paras[-1]} {doc_cites}"
-
-    # Append the stub absorption sentences as a distinct ending paragraph
+    # Keep stub-resolution text in a distinct final paragraph.
     if additionally_sentences:
-        clean_add = []
-        for sent in additionally_sentences:
-            s_clean = deduplicate_paragraph_citations(sent)
-            clean_add.append(s_clean)
-        add_para = " ".join(clean_add)
-        cleaned_paras.append(add_para)
+        cleaned_add = [deduplicate_paragraph_citations(s) for s in additionally_sentences]
+        cleaned_paras.append(" ".join(cleaned_add))
 
-    return "\n\n".join(cleaned_paras) if cleaned_paras else clean_desc.strip()
+    # source_chunks are the graph's provenance for the concept. If they do not
+    # contain a document ID, retain canonical document IDs explicitly cited
+    # elsewhere in the text as a fallback for otherwise-uncited paragraphs.
+    normalized_source_docs = {
+        doc_id
+        for doc_id in (extract_doc_id(sc) for sc in source_docs)
+        if doc_id
+    }
+    known_doc_ids = {doc_id.casefold() for doc_id in normalized_source_docs}
+    fallback_doc_ids = set(normalized_source_docs)
+    for paragraph in cleaned_paras:
+        for doc_id in re.findall(r'\[([a-zA-Z0-9_-]+)\]', paragraph):
+            if doc_id.casefold() in known_doc_ids or doc_id.casefold().startswith("canon_"):
+                fallback_doc_ids.add(doc_id)
+    doc_cites = " ".join(f"[{doc_id}]" for doc_id in sorted(fallback_doc_ids))
+
+    cited_paragraphs = []
+    for paragraph in cleaned_paras:
+        paragraph = deduplicate_paragraph_citations(paragraph)
+        paragraph_doc_ids = re.findall(r'\[([a-zA-Z0-9_-]+)\]', paragraph)
+        has_doc_citation = any(
+            doc_id.casefold() in known_doc_ids or doc_id.casefold().startswith("canon_")
+            for doc_id in paragraph_doc_ids
+        )
+        if not has_doc_citation and doc_cites:
+            paragraph = f"{paragraph.rstrip()} {doc_cites}"
+        cited_paragraphs.append(paragraph)
+
+    return "\n\n".join(cited_paragraphs) if cited_paragraphs else clean_desc.strip()
 
 
 def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
@@ -174,14 +185,18 @@ def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
             continue
 
         aliases = c.get("aliases", [])
-        brief = clean_brief(c.get("brief", "").strip())
+        brief = clean_brief(str(c.get("brief", "") or ""))
         entities = c.get("entities", [])
-        raw_source_chunks = c.get("source_chunks", [])
-        description = c.get("description", "").strip()
+        raw_source_chunks = c.get("source_chunks", []) or []
+        description = str(c.get("description", "") or "").strip()
         outbound_relations = c.get("outbound_relations", [])
 
         # Deduplicate source documents at the document level
-        source_docs = sorted(list({extract_doc_id(sc) for sc in raw_source_chunks if sc.strip()}))
+        source_docs = sorted({
+            extract_doc_id(sc)
+            for sc in raw_source_chunks
+            if isinstance(sc, str) and sc.strip()
+        } - {""})
 
         # Format body paragraphs with document-level citations & separate stub resolution paragraph
         description_body = format_description_paragraphs(description, source_docs)
