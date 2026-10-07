@@ -396,7 +396,7 @@ EXTRACTED CONCEPTS JSON:
                     max_connections=self.concurrency + 20,
                     max_keepalive_connections=self.concurrency
                 ),
-                timeout=httpx.Timeout(300.0, connect=10.0)
+                timeout=httpx.Timeout(450.0, connect=10.0)
             )
             http_clients.append(http_client)
 
