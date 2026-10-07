@@ -1,0 +1,12 @@
+{
+  "servers": [
+    "http://cn17-dgx:8001/v1",
+    "http://cn12-dgx:8001/v1",
+    "http://cn25-a40:8000/v1",
+    "http://cn36-a40:8001/v1",
+    "http://cn27-a40:8002/v1"
+  ],
+  "concurrency_per_server": 50,
+  "model_name": "Qwen/Qwen3.8-27B",
+  "embedding_model": "Qwen/Qwen3-Embedding-8B"
+}
