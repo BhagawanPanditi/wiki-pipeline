@@ -53,9 +53,12 @@ from tqdm import tqdm
 # This stage keeps its own per-server client construction (its two passes need
 # different request timeouts) but uses the shared partitioning, retry ladder,
 # budget and debug log.
-from pipeline_lib import (DebugLogger, StageBudget, atomic_write_json, backoff_delay,
-                          build_parser, classify_error, resolve_settings)
-from pipeline_lib import clean_json_string as _extract_json
+from pipeline_lib.atomic_io import atomic_write_json
+from pipeline_lib.cli import build_parser, resolve_settings
+from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.errors import StageBudget, classify_error
+from pipeline_lib.retry import backoff_delay
+from pipeline_lib.json_repair import clean_json_string as _extract_json
 
 # This stage's payloads are sometimes JSON arrays rather than objects.
 clean_json_string = functools.partial(_extract_json, allow_array=True)

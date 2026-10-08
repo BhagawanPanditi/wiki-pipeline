@@ -29,11 +29,17 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from pipeline_lib import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
-                          CheckpointLog, DebugLogger, ServerPool, StageBudget,
-                          atomic_write_text, build_improvement, build_parser,
-                          clean_json_string, collect_metrics, format_improvement,
-                          format_report, load_cached_chunks, resolve_settings, write_summary)
+from pipeline_lib.atomic_io import atomic_write_text
+from pipeline_lib.checkpoint import CheckpointLog
+from pipeline_lib.chunks import load_cached_chunks
+from pipeline_lib.cli import build_parser, resolve_settings
+from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.errors import StageBudget
+from pipeline_lib.json_repair import clean_json_string
+from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.reporting import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
+                                    build_improvement, collect_metrics,
+                                    format_improvement, format_report, write_summary)
 
 # ── Pydantic Data Schemas for Verification ────────────────────────────────────
 

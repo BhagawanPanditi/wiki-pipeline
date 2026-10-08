@@ -34,9 +34,12 @@ except Exception:
     STOP_WORDS = {"a", "an", "the", "and", "or", "in", "of", "on", "at", "to", "for", "with", "by", "is", "it", "as", "that", "this", "are", "was"}
 
 # ── Server Configuration ─────────────────────────────────────────────────────
-from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
-                          build_parser, clean_json_string, resolve_settings,
-                          sanitize_filename)
+from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
+from pipeline_lib.cli import build_parser, resolve_settings
+from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.errors import StageBudget
+from pipeline_lib.json_repair import clean_json_string
+from pipeline_lib.llm_pool import ServerPool
 
 STAGE = "global-consolidation"
 

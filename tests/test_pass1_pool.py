@@ -34,7 +34,7 @@ if "transformers" not in sys.modules:
     sys.modules["transformers"] = stub
 
 import concept_extraction_pass_1 as pass1  # noqa: E402
-from pipeline_lib import ServerPool  # noqa: E402
+from pipeline_lib.llm_pool import ServerPool
 from tests.fake_vllm import FakeVLLMCluster, FakeVLLMServer  # noqa: E402
 
 GOOD = {"concepts": [{"title": "Real Concept", "description": "A description.",

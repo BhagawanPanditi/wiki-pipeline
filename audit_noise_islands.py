@@ -22,8 +22,11 @@ from typing import Any, Dict, List, Optional, Set
 import networkx as nx
 from tqdm import tqdm
 
-from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
-                          build_parser, resolve_settings)
+from pipeline_lib.atomic_io import atomic_write_json
+from pipeline_lib.cli import build_parser, resolve_settings
+from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.errors import StageBudget
+from pipeline_lib.llm_pool import ServerPool
 
 STAGE = "island-audit"
 

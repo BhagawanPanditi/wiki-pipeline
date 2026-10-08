@@ -18,7 +18,7 @@ from typing import Dict, List, Set, Any, Tuple
 import networkx as nx
 from tqdm import tqdm
 
-from pipeline_lib import atomic_write_json
+from pipeline_lib.atomic_io import atomic_write_json
 
 def normalize_entity(ent: str) -> str:
     return ent.strip().lower()
