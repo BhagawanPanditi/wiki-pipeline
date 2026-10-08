@@ -40,12 +40,25 @@ class VerificationMetrics:
     sample_missed_facts: List[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        """Replace the mutable-default sentinels with empty lists.
+
+        ``None`` is used as the field default because a dataclass cannot safely default
+        to a shared list. This runs after ``__init__`` so callers may omit both sample
+        fields and still get independent, mutable lists.
+
+        Returns:
+            None."""
         if self.sample_missed_concepts is None:
             self.sample_missed_concepts = []
         if self.sample_missed_facts is None:
             self.sample_missed_facts = []
 
     def to_dict(self) -> Dict[str, Any]:
+        """Render the metrics as a plain dict for JSON output.
+
+        Returns:
+            Every field of this dataclass, via ``dataclasses.asdict``. Written into
+            ``verification_summary.json`` so the two phases can be compared offline."""
         return asdict(self)
 
 
@@ -119,12 +132,29 @@ def format_report(domain: str, metrics: VerificationMetrics) -> str:
 
 
 def _delta_pct(before: float, after: float) -> Optional[float]:
+    """Express a change as a percentage of the earlier value.
+
+    Args:
+        before: The Pass 1 value.
+        after: The Pass 2 value.
+
+    Returns:
+        The signed percentage change, or ``None`` when ``before`` is zero -- a
+        division that would be meaningless, which the report renders as "n/a"
+        rather than as an infinite improvement."""
     if before == 0:
         return None
     return ((after - before) / before) * 100.0
 
 
 def _fmt_pct(value: Optional[float]) -> str:
+    """Format a percentage delta for the improvement table.
+
+    Args:
+        value: A signed percentage, or ``None`` when the delta is undefined.
+
+    Returns:
+        ``"+12.3%"``-style text, or ``"n/a"`` for ``None``."""
     return "n/a" if value is None else f"{value:+.1f}%"
 
 

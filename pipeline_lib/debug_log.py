@@ -25,6 +25,14 @@ class DebugLogger:
 
     def __init__(self, path: Path, *, enabled: bool = True, fsync_every: int = 20,
                  label: str = "debug"):
+        """Prepare a debug sink; the file is opened on first write.
+
+        Args:
+            path: JSONL file to append to.
+            enabled: When ``False`` every write becomes a no-op, so a caller can disable
+                debug output without branching at each call site.
+            fsync_every: How many records may be written before forcing an ``fsync``.
+            label: Stage name recorded on each line."""
         self.path = Path(path)
         self.enabled = enabled
         self.fsync_every = max(1, fsync_every)
@@ -88,10 +96,26 @@ class DebugLogger:
         )
 
     async def aerror(self, context: str, exc: BaseException, **kwargs: Any) -> None:
+        """Awaitable form of :meth:`error`, offloaded to a thread.
+
+        Args:
+            context: Free-form description of where the failure happened.
+            exc: The exception to record.
+            **kwargs: Extra fields, forwarded to :meth:`error`.
+
+        Returns:
+            None. The blocking write and optional ``fsync`` happen off the event loop so
+            a failing stage cannot stall the requests still in flight."""
         await asyncio.to_thread(self.error, context, exc, **kwargs)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def close(self) -> None:
+        """Flush, fsync and close the file if it was opened.
+
+        Returns:
+            None. Safe to call repeatedly and safe when nothing was ever written. An
+            ``OSError`` during the final flush is ignored so teardown cannot mask the
+            error that ended the stage."""
         with self._lock:
             if self._handle is not None:
                 try:
@@ -103,9 +127,20 @@ class DebugLogger:
                 self._handle = None
 
     def __enter__(self) -> "DebugLogger":
+        """Return the logger for use in a ``with`` block.
+
+        Returns:
+            This logger."""
         return self
 
     def __exit__(self, *exc_info: Any) -> None:
+        """Close the logger when leaving a ``with`` block.
+
+        Args:
+            *exc_info: Ignored exception context.
+
+        Returns:
+            None. Never suppresses an exception."""
         self.close()
 
 

@@ -144,6 +144,18 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
     stage_override = overrides.get(stage, {}) if isinstance(overrides, dict) else {}
 
     def pick(cli_value: Any, override_key: str, default: Any) -> Any:
+        """Resolve one tunable by precedence.
+
+        Args:
+            cli_value: The value from the command line. ``None`` and ``0`` both mean
+                "not specified", which is what makes ``--concurrency_per_server 0``
+                usable as "give me the stage default".
+            override_key: Key to look for in this stage's ``config.json`` override.
+            default: The profile's built-in value.
+
+        Returns:
+            The first of the three that was actually specified: CLI, then config.json,
+            then the profile default."""
         if cli_value not in (None, 0):
             return cli_value
         if isinstance(stage_override, dict) and override_key in stage_override:

@@ -65,19 +65,47 @@ class CheckpointLog:
     """
 
     def __init__(self, path: Path, *, flush_every: int = 25):
+        """Open a checkpoint log, loading any state already on disk.
+
+        Args:
+            path: JSON file holding ``{item_key: completed}``.
+            flush_every: How many marks may accumulate before a flush is required. A
+                crash loses at most this many marks, and because the write is atomic
+                the file on disk is always parseable."""
         self.path = Path(path)
         self.flush_every = max(1, flush_every)
         self.data: Dict[str, bool] = load_bool_log(self.path)
         self._dirty = 0
 
     def is_done(self, key: str) -> bool:
+        """Report whether one item is already complete.
+
+        Args:
+            key: Item key.
+
+        Returns:
+            ``True`` when the key is present and marked complete. A key recorded as
+            ``False`` (started but not finished) counts as not done, so resume retries it."""
         return bool(self.data.get(key, False))
 
     def mark(self, key: str, completed: bool = True) -> None:
+        """Record an item's completion state.
+
+        Args:
+            key: Item key.
+            completed: ``True`` for a finished item. Passing ``False`` marks an item as
+                started-but-incomplete, which :meth:`reset_incomplete` later clears.
+
+        Returns:
+            None. The write is deferred until :meth:`flush`."""
         self.data[key] = completed
         self._dirty += 1
 
     def needs_flush(self) -> bool:
+        """Whether enough marks have accumulated to warrant a write.
+
+        Returns:
+            ``True`` once ``flush_every`` marks are pending."""
         return self._dirty >= self.flush_every
 
     def pending(self, keys: Iterable[str]) -> List[str]:
@@ -100,11 +128,23 @@ class CheckpointLog:
         return removed
 
     async def flush(self) -> None:
+        """Atomically write pending marks without blocking the loop.
+
+        Returns:
+            None. Does nothing when no mark is pending, so calling it unconditionally
+            at the end of a stage is cheap."""
         if self._dirty:
             await save_log_async(self.path, dict(self.data))
             self._dirty = 0
 
     def flush_sync(self) -> None:
+        """Synchronous counterpart of :meth:`flush`.
+
+        For use outside a coroutine, such as a ``finally`` block in synchronous code or
+        an interpreter shutdown hook.
+
+        Returns:
+            None. Does nothing when no mark is pending."""
         if self._dirty:
             save_log_sync(self.path, dict(self.data))
             self._dirty = 0

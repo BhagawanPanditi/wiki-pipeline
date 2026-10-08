@@ -45,6 +45,11 @@ class PoolResult:
 
     @property
     def failed_count(self) -> int:
+        """Number of items that did not complete.
+
+        Returns:
+            The length of :attr:`failures`. Provided so callers can test for a clean
+            run without touching the failure records themselves."""
         return len(self.failures)
 
     def raise_if_failed(self, label: str, *, examples: int = 10) -> None:
@@ -95,6 +100,23 @@ class ServerPool:
         unhealthy_threshold: int = 3,
         llm_log: Optional[LLMCallLog] = None,
     ):
+        """Configure a pool; no connection is opened yet.
+
+        Args:
+            servers: vLLM OpenAI-compatible base URLs. Blank entries are dropped.
+            concurrency_per_server: In-flight requests allowed per server.
+            request_timeout: Per-request read timeout in seconds.
+            connect_timeout: Optional separate connection timeout in seconds.
+            max_connections_slack: Extra httpx connections above the concurrency cap.
+            label: Stage name used in log messages and retry labels.
+            failover: Whether to move work off a server that stops responding.
+            unhealthy_threshold: Consecutive transient failures before a server is
+                retired for the rest of this map.
+            llm_log: Optional call log; every request is appended to it when given.
+
+        Raises:
+            RuntimeError: If no usable server URL was supplied.
+            ValueError: If ``concurrency_per_server`` is below 1."""
         cleaned = [s for s in servers if isinstance(s, str) and s.strip()]
         if not cleaned:
             raise RuntimeError(f"{label}: no usable LLM servers configured.")
@@ -124,6 +146,16 @@ class ServerPool:
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def _build_clients(self) -> None:
+        """Create one httpx client and one SDK client per server.
+
+        Called on entering the async context, not in ``__init__``, because building an
+        ``httpx.AsyncClient`` binds it to the running event loop. Also resets the
+        per-server health and request counters, so a pool reused for a second ``map``
+        starts from a clean slate.
+
+        Returns:
+            None. Populates ``_http``, ``_clients``, ``_healthy``, ``_served`` and
+            ``_consecutive_failures``."""
         timeout = (httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
                    if self.connect_timeout else httpx.Timeout(self.request_timeout))
         limits = httpx.Limits(max_connections=self.concurrency_per_server + self.max_connections_slack)
@@ -138,13 +170,31 @@ class ServerPool:
         self._served = [0] * len(self.servers)
 
     async def __aenter__(self) -> "ServerPool":
+        """Build the clients and return the pool for use in ``async with``.
+
+        Returns:
+            This pool, ready to :meth:`map`."""
         self._build_clients()
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
+        """Close every connection when leaving an ``async with`` block.
+
+        Args:
+            *exc_info: Ignored exception context.
+
+        Returns:
+            None. Never suppresses an in-flight exception."""
         await self.aclose()
 
     async def aclose(self) -> None:
+        """Release all httpx connections and flush the call log.
+
+        Safe to call more than once. A failure to close one client is swallowed so
+        teardown cannot mask the error that ended the stage.
+
+        Returns:
+            None."""
         for client in self._http:
             try:
                 await client.aclose()
@@ -160,10 +210,20 @@ class ServerPool:
 
     @property
     def healthy_servers(self) -> List[str]:
+        """Server URLs still considered usable.
+
+        Returns:
+            The subset of :attr:`servers` not retired by repeated transient failures."""
         return [s for s, ok in zip(self.servers, self._healthy) if ok]
 
     @property
     def per_server_counts(self) -> Dict[str, int]:
+        """Requests actually issued to each server.
+
+        Returns:
+            ``{server_url: request_count}`` for every configured server, including
+            those that served nothing. Counts attempts, not items, so a retried item
+            is counted on each server that tried it."""
         return dict(zip(self.servers, self._served))
 
     def _mark_failure(self, index: int, classification: str) -> None:
@@ -175,6 +235,14 @@ class ServerPool:
             self._healthy[index] = False
 
     def _next_healthy(self) -> Optional[int]:
+        """Pick the next server to receive requeued work.
+
+        Rotates through healthy servers so failover does not dump everything onto the
+        first one in the list.
+
+        Returns:
+            The index of a healthy server, or ``None`` when every server has been
+            retired -- which the caller turns into an ``AllServersUnhealthy`` failure."""
         healthy = [i for i, ok in enumerate(self._healthy) if ok]
         if not healthy:
             return None
@@ -224,6 +292,25 @@ class ServerPool:
                     smoothing=0.1, mininterval=0.5)
 
         async def run_item(server_index: int, index: int, item: Any) -> None:
+            """Drive one item to completion, with retries and accounting.
+
+            Applies ``retry_async`` around :func:`call`, then records the outcome: on
+            success the value is appended and ``on_result`` is awaited; on exhaustion the
+            failure is recorded against the item's index so the caller can recover the item
+            from its own list.
+
+            Args:
+                server_index: Index of the server owning this item's queue.
+                index: Position of the item in the caller's sequence.
+                item: The work unit itself.
+
+            Returns:
+                None. Mutates ``result`` and the progress bar; never raises for an ordinary
+                item failure.
+
+            Raises:
+                AllServersUnhealthy: If every server was retired while this item was in
+                flight, which aborts the whole map rather than losing the remaining work."""
             nonlocal outstanding
             key = key_fn(item) if key_fn is not None else str(index)
             client = self._clients[server_index]
@@ -232,6 +319,19 @@ class ServerPool:
             attempts_made = {"n": 0}
 
             async def call() -> Any:
+                """Issue one attempt at this item and publish its identity.
+
+                Increments the server's request counter, then sets the ``CURRENT_CALL``
+                contextvar so a wrapped client can attribute the request to this item, server
+                and attempt number in the call log. A response the handler rejects is recorded
+                separately, because the HTTP exchange itself may well have succeeded.
+
+                Returns:
+                    Whatever the handler returns.
+
+                Raises:
+                    Whatever the handler raises, after logging a rejection if an ``llm_log``
+                    is attached. ``retry_async`` decides whether that is retryable."""
                 self._served[server_index] += 1
                 attempts_made["n"] += 1
                 # Publish the item identity so the wrapped client can attribute
@@ -289,6 +389,23 @@ class ServerPool:
                 pbar.update(1)
 
         async def worker(server_index: int) -> None:
+            """Consume one server's queue until the map is finished.
+
+            Each server has its own worker and its own queue, which is what keeps the
+            spread deterministic: item ``i`` is only ever offered to server ``i % N``. A
+            worker exits when no items remain outstanding and its queue is empty. If its
+            server has been retired, remaining items are handed to another healthy server
+            instead of being dropped.
+
+            Args:
+                server_index: Index of the server this worker serves.
+
+            Returns:
+                None. Runs until the queue is drained.
+
+            Raises:
+                StageBudgetExceeded: Propagated from the budget check, so an expired
+                    wall-clock ceiling stops the map instead of idling on backoff."""
             nonlocal outstanding
             queue = queues[server_index]
             while True:

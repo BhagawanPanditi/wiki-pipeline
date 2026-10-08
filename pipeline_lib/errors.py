@@ -51,6 +51,12 @@ class PermanentFailure(RuntimeError):
     """An item failed for a reason that retrying cannot fix."""
 
     def __init__(self, message: str, *, cause: Optional[BaseException] = None):
+        """Record a failure that must not be retried.
+
+        Args:
+            message: Human-readable reason.
+            cause: The underlying exception, kept so the debug log and the stage's
+                final error message can show what actually went wrong."""
         super().__init__(message)
         self.cause = cause
 
@@ -59,6 +65,12 @@ class TransientFailureExhausted(RuntimeError):
     """An item kept failing transiently and ran out of attempts."""
 
     def __init__(self, message: str, *, attempts: int, cause: Optional[BaseException] = None):
+        """Record that every retry for one item was used up.
+
+        Args:
+            message: Human-readable reason.
+            attempts: How many attempts were made before giving up.
+            cause: The last underlying exception."""
         super().__init__(message)
         self.attempts = attempts
         self.cause = cause
@@ -147,6 +159,12 @@ class StageBudget:
     """
 
     def __init__(self, minutes: Optional[float]):
+        """Start the wall-clock clock for one stage.
+
+        Args:
+            minutes: Budget in minutes. ``None`` or a non-positive value disables the
+                budget entirely, in which case nothing ever expires and ``cap_sleep``
+                passes delays through unchanged."""
         self.minutes = minutes
         self.started_at = time.monotonic()
         self.deadline: Optional[float] = None
@@ -155,17 +173,35 @@ class StageBudget:
 
     @property
     def enabled(self) -> bool:
+        """Whether a budget was actually configured.
+
+        Returns:
+            ``True`` when ``minutes`` was a positive number."""
         return self.deadline is not None
 
     def remaining(self) -> Optional[float]:
+        """Seconds left before the budget expires.
+
+        Returns:
+            The remaining seconds, or ``None`` when no budget is configured. Negative
+            once expired."""
         if self.deadline is None:
             return None
         return max(0.0, self.deadline - time.monotonic())
 
     def elapsed(self) -> float:
+        """Seconds since this budget was created.
+
+        Returns:
+            Elapsed wall-clock seconds as a float."""
         return time.monotonic() - self.started_at
 
     def expired(self) -> bool:
+        """Whether the budget has run out.
+
+        Returns:
+            ``False`` when no budget is configured, otherwise whether the remaining
+            time has reached zero."""
         return self.deadline is not None and time.monotonic() >= self.deadline
 
     def check(self, context: str = "stage") -> None:
