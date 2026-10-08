@@ -23,20 +23,19 @@ LONG = ("This host concept is described in enough detail to exceed the minimum w
         "it reports a sustained throughput of 1240 requests per second at 61 ms latency.")
 
 
-def run(script, args, *, expect_rc=0, timeout=240):
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    proc = subprocess.run([sys.executable, str(REPO_ROOT / script), *args],
-                          cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, timeout=timeout)
-    assert proc.returncode == expect_rc, (
-        f"{script} exit {proc.returncode} (expected {expect_rc})\nARGS: {args}\n"
-        f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    return proc
+from tests.helpers import run_script as run
 
 
 def base_args(base, servers, **extra):
+    """Build the common arguments for a graph-stage test.
+
+    Args:
+        base: Run directory. Its parent becomes ``--wiki_base_dir``.
+        servers: Fake server URLs.
+        **extra: ``flag=value`` pairs appended as ``--flag value``.
+
+    Returns:
+        A list of CLI argument strings."""
     out = ["--wiki_base_dir", str(base.parent), "--servers", *servers,
            "--stage_budget_minutes", "2"]
     for k, v in extra.items():
@@ -50,6 +49,15 @@ class StubResolutionTests(unittest.TestCase):
     SCRIPT = "stub_resolution.py"
 
     def _build(self, root: Path, stubs=3, chunks_each=3):
+        """Write a fixture graph in which several stubs are each cited by several chunks.
+
+        Args:
+            root: Temporary directory to build in.
+            stubs: How many stubs to create.
+            chunks_each: How many chunks cite each stub.
+
+        Returns:
+            The run directory."""
         base = root / "wiki" / "biology"
         (base / "cache").mkdir(parents=True, exist_ok=True)
         (base / "staging").mkdir(parents=True, exist_ok=True)
@@ -77,6 +85,7 @@ class StubResolutionTests(unittest.TestCase):
         return base
 
     def test_major_stubs_resolve_and_spread_across_servers(self):
+        """Major stubs are defined by the LLM, spread evenly across servers, and recorded in the decision log."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp))
             responder = lambda p, i: {"is_valid_concept": True, "title": f"Resolved {i}",
@@ -113,6 +122,7 @@ class StubResolutionTests(unittest.TestCase):
             self.assertTrue(all(r["source_chunks"] for r in synthesized))
 
     def test_invalid_concept_downgrades_to_minor_stub(self):
+        """An invalid LLM answer downgrades a stub to a minor stub rather than failing the run."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), stubs=3)
             with FakeVLLMCluster(3, responder=lambda p, i: {
@@ -127,6 +137,14 @@ class ThinConceptTests(unittest.TestCase):
     SCRIPT = "thin_concept_handler.py"
 
     def _build(self, root: Path, pairs=6):
+        """Write a fixture graph of thin concepts, each paired with a host.
+
+        Args:
+            root: Temporary directory to build in.
+            pairs: How many thin-concept and host pairs to create.
+
+        Returns:
+            The run directory."""
         base = root / "wiki" / "biology"
         base.mkdir(parents=True, exist_ok=True)
         concepts = []
@@ -144,11 +162,20 @@ class ThinConceptTests(unittest.TestCase):
         return base
 
     def test_thin_concepts_fold_into_hosts_and_spread_evenly(self):
+        """Thin concepts are folded into their hosts, with the folds spread evenly across servers."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), pairs=6)
 
             def responder(prompt, i):
                 # Fold into whichever host was offered as candidate 1.
+                """Answer a thin-concept prompt with a fold decision into the host it was offered.
+
+                Args:
+                    prompt: The prompt text sent by the stage.
+                    i: Request index, unused.
+
+                Returns:
+                    A fold decision naming the first candidate host in the prompt."""
                 host = [l for l in prompt.splitlines() if l.startswith("Title: Host")]
                 return {"should_fold": True,
                         "target_host_title": host[0].split("Title: ", 1)[1],
@@ -168,6 +195,7 @@ class ThinConceptTests(unittest.TestCase):
             self.assertTrue(any("Thin" in e for h in hosts for e in h.get("entities", [])))
 
     def test_failed_fold_decisions_fall_through_to_deterministic_rules(self):
+        """A fold the LLM fails to decide falls through to the deterministic rules."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), pairs=3)
             with FakeVLLMCluster(3, responder=lambda p, i: "{not json") as cluster:
@@ -182,6 +210,13 @@ class IslandAuditTests(unittest.TestCase):
     SCRIPT = "audit_noise_islands.py"
 
     def _build(self, root: Path):
+        """Write a fixture graph with a two-concept island and a single lone concept.
+
+        Args:
+            root: Temporary directory to build in.
+
+        Returns:
+            The run directory."""
         base = root / "wiki" / "biology"
         base.mkdir(parents=True, exist_ok=True)
         concepts = []
@@ -206,6 +241,7 @@ class IslandAuditTests(unittest.TestCase):
         return base
 
     def test_islands_audited_and_spread_evenly(self):
+        """Small islands are audited and the audit requests are spread evenly across servers."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp))
             responder = lambda p, i: {"decision": "LINK", "target_sibling": "Concept 0",
@@ -237,6 +273,7 @@ class IslandAuditTests(unittest.TestCase):
                           [r["target_concept"] for r in lone["outbound_relations"]])
 
     def test_prune_decision_drops_noise(self):
+        """A PRUNE verdict removes the island from the graph."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp))
             with FakeVLLMCluster(2, responder=lambda p, i: {"decision": "PRUNE"}) as cluster:
@@ -249,6 +286,7 @@ class IslandAuditTests(unittest.TestCase):
             self.assertIn("Concept 0", titles)
 
     def test_unparseable_verdicts_fail_loudly(self):
+        """Island verdicts the model cannot parse fail the stage."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp))
             with FakeVLLMCluster(2, responder=lambda p, i: "not json") as cluster:

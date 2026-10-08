@@ -24,6 +24,7 @@ import unittest
 from pathlib import Path
 
 from tests.fake_vllm import FakeVLLMCluster
+from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = "concept_extraction_pass_1.py"
@@ -37,33 +38,17 @@ GOOD = {"concepts": [{"title": "Photosynthetic Electron Transport", "aliases": [
 
 
 def run_pass1(args, *, expect_rc=0, timeout=300):
-    """Run Pass 1 as a subprocess and assert on its exit code.
+    """Run concept_extraction_pass_1.py as a subprocess and assert its exit code.
 
     Args:
-        args: CLI arguments, excluding the interpreter and script.
-        expect_rc: Expected process return code.
-        timeout: Seconds to wait before failing the test.
+        args: Command-line arguments after the script name.
+        expect_rc: The exit code the run should produce.
+        timeout: Seconds to wait before the run is abandoned.
 
     Returns:
-        The completed ``subprocess.CompletedProcess``.
-
-    Raises:
-        AssertionError: If the return code differs from ``expect_rc``. The
-            message includes stdout and stderr so failures are diagnosable.
+        The completed process.
     """
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    # Deliberately NOT injecting a transformers stub: unchunked ingestion must
-    # work without it.
-    env.pop("PYTHONPATH", None)
-    proc = subprocess.run([sys.executable, str(REPO_ROOT / SCRIPT), *args],
-                          cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, timeout=timeout)
-    assert proc.returncode == expect_rc, (
-        f"exit {proc.returncode} (expected {expect_rc})\nARGS: {args}\n"
-        f"STDOUT:\n{proc.stdout[-4000:]}\nSTDERR:\n{proc.stderr[-4000:]}")
-    return proc
+    return run_script(SCRIPT, args, expect_rc=expect_rc, timeout=timeout)
 
 
 class CorpusIngestTests(unittest.TestCase):

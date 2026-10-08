@@ -44,6 +44,22 @@ Do not include filler or markdown. Just return the single sentence.
 """
 
 async def synthesize_reverse_relations(domain_dir: Path, args):
+    """Add the missing back-link for every one-way relation.
+
+    Finds each relation A to B that has no matching B to A, and adds one. Legacy
+    template wording ("semantic affinity") is rewritten as well. With ``--fast`` or no
+    servers the sentence comes from a template; otherwise the LLM writes it from both
+    briefs. Each addition is recorded in the decision log.
+
+    Args:
+        domain_dir: Run directory. Reads and rewrites ``global_concepts_refined.json``.
+        args: Parsed CLI namespace. ``args.fast`` forces template synthesis.
+
+    Returns:
+        None.
+
+    Raises:
+        FileNotFoundError: If no concept graph exists."""
     refined_file = domain_dir / "global_concepts_refined.json"
     if not refined_file.exists():
         fallback_file = domain_dir / "global_concepts.json"
@@ -261,6 +277,10 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
     print("Bidirectional relation synthesis complete! Zero stubs guaranteed.")
 
 def main():
+    """Parse the command line and add the reverse relations.
+
+    Returns:
+        None."""
     parser = build_parser(stage=STAGE, description="Synthesize bidirectional relations")
     parser.add_argument("--fast", action="store_true", help="Use template-based synthesis without LLM calls")
 

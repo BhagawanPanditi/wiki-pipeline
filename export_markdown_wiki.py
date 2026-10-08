@@ -139,6 +139,19 @@ def format_description_paragraphs(description: str, source_docs: List[str]) -> s
     return "\n\n".join(cited_paragraphs) if cited_paragraphs else clean_desc.strip()
 
 def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
+    """Write one Markdown page per concept.
+
+    Reads the most complete graph available (refined, then stubs-resolved, then
+    global) and writes an Obsidian-style page for each concept. The brief stays on a
+    single line, and each body paragraph ends with a citation to its source document.
+
+    Args:
+        domain_dir: Run directory the graph was read from.
+        output_dir: Folder to write into. Defaults to ``<run>/concepts_md`` when
+            ``None``.
+
+    Returns:
+        None. Prints how many pages were written."""
     refined_file = domain_dir / "global_concepts_refined.json"
     if not refined_file.exists():
         stubs_file = domain_dir / "global_concepts_stubs_resolved.json"

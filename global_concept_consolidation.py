@@ -46,6 +46,7 @@ except Exception:
 from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
 from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.event_log import EventLog
+from pipeline_lib.text import snippet_description
 from pipeline_lib.layout import log_path, run_dir_for
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
@@ -117,9 +118,19 @@ def canonical_lemma_key(title: str) -> str:
 class UnionFind:
     """Disjoint Set with iterative path compression and cycle prevention."""
     def __init__(self):
+        """Create an empty union-find structure."""
         self.parent: Dict[str, str] = {}
 
     def find(self, item: str) -> str:
+        """Return the root key of the set that contains ``item``.
+
+        Args:
+            item: A concept title or alias.
+
+        Returns:
+            The root key for the item's canonical form, or ``""`` when the title is empty
+            after normalisation. An unseen key becomes its own root. Paths are compressed
+            on the way, using an iterative walk so long chains cannot exhaust the stack."""
         key = canonical_lemma_key(item)
         if not key:
             return ""
@@ -146,6 +157,14 @@ class UnionFind:
         return root
 
     def union(self, item1: str, item2: str):
+        """Join the sets that contain two titles or aliases.
+
+        Args:
+            item1: One title or alias.
+            item2: Another title or alias.
+
+        Returns:
+            None. Does nothing when either item is empty or both already share a root."""
         root1 = self.find(item1)
         root2 = self.find(item2)
         if root1 and root2 and root1 != root2:
@@ -153,21 +172,41 @@ class UnionFind:
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
 
-def snippet_description(text: str, max_words: int = 30) -> str:
-    words = text.strip().split()
-    if len(words) <= max_words:
-        return text.strip()
-    return " ".join(words[:max_words]) + "..."
-
 def get_clean_words(text: str) -> List[str]:
+    """Return the content words of a text, with stopwords removed.
+
+    Args:
+        text: Any text, typically a concept title.
+
+    Returns:
+        Lowercase alphanumeric tokens, minus the stopwords in ``STOP_WORDS``."""
     words = re.findall(r'\b[a-z0-9]+\b', text.lower())
     return [w for w in words if w not in STOP_WORDS]
 
 def get_char_trigrams(text: str) -> Set[str]:
+    """Return the set of character trigrams of a text, padded with a space at each end.
+
+    Args:
+        text: Any text.
+
+    Returns:
+        The set of every three-character window of the lowercased, stripped text.
+        Used for fuzzy similarity."""
     clean = f" {text.lower().strip()} "
     return {clean[i:i+3] for i in range(len(clean) - 2)}
 
 def word_containment_similarity(words_a: List[str], words_b: List[str]) -> float:
+    """Score how much the smaller of two word lists is contained in the other.
+
+    Args:
+        words_a: Content words of the first title.
+        words_b: Content words of the second title.
+
+    Returns:
+        The overlap divided by the size of the smaller set. Returns ``0.0`` when either
+        list is empty, when the smaller set has a single word, or when fewer than two
+        words overlap. That guard stops a generic one-word match, such as "Cell"
+        against "T Cell", from counting as a fuzzy duplicate."""
     set_a, set_b = set(words_a), set(words_b)
     if not set_a or not set_b:
         return 0.0
@@ -181,6 +220,14 @@ def word_containment_similarity(words_a: List[str], words_b: List[str]) -> float
     return intersection / min_len
 
 def char_trigram_jaccard(trigrams_a: Set[str], trigrams_b: Set[str]) -> float:
+    """Compare two trigram sets by Jaccard similarity.
+
+    Args:
+        trigrams_a: Trigram set of the first title, from :func:`get_char_trigrams`.
+        trigrams_b: Trigram set of the second title.
+
+    Returns:
+        Shared trigrams divided by all trigrams, or ``0.0`` if either set is empty."""
     if not trigrams_a or not trigrams_b:
         return 0.0
     intersection = len(trigrams_a.intersection(trigrams_b))
@@ -327,6 +374,20 @@ async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) ->
     return GlobalFuzzyMergeSchema.model_validate_json(cleaned)
 
 async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], args) -> Tuple[List[MergeCluster], List[Dict[str, Any]]]:
+    """Ask the LLM which fuzzy candidate clusters really are the same concept.
+
+    Args:
+        candidate_clusters: Groups of concept dicts that look alike.
+        args: Parsed CLI namespace.
+
+    Returns:
+        A 2-tuple of the approved :class:`MergeCluster` list and one evaluation record
+        per cluster, holding what was sent and what came back. Both are empty when
+        there are no clusters.
+
+    Raises:
+        RuntimeError: If clusters exist but no LLM server is configured, or if any
+            cluster fails after retries. Failed clusters are recorded before the error."""
     if not candidate_clusters:
         return [], []
     if not args.servers:
@@ -438,6 +499,25 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
 
 # ── Core Pipeline Logic ──────────────────────────────────────────────────────
 def global_consolidate(domain_dir: Path, args):
+    """Merge the per-document concepts into one global graph.
+
+    Steps: load every ``consolidated/canon_*/concepts.json``, drop boilerplate titles,
+    merge exact title matches with union-find, find fuzzy candidates and have the LLM
+    confirm them, then fuse each group's aliases, entities, descriptions and citations
+    into one concept. Every exact merge and every approved fuzzy merge is recorded in
+    the decision log.
+
+    Args:
+        domain_dir: Run directory.
+        args: Parsed CLI namespace.
+
+    Returns:
+        None. Writes ``global_concepts.json`` and the audit summary
+        ``global_consolidation.json``.
+
+    Raises:
+        FileNotFoundError: If the ``consolidated/`` folder does not exist.
+        RuntimeError: If no consolidated concepts exist, or if LLM review fails."""
     consolidated_dir = domain_dir / "consolidated"
     concepts_dir = domain_dir / "concepts"
     log_file = domain_dir / "global_consolidation.json"
@@ -716,6 +796,10 @@ def global_consolidate(domain_dir: Path, args):
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 def main():
+    """Parse the command line and run global consolidation.
+
+    Returns:
+        None."""
     parser = build_parser(
         stage=STAGE,
         description="Global Knowledge Graph Consolidation (Exact + Fuzzy Blocking + LLM Verification)")

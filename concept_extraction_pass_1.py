@@ -106,6 +106,14 @@ Return ONLY valid JSON matching this exact structure:
 
 class WikiExtractorPipeline:
     def __init__(self, args):
+        """Prepare Pass 1 extraction, creating the staging and cache folders.
+
+        Args:
+            args: Parsed CLI namespace.
+
+        Sets:
+            Paths for staging, cache and ``extraction_log.json``, and the extraction
+            checkpoint loaded from that file."""
         self.args = args
         self.domain = args.domain
         self.base_wiki_dir = Path(args.wiki_base_dir) / self.domain
@@ -393,6 +401,21 @@ class WikiExtractorPipeline:
                                 debug_payload, encoding="utf-8")
 
     async def run(self):
+        """Extract concepts from every unit of the corpus and persist each result.
+
+        Units come from :meth:`prepare_chunks`, which reuses a validated chunk cache when
+        one matches. Units already recorded as complete are skipped. The rest go through
+        the server pool, and each unit's ``concepts.json`` is written as it finishes. The
+        checkpoint is flushed periodically, so an interrupted run resumes where it
+        stopped.
+
+        Returns:
+            None. Results are in ``staging/<doc>/<chunk>/concepts.json``.
+
+        Raises:
+            RuntimeError: If any unit is still incomplete after retries.
+            StageBudgetExceeded: If the stage's wall-clock budget runs out. The
+                checkpoint is kept, so the run is resumable."""
         self.settings = resolve_settings(self.args, STAGE)
         self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
                                  label=STAGE)

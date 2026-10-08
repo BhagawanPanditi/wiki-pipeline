@@ -11,6 +11,14 @@ import httpx
 from pipeline_config import load_global_config
 
 def main():
+    """Probe every configured LLM server and report which are healthy.
+
+    Reads ``config.json``, sends each server a short request, and prints the result
+    per server. The runner calls this before every stage and again before each retry.
+
+    Returns:
+        None. Exits 2 when ``config.json`` is invalid and 1 when any server is
+        unreachable, so a caller can tell the two apart."""
     servers, concurrency, model = load_global_config()
     if not isinstance(servers, list) or not servers or any(not isinstance(s, str) or not s.strip() for s in servers):
         print("ERROR: config.json must contain a non-empty 'servers' list of URLs.")

@@ -82,6 +82,14 @@ Return valid JSON:
 
 class StubResolver:
     def __init__(self, args):
+        """Prepare stub resolution. Nothing is read until :meth:`run`.
+
+        Args:
+            args: Parsed CLI namespace.
+
+        Sets:
+            Paths to the global graph, the chunk cache and the output file, the stage
+            settings, the debug log and the time budget."""
         self.domain_dir = Path(args.wiki_base_dir) / args.domain
         self.staging_dir = self.domain_dir / "staging"
         self.cache_dir = self.domain_dir / "cache"
@@ -100,6 +108,14 @@ class StubResolver:
         self.chunk_text_map: Dict[str, dict] = {}
 
     def load_data(self):
+        """Load the global graph, the unresolved stubs and the chunk text the stubs cite.
+
+        Returns:
+            None. Fills ``global_concepts``, ``stubs``, ``canonical_titles`` and
+            ``chunk_text_map``.
+
+        Raises:
+            FileNotFoundError: If the global graph or the chunk cache is missing."""
         print("Loading global concepts & log data...")
         if not self.global_file.exists():
             raise FileNotFoundError(f"Missing {self.global_file}. Run global_concept_consolidation.py first.")
@@ -128,6 +144,16 @@ class StubResolver:
         print(f"Loaded {len(self.global_concepts)} concepts, {len(self.stubs)} unresolved stubs, and {len(self.chunk_text_map)} text chunks.")
 
     def build_single_chunk_prompt(self, stub_name: str, sc: str) -> str:
+        """Build the evidence block for one stub in one chunk.
+
+        Args:
+            stub_name: The stub being defined.
+            sc: Source chunk key, ``"<doc_id>::<chunk_id>"``.
+
+        Returns:
+            The chunk's context before, its text and its context after, plus any relation
+            in that chunk that points at the stub. An empty string when there is no
+            evidence at all."""
         if "::" not in sc: return ""
         doc_id, chunk_id = sc.split("::", 1)
         stub_lower = stub_name.lower()
@@ -162,12 +188,37 @@ class StubResolver:
         return "\n".join(context_lines)
 
     async def resolve_major_stub(self, client, stub: dict, server_index: int = 0) -> dict:
+        """Define one major stub from every chunk that cites it.
+
+        Each source chunk is sent separately, five at a time. The valid answers are merged
+        into one concept: aliases and entities are unioned, description sentences are
+        de-duplicated, and relations to known concepts are kept along with the chunks that
+        support them.
+
+        Args:
+            client: ``AsyncOpenAI`` client bound to one server.
+            stub: The stub record, with ``stub_name`` and ``source_chunks``.
+            server_index: Index of the serving server, used only for accounting.
+
+        Returns:
+            A dict whose ``status`` is ``"success"`` (with ``concept``), ``"failed"`` (a
+            chunk never produced a valid answer; ``failed_chunks`` lists them), or
+            ``"downgraded"`` (no chunk gave a valid concept)."""
         stub_name = stub["stub_name"]
         source_chunks = stub.get("source_chunks", [])
         sem = asyncio.Semaphore(5)
         failed_chunks = []
 
         async def process_chunk(sc: str):
+            """Ask the LLM about one chunk, inside the shared five-slot semaphore.
+
+            Args:
+                sc: Source chunk key.
+
+            Returns:
+                ``(sc, extraction)``, where ``extraction`` is ``None`` when the chunk had no
+                evidence or failed after retries. A failed chunk is recorded, so the stub is
+                marked failed rather than quietly shortened. Budget expiry is not caught here."""
             async with sem:
                 context_str = self.build_single_chunk_prompt(stub_name, sc)
                 if not context_str.strip():
@@ -176,6 +227,14 @@ class StubResolver:
                 user_prompt = f"TARGET STUB TO DEFINE: {stub_name}\n\n{context_str}"
                 
                 async def call():
+                    """Make one LLM request for one chunk and validate the answer.
+
+                    Returns:
+                        A validated ``StubConceptExtraction``.
+
+                    Raises:
+                        Pydantic or JSON errors for an invalid answer, so the pool retries it. HTTP
+                        errors propagate as usual."""
                     response = await client.chat.completions.create(
                         model=self.settings.model_name,
                         messages=[
@@ -252,6 +311,19 @@ class StubResolver:
         }
 
     async def run(self):
+        """Resolve the major stubs through the pool, absorb the minor ones, and write the result.
+
+        Stubs cited by more than two chunks are defined by the LLM. Stubs cited by two or
+        fewer are absorbed into the concepts that mention them. Every stub's outcome is
+        written to the decision log.
+
+        Returns:
+            None. Writes ``global_concepts_stubs_resolved.json`` and the summary in
+            ``global_consolidation.json``.
+
+        Raises:
+            RuntimeError: If major stubs exist but no server is configured, or if any major
+                stub fails after retries."""
         self.decisions = EventLog(log_path(self.domain_dir, STAGE, "decisions"), label=STAGE)
         self.load_data()
         major_stubs = [s for s in self.stubs if len(s.get("source_chunks", [])) > 2]
@@ -277,6 +349,15 @@ class StubResolver:
                   f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
 
             async def classify_result(stub, res):
+                """Route one stub's outcome to the right list and to the decision log.
+
+                Args:
+                    stub: The stub record.
+                    res: The dict returned by :meth:`resolve_major_stub`.
+
+                Returns:
+                    None. A success becomes a new concept, a failure is recorded, and a downgrade
+                    joins the minor stubs."""
                 if res["status"] == "success":
                     new_concepts.append(res["concept"])
                     self.decisions.record("stub_synthesized", stub=res["stub"], title=res["concept"]["title"], source_chunks=res["concept"]["source_chunks"], aliases=res["concept"]["aliases"], relations=len(res["concept"]["outbound_relations"]))

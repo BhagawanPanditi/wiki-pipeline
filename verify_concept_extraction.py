@@ -125,6 +125,16 @@ class WikiVerifierPipeline:
     """Audits extracted concepts for one phase and reports aggregate quality."""
 
     def __init__(self, args):
+        """Prepare one verification phase. Phase 1 checks Pass 1; phase 2 checks Pass 2.
+
+        Args:
+            args: Parsed CLI namespace. ``args.phase`` must be 1 or 2.
+
+        Sets:
+            The stage name, settings, paths and the result and log files for this phase.
+
+        Raises:
+            ValueError: If ``--phase`` is not 1 or 2."""
         self.args = args
         self.domain = args.domain
         self.phase = int(args.phase)
@@ -221,6 +231,15 @@ class WikiVerifierPipeline:
 
     # ── single LLM interaction ─────────────────────────────────────────────
     def build_prompt(self, item: Dict[str, Any], concepts_json_raw: str) -> str:
+        """Build the auditor prompt for one unit.
+
+        Args:
+            item: The unit, with its text, its context and its key.
+            concepts_json_raw: The unit's extracted concepts, as JSON text.
+
+        Returns:
+            A prompt that asks the model to score coverage and to list missed concepts and
+            facts, with the required JSON output format."""
         return f"""\
 You are an auditor verifying the extraction quality. Compare the RAW CHUNK against EXTRACTED CONCEPTS JSON.
 Produce a verification report evaluating coverage and factual accuracy.
@@ -358,6 +377,18 @@ EXTRACTED CONCEPTS JSON:
 
     # ── orchestration ──────────────────────────────────────────────────────
     async def run(self) -> None:
+        """Audit every pending unit, then write the phase's summary report.
+
+        Each unit's verdict goes to its own result file and is checkpointed. When every
+        unit is done the report is printed. Phase 2 also prints the improvement over
+        phase 1 and writes ``verification_summary.json``.
+
+        Returns:
+            None.
+
+        Raises:
+            RuntimeError: If units remain without a verdict after retries, or if cached
+                chunks lack the extractions they need."""
         items = self.prepare_verification_items()
         pending = [i for i in items if not self.checkpoint.is_done(i["key"])]
 
@@ -429,6 +460,10 @@ EXTRACTED CONCEPTS JSON:
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
 def main():
+    """Parse the command line and run one verification phase.
+
+    Returns:
+        None."""
     parser = build_parser(
         stage="verification",
         description="Knowledge Graph extraction verifier & auditor (runs per phase)",

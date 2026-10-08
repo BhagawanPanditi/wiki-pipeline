@@ -36,6 +36,7 @@ SERVERS = ["http://s0/v1", "http://s1/v1", "http://s2/v1", "http://s3/v1", "http
 
 class ErrorClassificationTests(unittest.TestCase):
     def test_network_faults_are_transient(self):
+        """Network-level errors are classified as transient."""
         import httpx
         for exc in (asyncio.TimeoutError(), TimeoutError(), ConnectionError(),
                     httpx.ConnectError("down"), httpx.ReadTimeout("slow"),
@@ -43,6 +44,7 @@ class ErrorClassificationTests(unittest.TestCase):
             self.assertEqual(classify_error(exc), TRANSIENT, msg=type(exc).__name__)
 
     def test_http_status_mapping(self):
+        """HTTP status codes map to the expected error classes."""
         import httpx
         import openai
         request = httpx.Request("POST", "http://s0/v1/chat/completions")
@@ -68,12 +70,14 @@ class ErrorClassificationTests(unittest.TestCase):
                          RECOVERABLE)
 
     def test_control_exceptions_never_retry(self):
+        """Budget and failure-control exceptions are never retried."""
         for exc in (StageBudgetExceeded("out of time"), PermanentFailure("bad request"),
                     TransientFailureExhausted("gave up", attempts=4),
                     AllServersUnhealthy("all down")):
             self.assertEqual(classify_error(exc), PERMANENT, msg=type(exc).__name__)
 
     def test_stage_budget_expires_and_caps_sleep(self):
+        """An expired stage budget stops the stage and caps each backoff sleep."""
         budget = StageBudget(minutes=0.0005)  # 30 ms
         self.assertFalse(budget.expired())
         self.assertAlmostEqual(budget.cap_sleep(999.0), budget.remaining(), delta=0.01)
@@ -84,6 +88,7 @@ class ErrorClassificationTests(unittest.TestCase):
             budget.check("test-stage")
 
     def test_unbounded_budget_never_expires(self):
+        """A budget of None never expires."""
         budget = StageBudget(minutes=None)
         self.assertFalse(budget.enabled)
         self.assertIsNone(budget.remaining())
@@ -93,15 +98,21 @@ class ErrorClassificationTests(unittest.TestCase):
 
 class RetryTests(unittest.TestCase):
     def test_backoff_is_capped(self):
+        """Backoff delays grow but never exceed the configured cap."""
         self.assertLessEqual(backoff_delay(TRANSIENT, 1), 24.0)
         self.assertLessEqual(backoff_delay(TRANSIENT, 20), 24.0)
         self.assertLessEqual(backoff_delay(RECOVERABLE, 20), 4.8)
         self.assertLess(backoff_delay(RECOVERABLE, 1), backoff_delay(TRANSIENT, 1) + 1)
 
     def test_succeeds_after_transient_failures(self):
+        """A call that fails transiently and then succeeds returns its value."""
         calls = {"n": 0}
 
         async def flaky():
+            """Fail with a connection error on the first two calls, then return "ok".
+
+            Returns:
+                The string ``"ok"``, returned from the third call onward."""
             calls["n"] += 1
             if calls["n"] < 3:
                 raise ConnectionError("server reset")
@@ -118,6 +129,11 @@ class RetryTests(unittest.TestCase):
         calls = {"n": 0}
 
         async def bad_request():
+            """Raise a 400 Bad Request from the SDK, a permanent error that must never be retried.
+
+            Raises:
+                openai.BadRequestError: Always. retry_async must surface this as
+                PermanentFailure after a single attempt."""
             calls["n"] += 1
             request = httpx.Request("POST", "http://s0/v1")
             raise openai.BadRequestError("max_tokens too large",
@@ -129,7 +145,12 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(calls["n"], 1)
 
     def test_exhausted_transient_raises_with_attempt_count(self):
+        """When every attempt fails transiently, the error reports how many attempts were made."""
         async def always_down():
+            """Always fail with a transient error, so every retry is used up.
+
+            Raises:
+                httpx.ConnectError: Always."""
             raise ConnectionError("refused")
 
         with self.assertRaises(TransientFailureExhausted) as ctx:
@@ -137,9 +158,14 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(ctx.exception.attempts, 3)
 
     def test_budget_stops_retrying(self):
+        """A spent budget stops retries before the attempts are used up."""
         import time
 
         async def always_down():
+            """Always fail with a transient error, so every retry is used up.
+
+            Raises:
+                httpx.ConnectError: Always."""
             raise ConnectionError("refused")
 
         budget = StageBudget(minutes=0.0008)
@@ -152,21 +178,25 @@ class JsonRepairParityTests(unittest.TestCase):
     """The nine original copies were not identical; parity must be preserved."""
 
     def test_default_matches_standard_variant(self):
+        """The default JSON repair matches the standard variant."""
         raw = 'prefix ```json {"a": 1} ``` suffix'
         self.assertEqual(clean_json_string(raw), '{"a": 1}')
         # Standard variant does NOT fall back to a bare object.
         self.assertEqual(clean_json_string('bare {"a": 1} text'), 'bare {"a": 1} text')
 
     def test_pass2_variant_accepts_bare_object(self):
+        """The Pass 2 JSON repair accepts a bare object."""
         raw = 'here is the result {"a": 1} thanks'
         self.assertEqual(clean_json_string(raw, allow_bare_object=True), '{"a": 1}')
 
     def test_final_consolidate_variant_accepts_arrays(self):
+        """The final-consolidation JSON repair accepts a top-level array."""
         raw = '```json [1, 2, 3] ```'
         self.assertEqual(clean_json_string(raw), '```json [1, 2, 3] ```')
         self.assertEqual(clean_json_string(raw, allow_array=True), '[1, 2, 3]')
 
     def test_empty_and_none_safe(self):
+        """The JSON repair returns a safe value for empty and None input."""
         self.assertEqual(clean_json_string(""), "")
 
 
@@ -174,9 +204,21 @@ class ServerPoolBalanceTests(unittest.TestCase):
     """Proves requests are spread evenly instead of racing onto one server."""
 
     def _run(self, items, *, concurrency=4, servers=None, handler=None, **kwargs):
+        """Run one ServerPool map synchronously and return its result.
+
+        Args:
+            items: The items to process.
+            concurrency: In-flight requests per server.
+            servers: Fake server URLs; defaults to the module's SERVERS.
+            handler: The handler to run per item.
+            **kwargs: Forwarded to :meth:`ServerPool.map`.
+
+        Returns:
+            The ``PoolResult``."""
         servers = servers or SERVERS
 
         async def go():
+            """Drive one ServerPool.map to completion and return its result."""
             async with ServerPool(servers, concurrency_per_server=concurrency,
                                   request_timeout=5.0, label="test") as pool:
                 return await pool.map(items, handler, desc=None, show_progress=False,
@@ -187,6 +229,9 @@ class ServerPoolBalanceTests(unittest.TestCase):
     def test_five_items_over_five_servers_get_one_each(self):
         """The exact scenario from the bug report."""
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             return server_index
 
         result = self._run(list(range(5)), concurrency=50, handler=handler)
@@ -197,7 +242,11 @@ class ServerPoolBalanceTests(unittest.TestCase):
         self.assertEqual(result.failed_count, 0)
 
     def test_uneven_item_count_still_balances(self):
+        """An uneven number of items still spreads within one of each server."""
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             return server_index
 
         result = self._run(list(range(7)), concurrency=2, servers=SERVERS[:3],
@@ -208,7 +257,11 @@ class ServerPoolBalanceTests(unittest.TestCase):
         self.assertEqual(sorted(counts), [2, 2, 3])
 
     def test_single_server_tail_item_uses_that_server(self):
+        """A final lone item is dispatched to its designated server."""
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             return server_index
 
         result = self._run([99], concurrency=50, handler=handler)
@@ -221,6 +274,9 @@ class ServerPoolBalanceTests(unittest.TestCase):
         lock = asyncio.Lock()
 
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             async with lock:
                 live[server_index] += 1
                 peak[server_index] = max(peak[server_index], live[server_index])
@@ -234,9 +290,13 @@ class ServerPoolBalanceTests(unittest.TestCase):
         self.assertTrue(all(p >= 1 for p in peak), msg=f"every server used: {peak}")
 
     def test_transient_failure_is_retried_then_succeeds(self):
+        """A transient failure is retried, and the item then succeeds."""
         attempts = {}
 
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             attempts[item] = attempts.get(item, 0) + 1
             if attempts[item] < 2:
                 raise ConnectionError("reset")
@@ -247,11 +307,15 @@ class ServerPoolBalanceTests(unittest.TestCase):
         self.assertEqual(sorted(result.results), list(range(5)))
 
     def test_permanent_failure_recorded_without_retry(self):
+        """A permanent failure is recorded once, without retrying."""
         import httpx
         import openai
         attempts = {}
 
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             attempts[item] = attempts.get(item, 0) + 1
             request = httpx.Request("POST", "http://s0/v1")
             raise openai.BadRequestError("bad", response=httpx.Response(400, request=request),
@@ -263,7 +327,11 @@ class ServerPoolBalanceTests(unittest.TestCase):
         self.assertTrue(all(f["classification"] == "permanent" for f in result.failures))
 
     def test_raise_if_failed_surfaces_examples(self):
+        """A failed map raises an error that names example failures."""
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             raise ValueError("Response truncated")
 
         result = self._run(list(range(2)), concurrency=1, handler=handler, attempts=1)
@@ -274,11 +342,15 @@ class ServerPoolBalanceTests(unittest.TestCase):
     def test_failover_moves_work_off_a_dead_server(self):
         """A retired server's queue is served by healthy ones, not dropped."""
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             if server_index == 0:
                 raise ConnectionError("server 0 is down")
             return server_index
 
         async def go():
+            """Drive one ServerPool.map to completion and return its result."""
             async with ServerPool(SERVERS[:3], concurrency_per_server=1, request_timeout=5.0,
                                   label="test", unhealthy_threshold=1) as pool:
                 return await pool.map(list(range(9)), handler, desc=None,
@@ -290,12 +362,21 @@ class ServerPoolBalanceTests(unittest.TestCase):
         self.assertGreater(len(result.results), 0)
 
     def test_on_result_streams_each_completion(self):
+        """Each completion is reported to the callback as it finishes."""
         streamed = []
 
         async def handler(client, item, server_index):
+            """Test handler for the enclosing test. Follows the ServerPool contract:
+            (client, item, server_index) -> result. It raises to signal a failure the pool
+            should classify and retry or record."""
             return item * 10
 
         async def on_result(item, value):
+            """Pool callback, called once per completed item in completion order.
+
+            Args:
+                item: The item that completed.
+                value: The handler's result for that item."""
             streamed.append((item, value))
 
         self._run(list(range(6)), concurrency=2, handler=handler, on_result=on_result)
@@ -304,6 +385,7 @@ class ServerPoolBalanceTests(unittest.TestCase):
 
 class CheckpointTests(unittest.TestCase):
     def test_round_trip_and_resume(self):
+        """A checkpoint written to disk reloads with the same marks, so resume picks up where it stopped."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "log.json"
             log = CheckpointLog(path, flush_every=2)
@@ -318,6 +400,7 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(reloaded.pending(["a::1", "a::2", "a::3"]), ["a::2", "a::3"])
 
     def test_reset_incomplete_keeps_completed(self):
+        """Resetting incomplete items keeps the completed ones."""
         with tempfile.TemporaryDirectory() as tmp:
             log = CheckpointLog(Path(tmp) / "log.json")
             log.mark("keep", True)
@@ -330,6 +413,7 @@ class CheckpointTests(unittest.TestCase):
             self.assertNotIn("retry", log.data)
 
     def test_corrupt_checkpoint_degrades_to_empty(self):
+        """A corrupt checkpoint loads as empty instead of raising."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "log.json"
             path.write_text('{"half": ', encoding="utf-8")
@@ -337,6 +421,7 @@ class CheckpointTests(unittest.TestCase):
             self.assertIsNone(read_json(path, default=None))
 
     def test_atomic_write_leaves_no_temp_files(self):
+        """An atomic write leaves no temporary files behind."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "nested" / "out.json"
             atomic_write_json(path, {"concepts": [{"title": "x"}]})
@@ -347,6 +432,20 @@ class CheckpointTests(unittest.TestCase):
 class VerificationReportTests(unittest.TestCase):
     def _write_chunk(self, staging, doc, chunk, filename, score, sufficient,
                      concepts=(), facts=()):
+        """Write one chunk's verification result file for a metrics test.
+
+        Args:
+            staging: Staging directory.
+            doc: Document id.
+            chunk: Chunk id.
+            filename: Result file name, which decides the phase.
+            score: Coverage score to store.
+            sufficient: Whether the chunk is marked sufficient.
+            concepts: Missed concepts to store.
+            facts: Missed facts to store.
+
+        Returns:
+            None."""
         chunk_dir = staging / doc / chunk
         chunk_dir.mkdir(parents=True, exist_ok=True)
         (chunk_dir / filename).write_text(json.dumps({
@@ -355,6 +454,7 @@ class VerificationReportTests(unittest.TestCase):
         }), encoding="utf-8")
 
     def test_metrics_aggregate_and_improvement_is_computed(self):
+        """Per-chunk scores aggregate correctly, and the improvement between phases is computed."""
         with tempfile.TemporaryDirectory() as tmp:
             staging = Path(tmp) / "staging"
             # Pass 1: poor coverage.
@@ -406,6 +506,7 @@ class VerificationReportTests(unittest.TestCase):
             self.assertAlmostEqual(saved["improvement"]["coverage_after"], 0.975, places=3)
 
     def test_missing_pass2_still_writes_pass1_summary(self):
+        """With no phase 2 results, the phase 1 summary is still written."""
         with tempfile.TemporaryDirectory() as tmp:
             staging = Path(tmp) / "staging"
             before = collect_metrics(staging, label="PASS 1", result_filename=PASS1_RESULT)
@@ -453,6 +554,7 @@ class StageProfileParityTests(unittest.TestCase):
     }
 
     def test_every_profile_matches_its_historical_max_tokens(self):
+        """Every stage profile keeps the max_tokens the stage always used."""
         self.assertEqual(set(STAGE_PROFILES), set(self.HISTORICAL_MAX_TOKENS),
                          "a stage profile was added or renamed without pinning "
                          "its historical max_tokens")
@@ -461,6 +563,7 @@ class StageProfileParityTests(unittest.TestCase):
                              f"{stage}: max_tokens drifted from the historical value")
 
     def test_every_profile_is_bounded_so_no_stage_can_idle_forever(self):
+        """Every stage profile has finite attempts, a positive budget and a bounded attempt timeout."""
         for stage, profile in STAGE_PROFILES.items():
             self.assertGreater(profile.attempts, 0, stage)
             self.assertLessEqual(profile.attempts, 8, f"{stage}: retry ladder too long")

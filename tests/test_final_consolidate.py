@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from tests.fake_vllm import FakeVLLMCluster
+from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = "final_consolidate_and_link.py"
@@ -23,21 +24,30 @@ LONG = ("A dense factual description with enough words to look like a real conce
 NO_PAIRS = {"merge_pairs": [], "link_pairs": [], "noise": []}
 
 
-def run(args, *, expect_rc=0, timeout=240):
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    proc = subprocess.run([sys.executable, str(REPO_ROOT / SCRIPT), *args],
-                          cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, timeout=timeout)
-    assert proc.returncode == expect_rc, (
-        f"exit {proc.returncode} (expected {expect_rc})\nARGS: {args}\n"
-        f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    return proc
+def run(args, *, expect_rc=0, timeout=300):
+    """Run final_consolidate_and_link.py as a subprocess and assert its exit code.
+
+    Args:
+        args: Command-line arguments after the script name.
+        expect_rc: The exit code the run should produce.
+        timeout: Seconds to wait before the run is abandoned.
+
+    Returns:
+        The completed process.
+    """
+    return run_script(SCRIPT, args, expect_rc=expect_rc, timeout=timeout)
 
 
 class FinalConsolidateTests(unittest.TestCase):
     def _build(self, root: Path, letters="ABCDEF"):
+        """Write a refined graph with one concept per letter, so each letter is one batch.
+
+        Args:
+            root: Temporary directory to build in.
+            letters: One character per concept.
+
+        Returns:
+            The run directory, ``root/wiki/biology``."""
         base = root / "wiki" / "biology"
         base.mkdir(parents=True, exist_ok=True)
         # One alphabetical batch per letter, so len(letters) macro-scan items.
@@ -49,6 +59,15 @@ class FinalConsolidateTests(unittest.TestCase):
         return base
 
     def _args(self, base, servers, **extra):
+        """Build the CLI arguments for a final-consolidation run.
+
+        Args:
+            base: The run directory. Its parent becomes ``--wiki_base_dir``.
+            servers: Fake server URLs.
+            **extra: ``flag=value`` pairs appended as ``--flag value``.
+
+        Returns:
+            A list of CLI argument strings."""
         out = ["--domain", "biology", "--wiki_base_dir", str(base.parent),
                "--servers", *servers, "--stage_budget_minutes", "2"]
         for k, v in extra.items():
@@ -58,6 +77,7 @@ class FinalConsolidateTests(unittest.TestCase):
         return out
 
     def test_macro_batches_spread_evenly_across_servers(self):
+        """Six alphabetical batches over three servers reach each server exactly twice, and each batch is logged."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), letters="ABCDEF")
             with FakeVLLMCluster(3, responder=lambda p, i: NO_PAIRS) as cluster:
@@ -77,6 +97,7 @@ class FinalConsolidateTests(unittest.TestCase):
             self.assertTrue(list(base.glob("*.json")), "no graph output written")
 
     def test_uneven_batch_count_still_balances(self):
+        """Five batches over three servers stay within one request of each other."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), letters="ABCDE")
             with FakeVLLMCluster(3, responder=lambda p, i: NO_PAIRS) as cluster:
@@ -97,6 +118,7 @@ class FinalConsolidateTests(unittest.TestCase):
             self.assertEqual(out.stdout.count("item i -> server i % N"), 2)
 
     def test_unparseable_batches_fail_loudly_and_log_the_error(self):
+        """Batches the model cannot parse fail the stage, and each failure is in the decision log."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), letters="AB")
             with FakeVLLMCluster(2, responder=lambda p, i: "{not json") as cluster:
@@ -112,6 +134,7 @@ class FinalConsolidateTests(unittest.TestCase):
             self.assertTrue(all(e["error"] for e in errors))
 
     def test_transient_faults_are_retried_not_fatal(self):
+        """Transient faults are retried, and the stage completes."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), letters="AB")
             # fail_first is per server: each of the 2 servers takes 2 faults then

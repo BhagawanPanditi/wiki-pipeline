@@ -11,14 +11,13 @@ higher and the improvement deltas are non-trivial.
 """
 
 import json
-import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from tests.fake_vllm import FakeVLLMServer as _FakeServer
+from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VERIFIER = REPO_ROOT / "verify_concept_extraction.py"
@@ -50,6 +49,14 @@ class DoubleVerificationTests(unittest.TestCase):
         return domain_dir
 
     def _rewrite_concepts(self, domain_dir: Path, concepts_per_chunk: int) -> None:
+        """Trim every chunk's Pass 1 concepts to a fixed count, so a test controls the work size.
+
+        Args:
+            domain_dir: Run directory.
+            concepts_per_chunk: How many concepts each chunk keeps.
+
+        Returns:
+            None."""
         for chunk_dir in (domain_dir / "staging").glob("*/*"):
             chunk_id = chunk_dir.name
             (chunk_dir / "concepts.json").write_text(json.dumps({
@@ -60,21 +67,24 @@ class DoubleVerificationTests(unittest.TestCase):
 
     def _run_phase(self, domain_dir: Path, phase: int, servers, *, expect_rc=0,
                    extra=()):
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        proc = subprocess.run(
-            [sys.executable, str(VERIFIER), "--domain", "robotics",
-             "--wiki_base_dir", str(domain_dir.parent), "--phase", str(phase),
-             "--servers", *servers, "--max_attempts", "4",
-             "--stage_budget_minutes", "2", *extra],
-            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=180,
-        )
-        self.assertEqual(proc.returncode, expect_rc,
-                         msg=f"phase {phase}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-        return proc
+        """Run one verification phase as a subprocess.
+
+        Args:
+            domain_dir: Run directory.
+            phase: 1 or 2.
+            servers: Fake server URLs.
+            expect_rc: The exit code the run should produce.
+
+        Returns:
+            The completed process. The exit code is asserted before returning."""
+        return run_script("verify_concept_extraction.py",
+                          ["--domain", "robotics", "--wiki_base_dir", str(domain_dir.parent),
+                           "--phase", str(phase), "--servers", *servers, "--max_attempts", "4",
+                           "--stage_budget_minutes", "2", *extra],
+                          expect_rc=expect_rc, timeout=180)
 
     def test_two_phases_produce_two_scores_and_an_improvement(self):
+        """Both phases report a score, and phase 2 reports how much it improved on phase 1."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with _FakeServer() as server:
@@ -115,6 +125,7 @@ class DoubleVerificationTests(unittest.TestCase):
             self.assertEqual(imp["coverage_before"], round(pass1["coverage_score"], 4))
 
     def test_requests_spread_evenly_across_servers(self):
+        """Verification requests are spread evenly across the servers."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with _FakeServer() as s0, _FakeServer() as s1, _FakeServer() as s2:
@@ -130,6 +141,7 @@ class DoubleVerificationTests(unittest.TestCase):
                 self.assertIn("Requests served per server", out.stdout)
 
     def test_transient_server_faults_are_retried(self):
+        """A transient server fault is retried and the phase still completes."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             # First two requests 503; the retry must recover and complete.
@@ -140,6 +152,7 @@ class DoubleVerificationTests(unittest.TestCase):
                 self.assertGreaterEqual(server.requests, 4)
 
     def test_resume_skips_completed_chunks(self):
+        """A second run skips chunks that already have a verdict."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with _FakeServer() as server:
@@ -153,6 +166,7 @@ class DoubleVerificationTests(unittest.TestCase):
                                  msg="resume must not re-audit completed chunks")
 
     def test_missing_pass1_output_fails_loudly(self):
+        """Phase 2 without phase 1 output fails before making any request."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with _FakeServer() as server:

@@ -21,6 +21,7 @@ from export_markdown_wiki import export_wiki_markdown, format_description_paragr
 
 class CitationFormattingTests(unittest.TestCase):
     def test_brief_drops_provenance_and_flattens_newlines(self):
+        """A brief loses its provenance markers and is flattened onto a single line."""
         brief = (
             "A phenomenon described here. [canon_9531246a9168::chunk_001]\n\n"
             "A second sentence without a citation. [canon_f3a24c7a38b0]"
@@ -37,6 +38,7 @@ class CitationFormattingTests(unittest.TestCase):
         self.assertNotIn("\n", cleaned)
 
     def test_chunk_citations_reduce_to_document_ids(self):
+        """Chunk-level citations reduce to document-level ids."""
         description = "First [canon_abc123::chunk_000]. Second [canon_def456::chunk_019]."
 
         self.assertEqual(
@@ -45,6 +47,7 @@ class CitationFormattingTests(unittest.TestCase):
         )
 
     def test_each_paragraph_gets_a_document_level_citation(self):
+        """Each paragraph of an exported page gets a document-level citation."""
         description = (
             "First paragraph has an inline source. [canon_10d15b3efade::chunk_000]\n\n"
             "Second paragraph is missing an inline source.\n\n"
@@ -63,6 +66,7 @@ class CitationFormattingTests(unittest.TestCase):
         self.assertNotIn("chunk_", formatted)
 
     def test_export_keeps_brief_on_one_line_and_cites_each_body_paragraph(self):
+        """The export keeps the brief on one line and cites every body paragraph."""
         with tempfile.TemporaryDirectory() as temp_dir:
             domain_dir = Path(temp_dir) / "biology"
             domain_dir.mkdir()

@@ -34,33 +34,7 @@ LONG = ("A dense factual description with enough words to look like a real conce
 WIDE = "W" * 6000
 
 
-def run(script, args, *, expect_rc=0, timeout=300):
-    """Run a stage script as a subprocess and assert its exit code.
-
-    Args:
-        script: Stage file name at the repo root.
-        args: CLI arguments after the script name.
-        expect_rc: Expected return code.
-        timeout: Seconds to wait.
-
-    Returns:
-        The completed ``subprocess.CompletedProcess``.
-
-    Raises:
-        AssertionError: On an unexpected return code, with the tail of stdout and
-            stderr included.
-    """
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env.pop("PYTHONPATH", None)
-    proc = subprocess.run([sys.executable, str(REPO_ROOT / script), *args],
-                          cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, timeout=timeout)
-    assert proc.returncode == expect_rc, (
-        f"exit {proc.returncode} (expected {expect_rc})\nARGS: {args}\n"
-        f"STDOUT:\n{proc.stdout[-2500:]}\nSTDERR:\n{proc.stderr[-2500:]}")
-    return proc
+from tests.helpers import run_script as run
 
 
 def read_jsonl(path: Path):

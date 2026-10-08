@@ -66,6 +66,14 @@ If should_fold is false:
 
 class ThinConceptHandler:
     def __init__(self, args):
+        """Prepare thin-concept folding. Nothing is read until :meth:`run`.
+
+        Args:
+            args: Parsed CLI namespace, including ``--min_concept_words``.
+
+        Sets:
+            Paths, the stage settings, the debug and decision logs, the time budget, and
+            the word threshold ``min_words``."""
         self.domain_dir = Path(args.wiki_base_dir) / args.domain
         self.input_file = self.domain_dir / "global_concepts_stubs_resolved.json"
         self.output_file = self.domain_dir / "global_concepts_refined.json"
@@ -83,8 +91,15 @@ class ThinConceptHandler:
         self.title_map: Dict[str, Dict[str, Any]] = {}
 
     def load_data(self):
+        """Load the stub-resolved graph and index it by lowercased title.
+
+        Returns:
+            None. Fills ``concepts`` and ``title_map``.
+
+        Raises:
+            FileNotFoundError: If the stub-resolution output is missing."""
         if not self.input_file.exists():
-            raise FileNotFoundError(f"Missing input file {self.input_file}. Run stub_resolver.py first!")
+            raise FileNotFoundError(f"Missing input file {self.input_file}. Run stub_resolution.py first!")
 
         print(f"Loading concepts from {self.input_file}...")
         with open(self.input_file, "r", encoding="utf-8") as f:
@@ -94,6 +109,17 @@ class ThinConceptHandler:
         print(f"Loaded {len(self.concepts)} total concepts.")
 
     def find_candidate_hosts(self, thin_concept: Dict[str, Any], inbound_index: Dict[str, List[Dict[str, Any]]], chunk_index: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Rank the concepts that could absorb a thin concept.
+
+        Args:
+            thin_concept: The concept under consideration.
+            inbound_index: Lowercased title mapped to the concepts that link to it.
+            chunk_index: Source chunk mapped to the concepts that cite it.
+
+        Returns:
+            Candidate host concepts, best first: concepts that link to the thin concept,
+            then concepts that cite one of its source chunks. The thin concept itself is
+            never a candidate."""
         t_title_lower = thin_concept["title"].lower()
         candidates = []
         seen_titles = {t_title_lower}
@@ -157,6 +183,16 @@ CANDIDATE HOST CONCEPTS:
         return FoldDecisionSchema.model_validate_json(clean_json_string(raw_text))
 
     async def run(self):
+        """Fold each thin concept into its best host, or prune it.
+
+        Concepts under ``min_words`` are offered to the LLM along with their candidate
+        hosts, in parallel through the pool. Folds are applied in completion order.
+        Whatever is still thin afterwards is folded deterministically into its best
+        candidate, or pruned if it has no candidate and almost no content. Each decision
+        is recorded in the decision log.
+
+        Returns:
+            None. Writes ``global_concepts_refined.json``."""
         self.load_data()
 
         # Build Inbound Index and Chunk Index
@@ -360,6 +396,10 @@ CANDIDATE HOST CONCEPTS:
         print(f"Outputs written to:\n  - {self.output_file}\n  - {self.concepts_dir}/")
 
 def main():
+    """Parse the command line and run thin-concept folding.
+
+    Returns:
+        None."""
     parser = build_parser(
         stage=STAGE,
         description="Step 4B: LLM-Driven Thin Concept Folding & Pruning")

@@ -25,6 +25,13 @@ from pipeline_lib.layout import log_path
 STAGE = "entity-overlap"
 
 def normalize_entity(ent: str) -> str:
+    """Normalise an entity name so that equal names match.
+
+    Args:
+        ent: Entity text as extracted.
+
+    Returns:
+        The stripped, lowercased text."""
     return ent.strip().lower()
 
 def enrich_graph_via_entity_overlap(
@@ -33,6 +40,22 @@ def enrich_graph_via_entity_overlap(
     max_new_links_per_node: int = 4,
     dry_run: bool = False
 ):
+    """Link concepts that share enough named entities.
+
+    Concepts that share at least ``min_shared_entities`` normalised entities, and are
+    not already linked, get a reciprocal relation. An entity shared by more than 50
+    concepts is treated as generic and ignored. Pairs sharing the most entities are
+    linked first. A pair is skipped once both of its concepts have reached
+    ``max_new_links_per_node`` new links.
+
+    Args:
+        domain_dir: Run directory. Reads and rewrites ``global_concepts_refined.json``.
+        min_shared_entities: Shared entities required for a link.
+        max_new_links_per_node: Cap on new links per concept.
+        dry_run: Report the planned links without writing anything.
+
+    Returns:
+        None. Each link actually written is recorded in the decision log."""
     refined_file = domain_dir / "global_concepts_refined.json"
     if not refined_file.exists():
         raise FileNotFoundError(f"Missing refined graph file: {refined_file}")

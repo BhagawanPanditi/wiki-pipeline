@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
 from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.event_log import EventLog
+from pipeline_lib.text import first_sentences
 from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
@@ -53,12 +54,6 @@ Return valid JSON:
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
 
-def get_sentence_fallback(text: str, max_sentences: int = 2) -> str:
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
-    if len(sentences) <= max_sentences:
-        return text.strip()
-    return " ".join(sentences[:max_sentences])
-
 # ── LLM Async Worker ─────────────────────────────────────────────────────────
 async def generate_brief_llm(client, concept, settings) -> str:
     """One brief. Raises on any unusable response so the pool can classify and
@@ -88,6 +83,15 @@ async def generate_brief_llm(client, concept, settings) -> str:
 # ── Main Pipeline ────────────────────────────────────────────────────────────
 class ConceptBriefPipeline:
     def __init__(self, args):
+        """Prepare a brief-generation run. Nothing is read or written yet.
+
+        Args:
+            args: Parsed CLI namespace with ``domain``, ``wiki_base_dir`` and the shared
+                stage flags.
+
+        Sets:
+            The resolved stage settings, the run directory, the refined-graph path, the
+            debug log and the time budget."""
         self.args = args
         self.settings = resolve_settings(args, STAGE)
         self.domain_dir = Path(args.wiki_base_dir) / args.domain
@@ -100,6 +104,10 @@ class ConceptBriefPipeline:
         self.concepts: List[Dict[str, Any]] = []
 
     def load_data(self):
+        """Load the refined concept graph into ``self.concepts``.
+
+        Raises:
+            FileNotFoundError: If ``global_concepts_refined.json`` does not exist yet."""
         if not self.refined_file.exists():
             raise FileNotFoundError(f"Missing refined graph file: {self.refined_file}")
 
@@ -109,6 +117,14 @@ class ConceptBriefPipeline:
         print(f"Loaded {len(self.concepts)} total concepts.")
 
     async def run(self):
+        """Give every concept a brief, then rewrite the refined graph.
+
+        A concept that already has a brief keeps it. The rest go to the LLM through the
+        server pool. Any that still fail after retries get a deterministic fallback made
+        from their first two sentences, so one bad response never aborts the run.
+
+        Returns:
+            None. Writes ``global_concepts_refined.json`` in place."""
         self.load_data()
 
         # Identify concepts that need LLM generation vs. simple reuse
@@ -140,9 +156,29 @@ class ConceptBriefPipeline:
                   f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
 
             async def handler(client, concept, server_index):
+                """Request one brief from the LLM for one concept.
+
+                Args:
+                    client: The ``AsyncOpenAI`` client bound to one server.
+                    concept: The concept to describe.
+                    server_index: Index of the serving server, used only for accounting.
+
+                Returns:
+                    The brief text from :func:`generate_brief_llm`.
+
+                Raises:
+                    Whatever :func:`generate_brief_llm` raises, so the pool can retry it."""
                 return await generate_brief_llm(client, concept, settings)
 
             async def apply_brief(concept, brief_text):
+                """Attach a finished brief to its concept. Called in completion order.
+
+                Args:
+                    concept: The concept dict that was briefed.
+                    brief_text: The brief to store under ``brief``.
+
+                Returns:
+                    None."""
                 concept["brief"] = brief_text
 
             pool = ServerPool(
@@ -177,7 +213,7 @@ class ConceptBriefPipeline:
             for failure in result.failures:
                 concept = tasks_to_generate[failure["index"]]
                 concept["brief"] = clean_brief_text(
-                    get_sentence_fallback(concept.get("description", ""), max_sentences=2))
+                    first_sentences(concept.get("description", ""), max_sentences=2))
                 fallbacks += 1
             if fallbacks:
                 print(f"\u26a0\ufe0f  {fallbacks} brief(s) fell back to a truncated description.")
@@ -234,6 +270,10 @@ class ConceptBriefPipeline:
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 def main():
+    """Parse the command line and run brief generation.
+
+    Returns:
+        None."""
     parser = build_parser(
         stage=STAGE,
         description="Generate 2-3 sentence briefs for knowledge graph concepts")

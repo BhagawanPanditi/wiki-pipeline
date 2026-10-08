@@ -171,6 +171,23 @@ async def run_macro_scan(
     domain_name: str,
     args,
 ) -> List[MacroCandidateCluster]:
+    """First pass of final consolidation: scan the concepts alphabetically for duplicates, links and noise.
+
+    Concepts are grouped by first letter (digits and symbols share one group), and
+    each group is cut into batches. The pool sends each batch to the LLM, which
+    returns merge pairs, link pairs and noise titles. Each batch's answer is written
+    to the decision log.
+
+    Args:
+        concepts: All concepts in the refined graph.
+        domain_name: Optional domain hint, or ``None``.
+        args: Parsed CLI namespace.
+
+    Returns:
+        The candidate clusters, for the deep verification pass.
+
+    Raises:
+        RuntimeError: If no LLM server is configured, or if batches fail after retries."""
     letter_groups: Dict[str, List[Dict[str, Any]]] = {}
     for c in concepts:
         title = c["title"].strip()
@@ -231,6 +248,15 @@ async def run_macro_scan(
                                label=MACRO_STAGE)
 
     async def worker(client, server_url: str, work_queue: asyncio.Queue):
+        """Consume one server's queue of macro-scan batches until the queue is empty.
+
+        Args:
+            client: ``AsyncOpenAI`` client bound to this server.
+            server_url: Base URL of this server, for logging.
+            work_queue: This server's own queue of batches (the ``i % N`` partition).
+
+        Returns:
+            None. Results accumulate in the enclosing scope."""
         while True:
             item = await work_queue.get()
             if item is None:
@@ -391,6 +417,17 @@ async def run_macro_scan(
 
 # ── Helper for Resilient Action Parsing ──────────────────────────────────────
 def normalize_action_dict(d: Dict[str, Any]) -> Optional[VerifiedAction]:
+    """Turn one action from the LLM into a VerifiedAction, tolerating key-name variants.
+
+    Models name the same field several ways (``primary_title`` or
+    ``canonical_title``, ``absorbed_titles`` or ``duplicate_titles``), so every known
+    spelling is accepted.
+
+    Args:
+        d: One action object decoded from the LLM's JSON.
+
+    Returns:
+        A VerifiedAction, or ``None`` when ``d`` is not an object or names no action."""
     if not isinstance(d, dict):
         return None
     act = str(d.get("action", "")).upper().strip()
@@ -424,6 +461,24 @@ async def run_deep_verification(
     domain_name: str,
     args,
 ) -> List[VerifiedAction]:
+    """Second pass of final consolidation: verify each candidate group with its briefs.
+
+    Candidate groups from the macro scan are de-duplicated, and any group larger than
+    250 concepts is split into parts. Each group is sent with its briefs and
+    entities, and the LLM answers with MERGE, LINK, PRUNE or KEEP_SEPARATE actions.
+    Each answer is written to the decision log.
+
+    Args:
+        clusters: Candidate clusters from :func:`run_macro_scan`.
+        concepts: All concepts, used to look up each candidate's brief.
+        domain_name: Optional domain hint, or ``None``.
+        args: Parsed CLI namespace.
+
+    Returns:
+        The verified actions, ready for :func:`apply_all_resolutions`.
+
+    Raises:
+        RuntimeError: If no LLM server is configured, or if groups fail after retries."""
     concept_map = {c["title"].lower().strip(): c for c in concepts}
 
     # Deduplicate candidate groups across clusters
@@ -475,6 +530,15 @@ async def run_deep_verification(
                               label=DEEP_STAGE)
 
     async def worker(client, server_url: str, work_queue: asyncio.Queue):
+        """Consume one server's queue of candidate groups until the queue is empty.
+
+        Args:
+            client: ``AsyncOpenAI`` client bound to this server.
+            server_url: Base URL of this server, for logging.
+            work_queue: This server's own queue of groups (the ``i % N`` partition).
+
+        Returns:
+            None. Verified actions accumulate in the enclosing scope."""
         while True:
             item = await work_queue.get()
             if item is None:
@@ -618,6 +682,18 @@ async def run_deep_verification(
 
 # ── Step 3: Apply Resolutions & Update Graph ─────────────────────────────────
 def apply_all_resolutions(concepts: List[Dict[str, Any]], actions: List[VerifiedAction]) -> List[Dict[str, Any]]:
+    """Apply the verified actions to the concept list and return the survivors.
+
+    MERGE folds each absorbed concept into its primary, carrying over aliases,
+    entities and citations. PRUNE drops noise. LINK adds a reciprocal relation, using
+    the description the LLM wrote for each direction.
+
+    Args:
+        concepts: The concepts before resolution.
+        actions: Verified actions from the deep-verification pass.
+
+    Returns:
+        The surviving concepts, with merges, prunes and links applied."""
     title_map = {c["title"].lower().strip(): c for c in concepts}
     merge_remap: Dict[str, str] = {}  # absorbed_lower_title -> primary_canonical_title
     pruned_titles = set()
@@ -796,6 +872,24 @@ def apply_all_resolutions(concepts: List[Dict[str, Any]], actions: List[Verified
     return surviving_concepts
 
 async def main_pipeline(domain_dir: Path, domain_name: Optional[str], args):
+    """Run final consolidation end to end on one run directory.
+
+    Loads the refined graph. Then either re-applies the decisions in
+    ``log/final-deep-verify.decisions.jsonl`` (``--from_log``, which makes no LLM
+    calls) or runs the macro scan and the deep verification. It applies the
+    resolutions and overwrites ``global_concepts_refined.json``.
+
+    Args:
+        domain_dir: Run directory.
+        domain_name: Optional domain hint, or ``None``.
+        args: Parsed CLI namespace.
+
+    Returns:
+        None.
+
+    Raises:
+        FileNotFoundError: If no refined graph exists, or ``--from_log`` was given but
+            no decision log exists."""
     refined_file = domain_dir / "global_concepts_refined.json"
     if not refined_file.exists():
         fallback = domain_dir / "global_concepts_stubs_resolved.json"
@@ -869,6 +963,10 @@ async def main_pipeline(domain_dir: Path, domain_name: Optional[str], args):
     analyze_kg_islands(domain_dir)
 
 def main():
+    """Parse the command line and run final consolidation.
+
+    Returns:
+        None."""
     parser = build_parser(
         stage=MACRO_STAGE,
         description="Two-Pass Global Knowledge Graph Consolidation & Hierarchy Resolution",

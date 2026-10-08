@@ -19,6 +19,7 @@ from pipeline_lib.checkpoint import load_json_log, save_log_async, save_log_sync
 from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.corpus import chunking_enabled
 from pipeline_lib.event_log import EventLog
+from pipeline_lib.text import snippet_description
 from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
@@ -42,12 +43,6 @@ class DocumentConsolidationSchema(BaseModel):
     )
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
-
-def snippet_description(text: str, max_words: int = 30) -> str:
-    words = text.strip().split()
-    if len(words) <= max_words:
-        return text.strip()
-    return " ".join(words[:max_words]) + "..."
 
 # ── System Prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT_CONSOLIDATE = """\
@@ -83,6 +78,14 @@ If no concepts need to be merged, return: {"merge_clusters": []}.
 # ── Pipeline Implementation ──────────────────────────────────────────────────
 class DocumentConsolidatorPipeline:
     def __init__(self, args):
+        """Prepare document consolidation, creating the ``consolidated/`` folder.
+
+        Args:
+            args: Parsed CLI namespace.
+
+        Sets:
+            Paths, the stage settings, the debug and decision logs, the time budget and
+            the per-document checkpoint."""
         self.args = args
         self.domain = args.domain
         self.base_wiki_dir = Path(args.wiki_base_dir) / self.domain
@@ -103,6 +106,16 @@ class DocumentConsolidatorPipeline:
             corrupt_message="Consolidation log corrupted. Re-initializing.")
 
     def prepare_document_items(self) -> List[Dict[str, Any]]:
+        """Collect each document's concepts from the staging folder.
+
+        A document's concepts are gathered across all its chunks, and each concept is
+        stamped with the chunk it came from (``source_chunk``). Documents with no
+        concepts are skipped. A concepts file that cannot be read is recorded in the
+        debug log, not dropped silently.
+
+        Returns:
+            A list with one item per document: ``doc_id``, ``raw_concepts`` and
+            ``output_dir``."""
         print(f"Scanning staging directory: {self.staging_dir}...")
         doc_dirs = [d for d in self.staging_dir.iterdir() if d.is_dir() and d.name.startswith("canon_")]
         
@@ -124,7 +137,10 @@ class DocumentConsolidatorPipeline:
                             for concept in data.get("concepts", []):
                                 concept["source_chunk"] = f"{doc_id}::{chunk_id}"
                                 raw_concepts.append(concept)
-                    except Exception:
+                    except Exception as exc:
+                        self.debug.record("unreadable_concepts_file", doc_id=doc_id,
+                                          chunk_id=chunk_id, path=str(concepts_file),
+                                          error=str(exc))
                         continue
                         
             if raw_concepts:
@@ -240,6 +256,19 @@ class DocumentConsolidatorPipeline:
                                 payload, encoding="utf-8")
 
     def execute_programmatic_merge(self, raw_concepts: List[Dict[str, Any]], consolidation_delta: DocumentConsolidationSchema) -> List[Dict[str, Any]]:
+        """Apply the LLM's merge clusters to one document's concepts, deterministically.
+
+        Each cluster maps its member titles onto its primary title. Concepts that then
+        share a title are combined: aliases, entities and source chunks are unioned, and
+        description sentences are joined without repeats.
+
+        Args:
+            raw_concepts: The document's concepts, as produced by
+                :meth:`prepare_document_items`.
+            consolidation_delta: The LLM's merge clusters for this document.
+
+        Returns:
+            The merged concept list, one entry per distinct title."""
         title_map: Dict[str, str] = {}
         for cluster in consolidation_delta.merge_clusters:
             primary = cluster.primary_title.strip()
@@ -472,6 +501,10 @@ class DocumentConsolidatorPipeline:
         print(f"  - Concepts After:  {total_concepts_after}")
 
 def main():
+    """Parse the command line and run document consolidation.
+
+    Returns:
+        None."""
     parser = build_parser(
         stage=STAGE,
         description="Cross-Chunk Concept Consolidation Pipeline")

@@ -16,6 +16,19 @@ from pipeline_lib.cli import build_parser
 STAGE = "final-analysis"
 
 def analyze_kg_islands(domain_dir: Path):
+    """Measure how the concept graph splits into islands and write the report.
+
+    An island is a connected component of the concept graph. The report gives the
+    giant component, every smaller island, and the concepts with no links at all.
+
+    Args:
+        domain_dir: Run directory. Reads ``global_concepts_refined.json``.
+
+    Returns:
+        None. Writes ``islands_report.json``.
+
+    Raises:
+        FileNotFoundError: If the refined graph does not exist."""
     refined_file = domain_dir / "global_concepts_refined.json"
     report_file = domain_dir / "islands_report.json"
 

@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from tests.fake_vllm import FakeVLLMCluster, FakeVLLMServer
+from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = "concept_refinement_pass_2.py"
@@ -33,21 +34,31 @@ DELTA = {
 }
 
 
-def run_pass2(args, *, expect_rc=0, timeout=240):
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    proc = subprocess.run([sys.executable, str(REPO_ROOT / SCRIPT), *args],
-                          cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, timeout=timeout)
-    assert proc.returncode == expect_rc, (
-        f"exit {proc.returncode} (expected {expect_rc})\nARGS: {args}\n"
-        f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    return proc
+def run_pass2(args, *, expect_rc=0, timeout=300):
+    """Run concept_refinement_pass_2.py as a subprocess and assert its exit code.
+
+    Args:
+        args: Command-line arguments after the script name.
+        expect_rc: The exit code the run should produce.
+        timeout: Seconds to wait before the run is abandoned.
+
+    Returns:
+        The completed process.
+    """
+    return run_script(SCRIPT, args, expect_rc=expect_rc, timeout=timeout)
 
 
 class Pass2Tests(unittest.TestCase):
     def _build(self, root: Path, *, chunks=7, insufficient=True) -> Path:
+        """Write a Pass 1 output tree, optionally with chunks flagged for refinement.
+
+        Args:
+            root: Temporary directory to build in.
+            chunks: How many chunks to create.
+            insufficient: Whether the chunks are flagged as needing refinement.
+
+        Returns:
+            The run directory."""
         base = root / "wiki" / "biology"
         (base / "cache").mkdir(parents=True, exist_ok=True)
         (base / "staging").mkdir(parents=True, exist_ok=True)
@@ -76,6 +87,15 @@ class Pass2Tests(unittest.TestCase):
         return base
 
     def _args(self, base, servers, **extra):
+        """Build the CLI arguments for a Pass 2 run.
+
+        Args:
+            base: Run directory. Its parent becomes ``--wiki_base_dir``.
+            servers: Fake server URLs.
+            **extra: ``flag=value`` pairs appended as ``--flag value``.
+
+        Returns:
+            A list of CLI argument strings. The store_true flags are appended bare."""
         out = ["--domain", "biology", "--wiki_base_dir", str(base.parent),
                "--servers", *servers, "--stage_budget_minutes", "2"]
         for k, v in extra.items():
@@ -86,6 +106,7 @@ class Pass2Tests(unittest.TestCase):
         return out
 
     def test_merges_delta_backs_up_pass1_and_spreads_evenly(self):
+        """The merge backs up Pass 1 first, and the requests are spread evenly across servers."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=7)
             with FakeVLLMCluster(3, responder=lambda p, i: DELTA) as cluster:
@@ -116,11 +137,20 @@ class Pass2Tests(unittest.TestCase):
             self.assertTrue(all(log.values()) and len(log) == 7)
 
     def test_audit_feedback_from_verification_reaches_the_prompt(self):
+        """The missing concepts and facts from verification appear in the Pass 2 prompt."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=1)
             seen = []
 
             def responder(prompt, i):
+                """Record the prompt and return the fixed Pass 2 delta used by the test.
+
+                Args:
+                    prompt: The prompt text sent by the stage.
+                    i: Request index, unused.
+
+                Returns:
+                    The Pass 2 delta, a dict."""
                 seen.append(prompt)
                 return DELTA
 
@@ -136,6 +166,7 @@ class Pass2Tests(unittest.TestCase):
             self.assertIn("EXISTING EXTRACTED CONCEPTS (PASS 1)", prompt)
 
     def test_sufficient_chunks_send_no_audit_block(self):
+        """A chunk that verification found sufficient gets no audit block in its prompt."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=1, insufficient=False)
             seen = []
@@ -144,6 +175,7 @@ class Pass2Tests(unittest.TestCase):
             self.assertNotIn("AUDIT FEEDBACK", seen[0])
 
     def test_resume_skips_completed_chunks(self):
+        """A second run skips chunks that already have a Pass 2 result."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=3)
             with FakeVLLMCluster(1, responder=lambda p, i: DELTA) as cluster:
@@ -177,6 +209,7 @@ class Pass2Tests(unittest.TestCase):
             self.assertIn("server", debug["attempts"][0])
 
     def test_transient_http_fault_recovers(self):
+        """A transient HTTP fault is retried, and the chunk is refined."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=1)
             with FakeVLLMCluster(1, responder=lambda p, i: DELTA, fail_first=1) as cluster:
@@ -187,6 +220,7 @@ class Pass2Tests(unittest.TestCase):
                                       / "concepts.json").read_text())["concepts"][1]["title"])
 
     def test_missing_pass1_concepts_fails_before_any_request(self):
+        """Pass 2 without Pass 1 concepts fails before making any request."""
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=2)
             (base / "staging" / "canon_doc" / "chunk_001" / "concepts.json").unlink()

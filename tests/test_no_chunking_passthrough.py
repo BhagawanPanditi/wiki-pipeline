@@ -19,6 +19,7 @@ import unittest
 from pathlib import Path
 
 from tests.fake_vllm import FakeVLLMCluster
+from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = "doc_concept_consolidation.py"
@@ -43,31 +44,17 @@ def concept(title, chunk):
 
 
 def run_stage(args, *, expect_rc=0, timeout=300):
-    """Run document consolidation as a subprocess and assert the exit code.
+    """Run doc_concept_consolidation.py as a subprocess and assert its exit code.
 
     Args:
-        args: CLI arguments after the script name.
-        expect_rc: Expected return code.
-        timeout: Seconds to wait.
+        args: Command-line arguments after the script name.
+        expect_rc: The exit code the run should produce.
+        timeout: Seconds to wait before the run is abandoned.
 
     Returns:
-        The completed ``subprocess.CompletedProcess``.
-
-    Raises:
-        AssertionError: On an unexpected return code, with stdout and stderr
-            included so the failure is diagnosable.
+        The completed process.
     """
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env.pop("PYTHONPATH", None)
-    proc = subprocess.run([sys.executable, str(REPO_ROOT / SCRIPT), *args],
-                          cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, timeout=timeout)
-    assert proc.returncode == expect_rc, (
-        f"exit {proc.returncode} (expected {expect_rc})\nARGS: {args}\n"
-        f"STDOUT:\n{proc.stdout[-3000:]}\nSTDERR:\n{proc.stderr[-3000:]}")
-    return proc
+    return run_script(SCRIPT, args, expect_rc=expect_rc, timeout=timeout)
 
 
 class NoChunkingPassThroughTests(unittest.TestCase):

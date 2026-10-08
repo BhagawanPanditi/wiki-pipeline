@@ -22,12 +22,32 @@ if "transformers" not in sys.modules:
     class _Tok:
         @classmethod
         def from_pretrained(cls, *a, **k):
+            """Stand-in for the HuggingFace tokenizer loader.
+
+            Returns:
+                A fake tokenizer instance."""
             return cls()
 
         def encode(self, text, add_special_tokens=False):
+            """Tokenize text into one token per word.
+
+            Args:
+                text: Text to tokenize.
+                add_special_tokens: Accepted for signature compatibility; ignored.
+
+            Returns:
+                A list of integer token ids, one per word."""
             return list(range(len(str(text).split())))
 
         def decode(self, ids, skip_special_tokens=True):
+            """Turn token ids back into placeholder text.
+
+            Args:
+                ids: Token ids to decode.
+                skip_special_tokens: Accepted for signature compatibility; ignored.
+
+            Returns:
+                A string of placeholder words."""
             return " ".join(f"w{i}" for i in ids)
 
     stub.AutoTokenizer = _Tok
@@ -42,6 +62,14 @@ GOOD = {"concepts": [{"title": "Real Concept", "description": "A description.",
 
 
 def make_pipeline(root: Path, servers):
+    """Build a Pass 1 pipeline object for a test, without running it.
+
+    Args:
+        root: Wiki base directory.
+        servers: Fake server URLs.
+
+    Returns:
+        A configured ``WikiExtractorPipeline``."""
     parser = pass1.build_parser(stage=pass1.STAGE, description="t",
                                 include_data_dir=True, include_resume=True)
     args = parser.parse_args(["--domain", "biology", "--wiki_base_dir", str(root),
@@ -58,6 +86,13 @@ def make_pipeline(root: Path, servers):
 
 
 def chunks(n):
+    """Build ``n`` fake extraction units for a test.
+
+    Args:
+        n: How many units to build.
+
+    Returns:
+        A list of unit dicts with the keys Pass 1 expects."""
     return [{"doc_id": "canon_doc", "chunk_id": f"chunk_{i:03d}",
              "current_chunk": "Some raw text about a mechanism.",
              "context_before": "", "context_after": ""} for i in range(n)]
@@ -65,6 +100,15 @@ def chunks(n):
 
 class Pass1PoolTests(unittest.TestCase):
     def _run(self, pipe, items, servers):
+        """Run one pool map over the given units, the way Pass 1 does.
+
+        Args:
+            pipe: A configured pipeline, whose settings and debug log are used.
+            items: The units to extract.
+            servers: Fake server URLs.
+
+        Returns:
+            The ``PoolResult`` from the map."""
         pool = ServerPool(servers,
                           concurrency_per_server=pipe.settings.concurrency_per_server,
                           request_timeout=pipe.settings.profile.request_timeout,
@@ -72,6 +116,7 @@ class Pass1PoolTests(unittest.TestCase):
                           label=pass1.STAGE)
 
         async def go():
+            """Drive one pool map to completion and return its result."""
             try:
                 async with pool:
                     return await pool.map(items, pipe.extract_chunk,
@@ -85,6 +130,7 @@ class Pass1PoolTests(unittest.TestCase):
         return asyncio.run(go())
 
     def test_chunks_persist_and_spread_evenly(self):
+        """Extracted chunks are persisted, and the requests are spread evenly across servers."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with FakeVLLMCluster(3, responder=lambda p, i: GOOD) as cluster:
@@ -101,6 +147,7 @@ class Pass1PoolTests(unittest.TestCase):
                     self.assertTrue(pipe.extraction_log[f"{c['doc_id']}::{c['chunk_id']}"])
 
     def test_token_limit_truncation_fails_fast_without_retry(self):
+        """A response cut off at the token limit fails at once, with exactly one request."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             server = FakeVLLMServer(
@@ -125,6 +172,7 @@ class Pass1PoolTests(unittest.TestCase):
                 server.stop()
 
     def test_unparseable_response_is_retried_then_dumps_debug(self):
+        """An unparseable response is retried, and the failure is written to the debug log."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with FakeVLLMCluster(1, responder=lambda p, i: "{not json") as cluster:
@@ -148,6 +196,7 @@ class Pass1PoolTests(unittest.TestCase):
                                  len("Some raw text about a mechanism."))
 
     def test_transient_http_fault_recovers(self):
+        """A transient HTTP fault is retried, and the chunk is extracted."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with FakeVLLMCluster(1, responder=lambda p, i: GOOD, fail_first=1) as cluster:

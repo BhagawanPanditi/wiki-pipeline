@@ -25,31 +25,7 @@ LONG = ("A dense factual description with enough words to look like a real conce
         "brief including measured throughput of 1240 requests per second at 61 ms.")
 
 
-def run(script, args, *, expect_rc=0, timeout=240):
-    """Run a stage script as a subprocess and assert its exit code.
-
-    Args:
-        script: Stage file name at the repository root.
-        args: CLI arguments after the script name.
-        expect_rc: Expected return code.
-        timeout: Seconds before the subprocess is abandoned.
-
-    Returns:
-        The completed ``subprocess.CompletedProcess``.
-
-    Raises:
-        AssertionError: If the return code differs, with stdout and stderr.
-    """
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env.pop("PYTHONPATH", None)
-    proc = subprocess.run([sys.executable, str(REPO_ROOT / script), *args], cwd=REPO_ROOT,
-                          env=env, capture_output=True, text=True, timeout=timeout)
-    assert proc.returncode == expect_rc, (
-        f"exit {proc.returncode} (expected {expect_rc})\nSTDOUT:\n{proc.stdout[-2500:]}\n"
-        f"STDERR:\n{proc.stderr[-2500:]}")
-    return proc
+from tests.helpers import run_script as run
 
 
 def read_events(path: Path):

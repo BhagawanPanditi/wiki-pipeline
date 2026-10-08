@@ -30,9 +30,15 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):
+        """Silence the default per-request logging so test output stays readable."""
         pass
 
     def _send_json(self, code, payload):
+        """Write ``payload`` as a JSON response with HTTP status ``code``.
+
+        Args:
+            code: HTTP status code.
+            payload: JSON-serialisable body."""
         body = json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -41,12 +47,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        """Answer ``GET .../models`` so a health probe sees a live server.
+
+        Any other GET path gets a 404."""
         if self.path.endswith("/models"):
             self._send_json(200, {"object": "list", "data": [{"id": "test-model"}]})
             return
         self.send_error(404)
 
     def do_POST(self):
+        """Handle one chat completion.
+
+        Counts the request and records its prompt. The first ``fail_first`` requests fail
+        with ``fail_with`` (or hang, for ``"timeout"``). Every other request is answered by
+        the responder: a dict is sent as JSON, a string is sent verbatim, and a
+        ``(content, finish_reason)`` tuple simulates a truncated answer."""
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8")
         state = self.server.state
@@ -101,6 +116,14 @@ class FakeVLLMServer:
     """A throwaway vLLM-compatible endpoint bound to 127.0.0.1 on a free port."""
 
     def __init__(self, *, responder=None, fail_first=0, fail_with=503):
+        """Create, but do not start, a fake endpoint on a free localhost port.
+
+        Args:
+            responder: Callable ``(prompt, index) -> reply``. ``index`` counts requests
+                from zero. Defaults to a generic valid answer.
+            fail_first: How many of the first requests fail.
+            fail_with: HTTP status for those failures, or ``"timeout"`` to accept the
+                connection and never answer."""
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.httpd.state = {
             "lock": threading.Lock(),
@@ -114,28 +137,53 @@ class FakeVLLMServer:
 
     @property
     def url(self):
+        """The base URL to pass to ``--servers``.
+
+        Returns:
+            ``http://127.0.0.1:<port>/v1``."""
         return f"http://127.0.0.1:{self.httpd.server_port}/v1"
 
     @property
     def requests(self):
+        """How many requests this server has received.
+
+        Returns:
+            An int, counting failed requests as well as successful ones."""
         return self.httpd.state["requests"]
 
     @property
     def prompts(self):
+        """Every prompt this server has received, in arrival order.
+
+        Returns:
+            A copy of the list of prompt texts."""
         return list(self.httpd.state["prompts"])
 
     def start(self):
+        """Start serving in a background thread.
+
+        Returns:
+            This server."""
         self._thread.start()
         return self
 
     def stop(self):
+        """Shut the server down and release its socket."""
         self.httpd.shutdown()
         self.httpd.server_close()
 
     def __enter__(self):
+        """Start the server for use in a ``with`` block.
+
+        Returns:
+            This server."""
         return self.start()
 
     def __exit__(self, *exc):
+        """Stop the server when leaving a ``with`` block.
+
+        Args:
+            *exc: Ignored exception context."""
         self.stop()
 
 
@@ -143,18 +191,35 @@ class FakeVLLMCluster:
     """N fake servers, with helpers for asserting even spread."""
 
     def __init__(self, count, **kwargs):
+        """Start ``count`` independent fake servers.
+
+        Args:
+            count: How many servers to start.
+            **kwargs: Passed to each :class:`FakeVLLMServer`."""
         self.servers = [FakeVLLMServer(**kwargs).start() for _ in range(count)]
 
     @property
     def urls(self):
+        """The base URL of every server, in order.
+
+        Returns:
+            A list of URL strings."""
         return [s.url for s in self.servers]
 
     @property
     def counts(self):
+        """The requests each server has received, in server order.
+
+        Returns:
+            A list of ints. Used to check that work was spread evenly."""
         return [s.requests for s in self.servers]
 
     @property
     def total_requests(self):
+        """Requests received across all servers.
+
+        Returns:
+            An int."""
         return sum(self.counts)
 
     def assert_balanced(self, test, expected_total=None):
@@ -168,11 +233,20 @@ class FakeVLLMCluster:
                              msg=f"requests were not spread evenly: {counts}")
 
     def stop(self):
+        """Stop every server in the cluster."""
         for s in self.servers:
             s.stop()
 
     def __enter__(self):
+        """Return the cluster for use in a ``with`` block.
+
+        Returns:
+            This cluster."""
         return self
 
     def __exit__(self, *exc):
+        """Stop the cluster when leaving a ``with`` block.
+
+        Args:
+            *exc: Ignored exception context."""
         self.stop()

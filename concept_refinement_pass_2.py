@@ -146,6 +146,13 @@ Return ONLY valid JSON matching this exact structure:
 
 class WikiSecondPassPipeline:
     def __init__(self, args):
+        """Prepare Pass 2 refinement. Pass 1 output must already exist.
+
+        Args:
+            args: Parsed CLI namespace.
+
+        Raises:
+            FileNotFoundError: If the staging folder from Pass 1 is missing."""
         self.args = args
         self.domain = args.domain
         self.base_wiki_dir = Path(args.wiki_base_dir) / self.domain
@@ -441,6 +448,16 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
         return {"concepts": concepts_list}
 
     async def run(self):
+        """Refine every chunk that verification flagged, merging the LLM's additions into its Pass 1 concepts.
+
+        Before a chunk's concepts are changed, its Pass 1 version is backed up, so the
+        original is never lost. Each refinement is checkpointed as it completes.
+
+        Returns:
+            None. Updates each chunk's ``concepts.json`` and writes ``pass2_log.json``.
+
+        Raises:
+            RuntimeError: If any chunk is still incomplete after retries."""
         self.settings = resolve_settings(self.args, STAGE)
         self.decisions = EventLog(log_path(self.base_wiki_dir, STAGE, "decisions"), label=STAGE)
         self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
@@ -523,6 +540,10 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
 def main():
+    """Parse the command line and run Pass 2 refinement.
+
+    Returns:
+        None."""
     parser = build_parser(
         stage=STAGE,
         description="Second-Pass Concept Extraction & Patching Pipeline",

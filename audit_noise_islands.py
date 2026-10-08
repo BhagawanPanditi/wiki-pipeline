@@ -62,6 +62,26 @@ Return ONLY valid JSON matching this schema:
 """
 
 async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str], args):
+    """Ask the LLM what to do with each small island, then apply the answers.
+
+    Islands of at most ``--max_island_size`` concepts are sent through the server
+    pool, each with sibling concepts from the same source documents. A verdict is
+    one of PRUNE (noise), MERGE (a duplicate of a sibling), LINK (add reciprocal
+    links to a sibling) or KEEP. Every verdict is written to the decision log,
+    whether or not it was applied.
+
+    Args:
+        domain_dir: Run directory. Reads and rewrites ``global_concepts_refined.json``.
+        domain_name: Optional domain hint for the prompt, or ``None`` when no domain
+            was declared.
+        args: Parsed CLI namespace.
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: If there is work to do but no LLM server is configured, or if
+            any island still has no usable verdict after retries."""
     refined_file = domain_dir / "global_concepts_refined.json"
     if not refined_file.exists():
         fallback_file = domain_dir / "global_concepts.json"
@@ -130,6 +150,16 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
     decisions = EventLog(log_path(domain_dir, STAGE, "decisions"), label=STAGE)
 
     def build_audit_prompt(comp: List[str]) -> str:
+        """Build the LLM prompt for one island.
+
+        Args:
+            comp: The island's concept titles, lowercased, as keys into ``title_map``.
+
+        Returns:
+            The prompt text. It holds the island's own concepts (title, brief, aliases
+            and first entities), then up to 12 sibling concepts from the same source
+            documents, mainland concepts first. The domain clause appears only when a
+            domain hint was given."""
         island_payload = []
         source_docs = set()
         for t_lower in comp:
@@ -371,6 +401,10 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
     print(f"Updated Graph: {len(new_components)} islands total. Giant component: {new_giant}/{len(surviving_concepts)} ({new_giant/len(surviving_concepts)*100:.2f}%)")
 
 def main():
+    """Parse the command line and run the island audit.
+
+    Returns:
+        None."""
     parser = build_parser(
         stage=STAGE,
         description="Audit, connect, and prune small islands using sibling document context")
