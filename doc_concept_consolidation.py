@@ -17,6 +17,7 @@ from tqdm.asyncio import tqdm
 # ── Server & Concurrency Configuration ───────────────────────────────────────
 from pipeline_lib.checkpoint import load_json_log, save_log_async, save_log_sync
 from pipeline_lib.cli import build_parser, resolve_settings
+from pipeline_lib.corpus import chunking_enabled
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
@@ -318,7 +319,52 @@ class DocumentConsolidatorPipeline:
 
         return consolidated_concepts
 
+    async def pass_through(self, pending: List[Dict[str, Any]]) -> None:
+        """Copy each document's concepts to ``consolidated/`` without any LLM call.
+
+        This stage exists to merge duplicate concepts found in *different chunks
+        of the same document*. When the corpus was ingested with
+        ``--no-chunking`` every document is a single unit, so there are no
+        cross-chunk duplicates to find and no merge to decide.
+
+        Writing through the normal :meth:`persist_consolidation` path keeps the
+        output files, their schema and the checkpoint identical to a chunked
+        run, so every later stage is unaffected.
+
+        Args:
+            pending: Document items not yet recorded as consolidated. Each has
+                ``doc_id``, ``raw_concepts`` and ``output_dir``.
+
+        Returns:
+            None. Mutates ``self.log_data`` to mark each document complete.
+        """
+        # An empty merge decision is exactly "change nothing": running it through
+        # execute_programmatic_merge reuses the same normalisation as a real run
+        # instead of hand-rolling a second writer.
+        no_merges = DocumentConsolidationSchema()
+        for item in pending:
+            await self.persist_consolidation(item, no_merges)
+        if pending:
+            await save_log_async(self.log_file, self.log_data)
+            self.flush_count = 0
+
     async def run(self):
+        """Consolidate concepts within each document, then report the totals.
+
+        Chooses between the LLM merge pass and a no-op pass-through based on how
+        the corpus was ingested (see :func:`pipeline_lib.corpus.chunking_enabled`
+        and ``run_config.json``). Resumes from ``doc_consolidation_log.json``,
+        processing only documents not already marked complete.
+
+        Returns:
+            None. Writes ``consolidated/<doc_id>/concepts.json`` and
+            ``merge_clusters.json`` per document, plus the before/after concept
+            counts in the checkpoint log.
+
+        Raises:
+            RuntimeError: If any document is still unconsolidated after the pass,
+                which keeps the pipeline from advancing on partial output.
+        """
         doc_items = self.prepare_document_items()
         
         # Calculate total concepts before consolidation
@@ -330,7 +376,12 @@ class DocumentConsolidatorPipeline:
         print(f"Total raw concepts before consolidation: {total_concepts_before}")
         
         settings = self.settings
-        if pending:
+        if not chunking_enabled(self.base_wiki_dir):
+            print("Chunking was disabled for this corpus, so every document is a single")
+            print("unit and there are no cross-chunk duplicates to merge. Passing")
+            print(f"{len(pending)} document(s) through without any LLM call.")
+            await self.pass_through(pending)
+        elif pending:
             print(f"Spreading {len(pending)} document(s) across {len(settings.servers)} "
                   f"server(s) at {settings.concurrency_per_server} concurrent request(s) "
                   f"each (item i -> server i % N).")
