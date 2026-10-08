@@ -45,7 +45,8 @@ except Exception:
 # ── Server Configuration ─────────────────────────────────────────────────────
 from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path, run_dir_for
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
@@ -337,8 +338,8 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
           f"{settings.concurrency_per_server} concurrent request(s) each "
           f"(item i -> server i % N).")
 
-    debug_path = Path(args.wiki_base_dir) / args.domain / "global_consolidation_debug.jsonl"
-    debug = DebugLogger(debug_path, label=STAGE)
+    debug_path = log_path(run_dir_for(args), STAGE, "debug")
+    debug = EventLog(debug_path, label=STAGE)
     budget = StageBudget(settings.budget_minutes)
     print(f"Per-item attempts: {settings.attempts} | Stage budget: "
           f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
@@ -440,6 +441,7 @@ def global_consolidate(domain_dir: Path, args):
     consolidated_dir = domain_dir / "consolidated"
     concepts_dir = domain_dir / "concepts"
     log_file = domain_dir / "global_consolidation.json"
+    decisions = EventLog(log_path(domain_dir, STAGE, "decisions"), label=STAGE)
 
     if not consolidated_dir.exists():
         raise FileNotFoundError(f"No consolidated directory found at {consolidated_dir}")
@@ -484,6 +486,10 @@ def global_consolidate(domain_dir: Path, args):
     for root, concepts in exact_groups.items():
         title_counter = Counter(c.get("title", "").strip() for c in concepts)
         chosen_title = title_counter.most_common(1)[0][0]
+        merged_titles = sorted({c.get("title", "").strip() for c in concepts} - {chosen_title})
+        if merged_titles:
+            decisions.record("exact_merge", canonical=chosen_title, merged=merged_titles,
+                             members=len(concepts))
         
         all_aliases = set()
         all_descs = []
@@ -508,6 +514,8 @@ def global_consolidate(domain_dir: Path, args):
     # Apply LLM Approved Fuzzy Merges to UnionFind
     for cluster in approved_fuzzy_merges:
         primary = cluster.primary_title.strip()
+        decisions.record("fuzzy_merge", canonical=primary,
+                         merged=[m.strip() for m in cluster.merged_titles])
         uf.find(primary)
         for merged in cluster.merged_titles:
             uf.union(primary, merged.strip())

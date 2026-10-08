@@ -68,8 +68,12 @@ class FinalConsolidateTests(unittest.TestCase):
             self.assertIn("Step 1 Complete", out.stdout)
             # The macro scan writes its own raw-response log; find it by pattern
             # rather than hardcoding a name.
-            logs = [f for f in base.glob("*.jsonl") if "debug" not in f.name]
-            self.assertTrue(logs, f"no raw-response log written; have {sorted(x.name for x in base.iterdir())}")
+            llm_logs = sorted(f.name for f in (base / "log").glob("*.llm.jsonl"))
+            self.assertEqual(llm_logs, ["final-macro-scan.llm.jsonl"], llm_logs)
+            decisions = [json.loads(line) for line in
+                         (base / "log" / "final-macro-scan.decisions.jsonl").read_text().splitlines()]
+            # One macro_scan decision per alphabetical batch: six letters, six records.
+            self.assertEqual(sum(1 for d in decisions if d["event"] == "macro_scan"), 6)
             self.assertTrue(list(base.glob("*.json")), "no graph output written")
 
     def test_uneven_batch_count_still_balances(self):
@@ -87,8 +91,8 @@ class FinalConsolidateTests(unittest.TestCase):
             base = self._build(Path(tmp), letters="AB")
             with FakeVLLMCluster(1, responder=lambda p, i: NO_PAIRS) as cluster:
                 out = run(self._args(base, cluster.urls))
-            self.assertIn("final_macro_scan_debug.jsonl", out.stdout)
-            self.assertIn("final_deep_verify_debug.jsonl", out.stdout)
+            self.assertIn("final-macro-scan.debug.jsonl", out.stdout)
+            self.assertIn("final-deep-verify.debug.jsonl", out.stdout)
             # Both passes announced their own spread.
             self.assertEqual(out.stdout.count("item i -> server i % N"), 2)
 
@@ -101,11 +105,11 @@ class FinalConsolidateTests(unittest.TestCase):
                 self.assertEqual(cluster.total_requests, 2)
             self.assertIn("Final macro scan failed for 2 batch(es)",
                           proc.stdout + proc.stderr)
-            logs = [f for f in base.glob("*.jsonl") if "debug" not in f.name]
-            self.assertTrue(logs, "no raw-response log written")
-            entries = [json.loads(l) for f in logs for l in f.read_text().strip().splitlines()]
-            errors = [e for e in entries if "error" in e]
+            entries = [json.loads(line) for line in
+                       (base / "log" / "final-macro-scan.decisions.jsonl").read_text().splitlines()]
+            errors = [e for e in entries if e["event"] == "macro_scan_failed"]
             self.assertEqual(len(errors), 2, entries)
+            self.assertTrue(all(e["error"] for e in errors))
 
     def test_transient_faults_are_retried_not_fatal(self):
         with tempfile.TemporaryDirectory() as tmp:

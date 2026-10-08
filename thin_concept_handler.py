@@ -21,7 +21,8 @@ from tqdm.asyncio import tqdm
 # ── Configuration ────────────────────────────────────────────────────────────
 from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
@@ -73,7 +74,8 @@ class ThinConceptHandler:
 
         self.args = args
         self.settings = resolve_settings(args, STAGE)
-        self.debug = DebugLogger(self.domain_dir / "thin_concept_debug.jsonl", label=STAGE)
+        self.debug = EventLog(log_path(self.domain_dir, STAGE, "debug"), label=STAGE)
+        self.decisions = EventLog(log_path(self.domain_dir, STAGE, "decisions"), label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
         self.min_words = args.min_concept_words
 
@@ -231,6 +233,10 @@ CANDIDATE HOST CONCEPTS:
                     if r.get("target_concept", "").strip().lower() != thin_concept["title"].lower()
                 ]
 
+                self.decisions.record(
+                    "concept_folded", method="llm", thin_concept=thin_concept["title"],
+                    host=target_host["title"],
+                    description_rewritten=bool(decision.synthesized_description))
                 folded_titles.add(thin_concept["title"].lower())
 
             pool = ServerPool(
@@ -287,11 +293,14 @@ CANDIDATE HOST CONCEPTS:
                         best_host["source_chunks"] = sorted(list(best_host_chunks))
                         if c["title"] not in best_host.get("entities", []):
                             best_host.setdefault("entities", []).append(c["title"])
+                        self.decisions.record("concept_folded", method="deterministic", thin_concept=c["title"], host=best_host["title"], description_rewritten=bool(desc_to_add))
                         folded_titles.add(t_title_lower)
                         continue
 
                 # If no candidate host exists and it is ultra-thin (< 25 words), prune to prevent stub-like concepts
                 if words < 25 or len(c.get("outbound_relations", [])) == 0:
+                    self.decisions.record("concept_pruned", thin_concept=c["title"], words=words,
+                                          outbound_relations=len(c.get("outbound_relations", [])))
                     pruned_titles.add(t_title_lower)
 
         # Build Final Clean Graph: Absolutely zero thin concepts below min_words survived

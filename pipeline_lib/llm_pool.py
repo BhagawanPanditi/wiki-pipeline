@@ -24,7 +24,7 @@ import httpx
 from openai import AsyncOpenAI
 from tqdm import tqdm
 
-from .debug_log import DebugLogger
+from .event_log import EventLog
 from .llm_log import CURRENT_CALL, LLMCallLog, wrap_client
 from .errors import (AllServersUnhealthy, PermanentFailure, StageBudget,
                      TransientFailureExhausted, describe_error)
@@ -259,7 +259,7 @@ class ServerPool:
         desc: Optional[str] = None,
         key_fn: Optional[Callable[[Any], str]] = None,
         budget: Optional[StageBudget] = None,
-        debug: Optional[DebugLogger] = None,
+        debug: Optional[EventLog] = None,
         attempt_timeout: Optional[float] = None,
         on_result: Optional[Callable[[Any, Any], Awaitable[None]]] = None,
         show_progress: bool = True,

@@ -19,6 +19,8 @@ from tqdm import tqdm
 
 from pipeline_lib.atomic_io import atomic_write_json
 from pipeline_lib.cli import build_parser
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 
 STAGE = "entity-overlap"
 
@@ -97,6 +99,7 @@ def enrich_graph_via_entity_overlap(
     candidate_links.sort(key=lambda x: len(x[2]), reverse=True)
 
     node_link_budget: Dict[str, int] = defaultdict(int)
+    applied_links: List[Tuple[str, str, List[str], str]] = []
     added_links_by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     for t1, t2, shared_list in candidate_links:
@@ -123,6 +126,7 @@ def enrich_graph_via_entity_overlap(
         node_link_budget[t2] += 1
 
         G.add_edge(t1, t2)
+        applied_links.append((t1, t2, shared_list, rel_statement))
         new_edges_added += 1
 
     post_components = list(nx.connected_components(G))
@@ -137,6 +141,10 @@ def enrich_graph_via_entity_overlap(
         print("[DRY RUN] No files modified.")
         return
 
+    decisions = EventLog(log_path(domain_dir, STAGE, "decisions"), label=STAGE)
+    for t1, t2, shared_list, rel_statement in applied_links:
+        decisions.record("entity_link_added", a=t1, b=t2, shared_entities=shared_list,
+                         relation=rel_statement)
     # Update concepts in memory
     for c in concepts:
         title = c["title"]

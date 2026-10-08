@@ -33,7 +33,8 @@ from pipeline_lib.atomic_io import atomic_write_text
 from pipeline_lib.checkpoint import CheckpointLog
 from pipeline_lib.chunks import load_cached_chunks
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
@@ -141,7 +142,7 @@ class WikiVerifierPipeline:
         # Pass 2 consumes phase 1's missing_concepts / missing_facts.
         self.result_filename = PASS1_RESULT if self.phase == 1 else PASS2_RESULT
         log_name = "verification_log.json" if self.phase == 1 else "verification_pass2_log.json"
-        debug_name = "verification_debug.jsonl" if self.phase == 1 else "verification_pass2_debug.jsonl"
+        debug_stage = self.stage  # log/<stage>.debug.jsonl: one file per phase
         self.verification_log_file = self.base_wiki_dir / log_name
 
         if not self.staging_dir.exists():
@@ -150,7 +151,7 @@ class WikiVerifierPipeline:
             )
 
         self.checkpoint = CheckpointLog(self.verification_log_file, flush_every=50)
-        self.debug = DebugLogger(self.base_wiki_dir / debug_name, label=self.stage)
+        self.debug = EventLog(log_path(self.base_wiki_dir, debug_stage, "debug"), label=self.stage)
         self.budget = StageBudget(self.settings.budget_minutes)
         self.verification_failures: Dict[str, str] = {}
 
@@ -382,7 +383,7 @@ EXTRACTED CONCEPTS JSON:
             max_connections_slack=20,
             label=self.stage,
             # Each phase gets its own log file, matching its own debug log and
-            # checkpoint: logs/verification.jsonl vs logs/verification-pass2.jsonl.
+            # checkpoint: log/verification.llm.jsonl vs log/verification-pass2.llm.jsonl.
             llm_log=LLMCallLog.from_args(self.args, self.stage),
             failover=not getattr(self.args, "no_failover", False),
         )

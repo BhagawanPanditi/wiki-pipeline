@@ -278,8 +278,9 @@ def main() -> None:
     """Render the refined concept graph as one Markdown file per concept.
 
     Reads ``global_concepts_refined.json`` from the run directory and writes an
-    Obsidian-style Markdown page per concept, with citations resolved through
-    ``cache/doc_mapping.json``.
+    Obsidian-style Markdown page per concept. Citations keep the canonical
+    ``canon_<hash>`` document ids; ``doc_mapping.json`` in the run directory maps
+    each original document id to its canonical id.
 
     Returns:
         None. Writes to ``--output_dir`` if given, otherwise

@@ -9,7 +9,7 @@ Pinned behaviour:
   * ``.json`` array and ``.jsonl`` corpora are both accepted, auto-detected.
   * ``contents``/``content`` and ``id``/``doc_id`` spellings are normalised.
   * Identical documents are deduplicated to one ``canon_<hash>`` unit, and the
-    original ids survive in ``cache/doc_mapping.json``.
+    original ids survive in ``doc_mapping.json``.
   * ``--domain`` is optional: without it outputs land in ``default/``.
   * ``run_config.json`` records the chunking decision for later stages.
   * A bad corpus fails loudly, naming the file and the record.
@@ -110,7 +110,7 @@ class CorpusIngestTests(unittest.TestCase):
                             f"expected domainless output in 'default/', have "
                             f"{sorted(p.name for p in (root / 'wiki').iterdir())}")
 
-            mapping = json.loads((run_dir / "cache" / "doc_mapping.json").read_text())
+            mapping = json.loads((run_dir / "doc_mapping.json").read_text())
             self.assertEqual(sorted(mapping), ["doc-A", "doc-B"])
             self.assertTrue(all(v.startswith("canon_") for v in mapping.values()))
             self.assertEqual(len(set(mapping.values())), 2)
@@ -152,7 +152,7 @@ class CorpusIngestTests(unittest.TestCase):
 
             run_dir = root / "wiki" / "biology"
             self.assertTrue(run_dir.is_dir())
-            mapping = json.loads((run_dir / "cache" / "doc_mapping.json").read_text())
+            mapping = json.loads((run_dir / "doc_mapping.json").read_text())
             self.assertEqual(sorted(mapping), ["x1", "x2"])
             config = json.loads((run_dir / "run_config.json").read_text())
             self.assertEqual(config["domain"], "biology")
@@ -177,7 +177,7 @@ class CorpusIngestTests(unittest.TestCase):
                 self.assertEqual(cluster.total_requests, 2)
 
             run_dir = root / "wiki" / "default"
-            mapping = json.loads((run_dir / "cache" / "doc_mapping.json").read_text())
+            mapping = json.loads((run_dir / "doc_mapping.json").read_text())
             self.assertEqual(len(mapping), 3)
             self.assertEqual(mapping["first"], mapping["third"])
             self.assertNotEqual(mapping["first"], mapping["second"])
@@ -202,7 +202,7 @@ class CorpusIngestTests(unittest.TestCase):
             (cache / "chunks_cache.json").write_text(json.dumps(
                 [{"doc_id": "canon_x", "chunk_id": "chunk_000", "current_chunk": "old",
                   "context_before": "", "context_after": ""}]))
-            (cache / "doc_mapping.json").write_text(json.dumps({"d1": "canon_x"}))
+            (cache.parent / "doc_mapping.json").write_text(json.dumps({"d1": "canon_x"}))
 
             from pipeline_lib.corpus import cache_manifest
             (cache / "chunks_cache_manifest.json").write_text(json.dumps(cache_manifest(
@@ -263,7 +263,7 @@ class CorpusIngestTests(unittest.TestCase):
             run_dir = root / "wiki" / "biology"
             config = json.loads((run_dir / "run_config.json").read_text())
             self.assertTrue(config["corpus"].endswith("biology.jsonl"))
-            mapping = json.loads((run_dir / "cache" / "doc_mapping.json").read_text())
+            mapping = json.loads((run_dir / "doc_mapping.json").read_text())
             self.assertEqual(sorted(mapping), ["legacy"])
             self.assertTrue(mapping["legacy"].startswith("canon_"))
 

@@ -130,14 +130,13 @@ class LLMCallLogTests(unittest.TestCase):
             with FakeVLLMCluster(1, responder=lambda p, i: verdict) as servers:
                 run(DOC_STAGE, self._args(base, servers.urls))
 
-            log = run_dir / "logs" / "document-consolidation.jsonl"
+            log = run_dir / "log" / "document-consolidation.llm.jsonl"
             records = read_jsonl(log)
             self.assertEqual(len(records), 1)
             rec = records[0]
 
             self.assertTrue(rec["ok"])
             self.assertEqual(rec["stage"], "document-consolidation")
-            self.assertEqual(rec["mode"], "full")
             self.assertFalse(rec["response"]["truncated"])
             self.assertEqual(rec["response"]["chars"], len(json.dumps(verdict)))
             self.assertIn(WIDE, rec["response"]["text"])
@@ -163,8 +162,7 @@ class LLMCallLogTests(unittest.TestCase):
             with FakeVLLMCluster(1, responder=lambda p, i: verdict) as servers:
                 run(DOC_STAGE, self._args(base, servers.urls, llm_log="compact"))
 
-            rec = read_jsonl(run_dir / "logs" / "document-consolidation.jsonl")[0]
-            self.assertEqual(rec["mode"], "compact")
+            rec = read_jsonl(run_dir / "log" / "document-consolidation.llm.jsonl")[0]
             self.assertTrue(rec["response"]["truncated"])
             self.assertLess(len(rec["response"]["text"]), 2400)
             # The original size is still known, so truncation is never silent.
@@ -180,7 +178,7 @@ class LLMCallLogTests(unittest.TestCase):
                 run(DOC_STAGE, self._args(base, servers.urls, llm_log="errors"))
                 self.assertEqual(servers.total_requests, 1)
 
-            log = run_dir / "logs" / "document-consolidation.jsonl"
+            log = run_dir / "log" / "document-consolidation.llm.jsonl"
             self.assertFalse(log.exists(),
                              "errors mode must not write a file for a clean run")
 
@@ -195,14 +193,14 @@ class LLMCallLogTests(unittest.TestCase):
                         expect_rc=1)
                     attempts = servers.total_requests
 
-                records = read_jsonl(run_dir / "logs" / "document-consolidation.jsonl")
+                records = read_jsonl(run_dir / "log" / "document-consolidation.llm.jsonl")
                 self.assertTrue(records, f"{mode}: nothing logged for a failed run")
 
                 # The HTTP exchange succeeded (200 with a garbage body), so the
                 # stage's refusal is a separate "rejection" line. Without it,
                 # errors mode would report a clean run.
-                calls = [r for r in records if r["kind"] == "call"]
-                rejects = [r for r in records if r["kind"] == "rejection"]
+                calls = [r for r in records if r["event"] == "call"]
+                rejects = [r for r in records if r["event"] == "rejection"]
                 # errors mode drops successful HTTP exchanges by design; the
                 # other modes keep one call line per request actually issued.
                 expected_calls = 0 if mode == "errors" else attempts
@@ -222,7 +220,7 @@ class LLMCallLogTests(unittest.TestCase):
                 if mode == "errors":
                     # Successes are dropped, but a refused response is not one.
                     self.assertEqual(len(records), attempts)
-                    self.assertTrue(all(r["kind"] == "rejection" for r in records))
+                    self.assertTrue(all(r["event"] == "rejection" for r in records))
                 else:
                     for rec in calls:
                         self.assertIn("not json", rec["response"]["text"],
@@ -252,11 +250,11 @@ class LLMCallLogTests(unittest.TestCase):
                                   "--servers", *servers.urls,
                                   "--stage_budget_minutes", "2"])
 
-            macro = read_jsonl(run_dir / "logs" / "final-macro-scan.jsonl")
+            macro = read_jsonl(run_dir / "log" / "final-macro-scan.llm.jsonl")
             self.assertTrue(macro)
             self.assertTrue(all(r["stage"] == "final-macro-scan" for r in macro))
             self.assertTrue(all(r["item"].startswith("letter:") for r in macro))
-            self.assertFalse((run_dir / "logs" / "final-deep-verify.jsonl").exists(),
+            self.assertFalse((run_dir / "log" / "final-deep-verify.llm.jsonl").exists(),
                              "deep verify made no calls, so it should leave no log")
 
     def test_log_lives_inside_the_wiki_dir_not_the_repo(self):
@@ -266,11 +264,12 @@ class LLMCallLogTests(unittest.TestCase):
             run_dir = self._stage_doc(base)
             with FakeVLLMCluster(1, responder=lambda p, i: {"merge_clusters": []}) as servers:
                 run(DOC_STAGE, self._args(base, servers.urls))
-            self.assertTrue((run_dir / "logs").is_dir())
-            self.assertEqual(sorted(p.name for p in (run_dir / "logs").iterdir()),
-                             ["document-consolidation.jsonl"])
+            self.assertTrue((run_dir / "log").is_dir())
+            self.assertEqual(sorted(p.name for p in (run_dir / "log").iterdir()),
+                             ["document-consolidation.decisions.jsonl",
+                              "document-consolidation.llm.jsonl"])
             # Nothing leaked into the repository working tree.
-            self.assertFalse(list(REPO_ROOT.glob("logs")))
+            self.assertFalse(list(REPO_ROOT.glob("log")))
 
 
 if __name__ == "__main__":

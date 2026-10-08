@@ -18,7 +18,8 @@ from tqdm import tqdm
 
 from pipeline_lib.atomic_io import atomic_write_json
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.llm_log import LLMCallLog
 from pipeline_lib.llm_pool import ServerPool
@@ -93,6 +94,7 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                     missing_reverse.append((c["title"].lower().strip(), tgt, rel_str))
 
     print(f"Found {len(missing_reverse)} directional edges that lack a reverse link.")
+    decisions = EventLog(log_path(domain_dir, STAGE, "decisions"), label=STAGE)
 
     if not missing_reverse:
         print("All relationships are already bidirectional!")
@@ -112,9 +114,11 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                 "relation": reverse_desc,
                 "source_chunks": []
             })
+            decisions.record("reverse_link_added", method="template", source=concept_b["title"],
+                             target=title_a, relation=reverse_desc)
     else:
         settings = resolve_settings(args, STAGE)
-        debug = DebugLogger(domain_dir / "reverse_relations_debug.jsonl", label=STAGE)
+        debug = EventLog(log_path(domain_dir, STAGE, "debug"), label=STAGE)
         budget = StageBudget(settings.budget_minutes)
         failed_relations: List[Tuple[str, str]] = []
 
@@ -165,6 +169,9 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                     "relation": rev_text,
                     "source_chunks": []
                 })
+            decisions.record("reverse_link_added", method="llm", source=concept_b["title"],
+                             target=concept_a["title"], relation=rev_text,
+                             updated_existing=existing_rel is not None)
 
         print(f"Synthesizing reverse relations using LLM pool across {len(settings.servers)} servers...")
         print(f"Spreading {len(missing_reverse)} edge(s) at {settings.concurrency_per_server} "

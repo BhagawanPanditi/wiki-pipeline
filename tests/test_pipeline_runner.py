@@ -102,7 +102,7 @@ if script == "concept_extraction_pass_1.py":
     cache = run_dir / "cache"
     cache.mkdir(parents=True, exist_ok=True)
     (cache / "chunks_cache.json").write_text(json.dumps(units))
-    (cache / "doc_mapping.json").write_text(json.dumps(mapping))
+    (run_dir / "doc_mapping.json").write_text(json.dumps(mapping))
     (cache / "chunks_cache_manifest.json").write_text(json.dumps(cache_manifest(
         corpus, tokenizer_name=tokenizer_name, chunking=chunking,
         chunk_size=chunk_size, overlap=overlap)))

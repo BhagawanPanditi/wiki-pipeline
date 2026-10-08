@@ -4,7 +4,7 @@ The debug log answers "what went wrong". This answers "what exactly did we ask
 the model, and what exactly did it say" -- for every call, successful or not.
 Each stage writes its own file at::
 
-    <wiki_base_dir>/<domain>/logs/<stage>.jsonl
+    <wiki_base_dir>/<domain>/log/<stage>.llm.jsonl
 
 One JSON object per line, one line per HTTP request actually issued (so a
 retried item produces one line per attempt). Lines are flushed as they happen,
@@ -20,7 +20,7 @@ a buffer that was never written.
   than silent.
 * ``errors``         -- failed calls only. Successful traffic is not written.
 
-Each line carries a ``kind`` field. ``"call"`` is the HTTP exchange itself;
+Each line carries an ``event`` field. ``"call"`` is the HTTP exchange itself;
 ``"rejection"`` is the stage deciding the response was unusable (bad JSON, a
 schema mismatch, a ``finish_reason`` of ``length``). The distinction matters
 because the most common failure in this pipeline is a *successful* HTTP response
@@ -34,11 +34,12 @@ always records ``truncated`` plus the original character counts.
 
 import contextvars
 import json
-import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from .event_log import EventLog
+from .layout import log_path, run_dir_for
 
 # The three accepted --llm_log values, in the order shown in --help.
 MODES = ("full", "compact", "errors")
@@ -51,16 +52,6 @@ COMPACT_CHAR_LIMIT = 2000
 # identity down through their own call stack.
 CURRENT_CALL: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
     "CURRENT_CALL", default={})
-
-
-def utc_now() -> str:
-    """Return the current UTC time as an ISO-8601 string with a Z suffix.
-
-    Returns:
-        e.g. ``"2026-10-08T14:03:22.481930+00:00"``. Used as the ``ts`` field of
-        every log line so records can be ordered across stages and servers.
-    """
-    return datetime.now(timezone.utc).isoformat()
 
 
 def truncate(text: Optional[str], limit: int = COMPACT_CHAR_LIMIT) -> Dict[str, Any]:
@@ -114,8 +105,7 @@ class LLMCallLog:
         self.path = Path(path)
         self.mode = mode if mode in MODES else "full"
         self.stage = stage
-        self._handle = None
-        self._lock = threading.Lock()
+        self._events = EventLog(self.path, label=stage)
         self.calls = 0
         self.failures = 0
         self.rejections = 0
@@ -131,10 +121,9 @@ class LLMCallLog:
 
         Returns:
             An :class:`LLMCallLog` writing to
-            ``<wiki_base_dir>/<domain>/logs/<stage>.jsonl``.
+            ``<wiki_base_dir>/<domain>/log/<stage>.llm.jsonl``.
         """
-        base = Path(getattr(args, "wiki_base_dir", ".")) / getattr(args, "domain", "default")
-        return cls(base / "logs" / f"{stage}.jsonl",
+        return cls(log_path(run_dir_for(args), stage, "llm"),
                    mode=getattr(args, "llm_log", "full") or "full",
                    stage=stage)
 
@@ -156,24 +145,18 @@ class LLMCallLog:
         """
         return 0 if self.mode == "full" else COMPACT_CHAR_LIMIT
 
-    def _write(self, entry: Dict[str, Any]) -> None:
-        """Serialise one entry and flush it to disk.
+    def _write(self, event: str, fields: Dict[str, Any]) -> None:
+        """Append one event through the shared :class:`EventLog`.
 
         Args:
-            entry: JSON-serialisable record.
+            event: ``"call"`` or ``"rejection"``.
+            fields: The event's payload. The stage name and timestamp are added
+                by :class:`EventLog`, so they are not repeated here.
 
         Returns:
-            None. Failures to write are swallowed after being noted on the entry
-            path's caller -- a logging problem must never take down a stage that
-            is otherwise making progress.
+            None.
         """
-        line = json.dumps(entry, ensure_ascii=False, default=str)
-        with self._lock:
-            if self._handle is None:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._handle = self.path.open("a", encoding="utf-8")
-            self._handle.write(line + "\n")
-            self._handle.flush()
+        self._events.record(event, **fields)
 
     @staticmethod
     def _request_summary(kwargs: Dict[str, Any], limit: int) -> Dict[str, Any]:
@@ -265,11 +248,7 @@ class LLMCallLog:
             return
         limit = self._limit()
         text = self._response_text(completion)
-        entry = {
-            "ts": utc_now(),
-            "stage": self.stage,
-            "mode": self.mode,
-            "kind": "call",
+        fields = {
             "ok": True,
             "server": server,
             "latency_ms": round(latency_ms, 2),
@@ -277,8 +256,8 @@ class LLMCallLog:
             "request": self._request_summary(kwargs, limit),
             "response": truncate(text, limit),
         }
-        entry.update(self._context())
-        self._write(entry)
+        fields.update(self._context())
+        self._write("call", fields)
 
     def failure(self, *, server: str, kwargs: Dict[str, Any], error: BaseException,
                 latency_ms: float, classification: Optional[str] = None) -> None:
@@ -299,11 +278,7 @@ class LLMCallLog:
         """
         self.calls += 1
         self.failures += 1
-        entry = {
-            "ts": utc_now(),
-            "stage": self.stage,
-            "mode": self.mode,
-            "kind": "call",
+        fields = {
             "ok": False,
             "server": server,
             "latency_ms": round(latency_ms, 2),
@@ -313,8 +288,8 @@ class LLMCallLog:
             "request": self._request_summary(kwargs, self._limit()),
             "response": None,
         }
-        entry.update(self._context())
-        self._write(entry)
+        fields.update(self._context())
+        self._write("call", fields)
 
     def rejection(self, *, server: str, error: BaseException,
                   classification: Optional[str] = None) -> None:
@@ -336,19 +311,15 @@ class LLMCallLog:
             written by :meth:`success` on the same attempt, in the same mode.
         """
         self.rejections += 1
-        entry = {
-            "ts": utc_now(),
-            "stage": self.stage,
-            "mode": self.mode,
-            "kind": "rejection",
+        fields = {
             "ok": False,
             "server": server,
             "error_type": type(error).__name__,
             "error_message": str(error),
             "classification": classification,
         }
-        entry.update(self._context())
-        self._write(entry)
+        fields.update(self._context())
+        self._write("rejection", fields)
 
     def close(self) -> None:
         """Flush and close the underlying file, if it was ever opened.
@@ -357,13 +328,7 @@ class LLMCallLog:
             None. Safe to call more than once and safe to call when nothing was
             written.
         """
-        with self._lock:
-            if self._handle is not None:
-                try:
-                    self._handle.flush()
-                    self._handle.close()
-                finally:
-                    self._handle = None
+        self._events.close()
 
     def __enter__(self) -> "LLMCallLog":
         """Return self so the log can be used in a ``with`` block.

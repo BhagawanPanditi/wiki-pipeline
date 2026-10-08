@@ -112,7 +112,7 @@ class FuzzyPassTests(unittest.TestCase):
                 self.assertIn("LLM fuzzy review failed", str(caught.exception))
                 self.assertIn("1 cluster", str(caught.exception))
 
-            debug = Path(tmp) / "biology" / "global_consolidation_debug.jsonl"
+            debug = Path(tmp) / "biology" / "log" / "global-consolidation.debug.jsonl"
             self.assertTrue(debug.is_file(), "no debug log written on failure")
             errors = [json.loads(line) for line in debug.read_text().splitlines() if line.strip()]
             self.assertTrue(errors, "debug log is empty after a failed cluster")

@@ -24,7 +24,8 @@ from tqdm import tqdm
 
 from pipeline_lib.atomic_io import atomic_write_json
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.llm_log import LLMCallLog
 from pipeline_lib.llm_pool import ServerPool
@@ -112,7 +113,7 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
         raise RuntimeError("Island auditing found work to do, but no LLM servers are configured.")
 
     settings = resolve_settings(args, STAGE)
-    debug = DebugLogger(domain_dir / "island_audit_debug.jsonl", label=STAGE)
+    debug = EventLog(log_path(domain_dir, STAGE, "debug"), label=STAGE)
     budget = StageBudget(settings.budget_minutes)
 
     prune_titles_set: Set[str] = set()
@@ -126,8 +127,7 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
     print(f"Per-item attempts: {settings.attempts} | Stage budget: "
           f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
 
-    audit_log_path = domain_dir / "island_audit_log.jsonl"
-    log_f = open(audit_log_path, "w", encoding="utf-8")
+    decisions = EventLog(log_path(domain_dir, STAGE, "decisions"), label=STAGE)
 
     def build_audit_prompt(comp: List[str]) -> str:
         island_payload = []
@@ -200,9 +200,13 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
         rel_ab = res_json.get("relation_to_sibling")
         rel_ba = res_json.get("relation_from_sibling")
 
-        log_entry = {"comp": comp, "decision": decision, "response": res_json}
-        log_f.write(json.dumps(log_entry) + "\n")
-        log_f.flush()
+        applied = decision == "PRUNE" or (
+            decision in ("MERGE", "LINK") and bool(target_sib)
+            and target_sib.lower().strip() in title_map)
+        decisions.record("island_verdict", island_titles=comp, decision=decision,
+                         applied=applied, target_sibling=target_sib,
+                         relation_to_sibling=rel_ab, relation_from_sibling=rel_ba,
+                         reason=res_json.get("reason"))
 
         if decision == "PRUNE":
             for t_lower in comp:
@@ -243,7 +247,7 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
                 on_result=record_verdict,
             )
     finally:
-        log_f.close()
+        decisions.close()
         debug.close()
 
     # An island that never produced a verdict is a failure, exactly as before.

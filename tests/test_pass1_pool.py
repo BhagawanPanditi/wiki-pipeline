@@ -49,7 +49,7 @@ def make_pipeline(root: Path, servers):
                               "--stage_budget_minutes", "2"])
     pipe = pass1.WikiExtractorPipeline(args)
     pipe.settings = pass1.resolve_settings(args, pass1.STAGE)
-    pipe.debug = pass1.DebugLogger(pipe.base_wiki_dir / "pass1_extraction_debug.jsonl",
+    pipe.debug = pass1.EventLog(pass1.log_path(pipe.base_wiki_dir, pass1.STAGE, "debug"),
                                    label=pass1.STAGE)
     pipe.budget = pass1.StageBudget(pipe.settings.budget_minutes)
     pipe.attempt_errors = {}

@@ -1,9 +1,9 @@
-"""Streaming, untruncated debug and error sinks.
+"""Streaming, untruncated JSONL event log.
 
-Every stage needs the same thing when an LLM call misbehaves: the full prompt,
-the full raw response and the full traceback, written to disk the moment the
-event happens rather than buffered until the end of a multi-hour run. Nothing
-here truncates. Raw responses are stored verbatim so a malformed 8k-token
+One class serves every log a stage writes: decision records ("stub absorbed into
+X"), failure evidence (full prompt, raw response, traceback) and any other
+event. Each event is written the moment it happens rather than buffered until
+the end of a multi-hour run, and nothing is truncated, so a malformed 8k-token
 payload can be replayed offline.
 
 Records are newline-delimited JSON, which keeps a partially written last line
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-class DebugLogger:
+class EventLog:
     """Append-only JSONL sink with immediate, untruncated writes."""
 
     def __init__(self, path: Path, *, enabled: bool = True, fsync_every: int = 20,
@@ -41,6 +41,7 @@ class DebugLogger:
         self._handle = None
         self._since_fsync = 0
         self.records_written = 0
+        self._warned = False
         if self.enabled:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -67,9 +68,13 @@ class DebugLogger:
                 if self._since_fsync >= self.fsync_every:
                     os.fsync(self._handle.fileno())
                     self._since_fsync = 0
-            except OSError:
-                # Losing a debug line must never kill a pipeline stage.
-                pass
+            except OSError as exc:
+                # A lost log line must never kill a stage that is otherwise
+                # making progress, but it must not vanish silently either.
+                if not self._warned:
+                    self._warned = True
+                    print(f"WARNING: could not write to {self.path}: {exc}. "
+                          f"Further write errors to this log are suppressed.")
 
     async def arecord(self, event: str, **fields: Any) -> None:
         """Thread-offloaded ``record`` so large payloads do not block the loop."""
@@ -126,7 +131,7 @@ class DebugLogger:
                 self._handle.close()
                 self._handle = None
 
-    def __enter__(self) -> "DebugLogger":
+    def __enter__(self) -> "EventLog":
         """Return the logger for use in a ``with`` block.
 
         Returns:

@@ -21,7 +21,8 @@ from tqdm.asyncio import tqdm
 # ── Configuration ────────────────────────────────────────────────────────────
 from pipeline_lib.atomic_io import atomic_write_json
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import PermanentFailure, StageBudget, TransientFailureExhausted
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
@@ -90,7 +91,7 @@ class StubResolver:
         
         self.args = args
         self.settings = resolve_settings(args, STAGE)
-        self.debug = DebugLogger(self.domain_dir / "stub_resolution_debug.jsonl",
+        self.debug = EventLog(log_path(self.domain_dir, STAGE, "debug"),
                                  label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
 
@@ -251,9 +252,15 @@ class StubResolver:
         }
 
     async def run(self):
+        self.decisions = EventLog(log_path(self.domain_dir, STAGE, "decisions"), label=STAGE)
         self.load_data()
         major_stubs = [s for s in self.stubs if len(s.get("source_chunks", [])) > 2]
         minor_stubs_set = {s["stub_name"] for s in self.stubs if len(s.get("source_chunks", [])) <= 2}
+        self.decisions.record(
+            "stubs_detected",
+            major=[{"stub": s["stub_name"], "source_chunks": s.get("source_chunks", [])} for s in major_stubs],
+            minor=[{"stub": s["stub_name"], "source_chunks": s.get("source_chunks", [])}
+                   for s in self.stubs if len(s.get("source_chunks", [])) <= 2])
         
         new_concepts = []
         failed_stubs = []
@@ -272,10 +279,14 @@ class StubResolver:
             async def classify_result(stub, res):
                 if res["status"] == "success":
                     new_concepts.append(res["concept"])
+                    self.decisions.record("stub_synthesized", stub=res["stub"], title=res["concept"]["title"], source_chunks=res["concept"]["source_chunks"], aliases=res["concept"]["aliases"], relations=len(res["concept"]["outbound_relations"]))
                 elif res["status"] == "failed":
                     failed_stubs.append({"stub": res["stub"],
                                          "failed_chunks": res.get("failed_chunks", [])})
+                    self.decisions.record("stub_failed", stub=res["stub"], failed_chunks=res.get("failed_chunks", []))
                 else:
+                    self.decisions.record("stub_downgraded", stub=res["stub"], reason="no chunk produced a valid concept")
+
                     minor_stubs_set.add(res["stub"])
 
             pool = ServerPool(
@@ -333,6 +344,8 @@ class StubResolver:
                     concept_sources = set(concept.get("source_chunks", []))
                     concept_sources.update(rel.get("source_chunks", []))
                     concept["source_chunks"] = sorted(list(concept_sources))
+                    
+                    self.decisions.record("stub_absorbed", stub=canonical_stub_name, into=concept["title"], relation=rel_text or None)
                     
                     if canonical_stub_name not in concept.get("entities", []):
                         concept.setdefault("entities", []).append(canonical_stub_name)

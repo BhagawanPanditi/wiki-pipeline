@@ -90,7 +90,7 @@ Output goes to <wiki-base-dir>/<domain or 'default'>/.
 
 Tuning:
   --llm-log MODE       full (default, complete prompt and response), compact,
-                       or errors. Written to logs/<stage>.jsonl in the run dir.
+                       or errors. Written to log/<stage>.llm.jsonl in the run dir.
   --servers URL ...    Override config.json; work is spread evenly across them.
   --item-attempts N    Retries per LLM call inside a stage.
   --stage-budget-minutes MIN
@@ -229,7 +229,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_NAME="${DOMAIN:-$DEFAULT_RUN_NAME}"
 DOMAIN_DIR="${WIKI_BASE_DIR}/${RUN_NAME}"
 STATE_DIR="${DOMAIN_DIR}/.pipeline_state"
-LOG_DIR="${DOMAIN_DIR}/pipeline_logs"
+LOG_DIR="${DOMAIN_DIR}/log"
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
 # Arguments forwarded to every stage script so one command line controls the
@@ -394,6 +394,7 @@ step_outputs_ready() {
         pass1-extraction)
             [[ -s "$DOMAIN_DIR/cache/chunks_cache.json" && \
               -s "$DOMAIN_DIR/cache/chunks_cache_manifest.json" && \
+              -s "$DOMAIN_DIR/doc_mapping.json" && \
               -s "$DOMAIN_DIR/extraction_log.json" ]] && pass1_outputs_current
             ;;
         verification)
@@ -468,7 +469,7 @@ run_step() {
     shift
     local marker="$STATE_DIR/${step}.done"
     local failed_marker="$STATE_DIR/${step}.failed"
-    local step_log="$LOG_DIR/${step}.log"
+    local step_log="$LOG_DIR/${step}.run.log"
     local attempt=1
     local delay=15
     local rc=0
@@ -546,7 +547,7 @@ cat <<EOF
  Domain hint:      ${DOMAIN:-none (outputs to '${RUN_NAME}/', prompts omit it)}
  Run directory:    ${DOMAIN_DIR}
  Chunking:         ${CHUNKING} (size ${CHUNK_SIZE}, overlap ${CHUNK_OVERLAP})
- LLM call log:     ${LLM_LOG} -> ${DOMAIN_DIR}/logs/
+ LLM call log:     ${LLM_LOG} (per stage, under ${LOG_DIR}/)
  Fresh run:        ${FRESH}
  Retry forever:    ${RETRY_FOREVER}
  Max stage tries:  ${MAX_STAGE_ATTEMPTS}
@@ -554,7 +555,7 @@ cat <<EOF
  Stage budget:     ${STAGE_BUDGET_MINUTES:-stage default} minutes
  Server override:  ${SERVERS[*]:-from config.json}
  Checkpoints:      ${STATE_DIR}
- Stage logs:       ${LOG_DIR}
+ Logs:              ${LOG_DIR}/ (stage LLM calls, decisions, debug, step output)
 ========================================================================
 EOF
 
@@ -600,9 +601,8 @@ cat <<EOF
  PIPELINE RUN COMPLETE
  Output Markdown files: ${DOMAIN_DIR}/concepts_md/
  Output concept graph:  ${DOMAIN_DIR}/global_concepts_refined.json
- Citation doc mapping:  ${DOMAIN_DIR}/cache/doc_mapping.json
+ Citation doc mapping:  ${DOMAIN_DIR}/doc_mapping.json
  Verification scores:   ${DOMAIN_DIR}/verification_summary.json
- LLM call logs:         ${DOMAIN_DIR}/logs/
- Stage logs/markers:    ${LOG_DIR}/ and ${STATE_DIR}/
+ Logs:                 ${LOG_DIR}/
 ========================================================================
 EOF

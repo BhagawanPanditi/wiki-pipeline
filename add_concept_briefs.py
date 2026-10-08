@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field
 
 from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
@@ -92,7 +93,7 @@ class ConceptBriefPipeline:
         self.domain_dir = Path(args.wiki_base_dir) / args.domain
         self.refined_file = self.domain_dir / "global_concepts_refined.json"
         self.concepts_dir = self.domain_dir / "concepts"
-        self.debug = DebugLogger(self.domain_dir / "brief_generation_debug.jsonl",
+        self.debug = EventLog(log_path(self.domain_dir, STAGE, "debug"),
                                  label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
 

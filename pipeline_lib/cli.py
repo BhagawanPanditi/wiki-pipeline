@@ -224,7 +224,7 @@ def add_common_args(
                              "<wiki_base_dir>/<domain or 'default'>/.")
     parser.add_argument("--llm_log", type=str, choices=("full", "compact", "errors"),
                         default="full",
-                        help="What to record in logs/llm_calls.jsonl for this stage: "
+                        help="What to record in log/<stage>.llm.jsonl for this stage: "
                              "'full' (default) keeps the complete untruncated prompt and "
                              "response, 'compact' truncates both, 'errors' keeps failures "
                              "only.")

@@ -22,7 +22,8 @@ from tqdm.asyncio import tqdm
 from pipeline_lib.checkpoint import load_bool_log, save_log_async, save_log_sync
 from pipeline_lib.chunks import load_cached_chunks
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string as _extract_json
 from pipeline_lib.llm_log import LLMCallLog
@@ -348,6 +349,11 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
 
         # 3. Apply updates & merged output to concepts.json
         merged_data = self.apply_merges(item["pass1_concepts"], delta)
+        self.decisions.record(
+            "concept_refined", chunk=key,
+            concepts_updated=[{"title": u.title, "aliases_added": list(u.additional_aliases),
+                               "sentences_added": len(u.additional_description_sentences)}
+                              for u in delta.concept_updates])
         merged_payload = json.dumps(merged_data, indent=2)
         await asyncio.to_thread(concepts_file.write_text, merged_payload, encoding="utf-8")
 
@@ -436,7 +442,8 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
 
     async def run(self):
         self.settings = resolve_settings(self.args, STAGE)
-        self.debug = DebugLogger(self.base_wiki_dir / "pass2_refinement_debug.jsonl",
+        self.decisions = EventLog(log_path(self.base_wiki_dir, STAGE, "decisions"), label=STAGE)
+        self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
                                  label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
         self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}

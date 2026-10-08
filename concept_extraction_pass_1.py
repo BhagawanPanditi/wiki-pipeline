@@ -17,7 +17,8 @@ from pipeline_lib.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
                                  build_units, cache_manifest, deduplicate,
                                  load_corpus, resolve_corpus_path,
                                  save_run_config)
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import PermanentFailure, StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
@@ -157,7 +158,8 @@ class WikiExtractorPipeline:
         with ``--corpus`` or resolved from the legacy ``--data_dir``/``--domain``
         layout. Documents with identical content are collapsed into one
         canonical document; the original ids are written to
-        ``cache/doc_mapping.json`` so citations can be traced back to the source.
+        ``doc_mapping.json`` in the run directory so citations can be traced back to
+        the source.
 
         Chunking is optional. With ``--no-chunking`` each document becomes a
         single unit and no tokenizer is loaded, so ``transformers`` and an
@@ -179,7 +181,7 @@ class WikiExtractorPipeline:
         """
         chunks_cache_file = self.cache_dir / "chunks_cache.json"
         cache_manifest_file = self.cache_dir / "chunks_cache_manifest.json"
-        mapping_file = self.cache_dir / "doc_mapping.json"
+        mapping_file = self.base_wiki_dir / "doc_mapping.json"
 
         corpus_path = resolve_corpus_path(self.args)
         chunking = bool(getattr(self.args, "chunking", True))
@@ -392,7 +394,7 @@ class WikiExtractorPipeline:
 
     async def run(self):
         self.settings = resolve_settings(self.args, STAGE)
-        self.debug = DebugLogger(self.base_wiki_dir / "pass1_extraction_debug.jsonl",
+        self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
                                  label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
         self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}
@@ -477,7 +479,7 @@ def main() -> None:
     Reads the corpus given by ``--corpus`` (or the legacy
     ``--data_dir``/``--domain`` pair), extracts concepts from every unit through
     the server pool, and writes per-chunk results under ``staging/`` plus the
-    citation mapping under ``cache/doc_mapping.json``. Resumes from
+    citation mapping under ``doc_mapping.json``. Resumes from
     ``extraction_log.json`` unless ``--resume`` is omitted.
 
     Returns:

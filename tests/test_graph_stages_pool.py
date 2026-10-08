@@ -101,6 +101,16 @@ class StubResolutionTests(unittest.TestCase):
             # They are no longer listed as unresolved.
             log = json.loads((base / "global_consolidation.json").read_text())
             self.assertIn("unresolved_stubs", log)
+            # The decision log answers "what were the stubs, and what did each become".
+            records = [json.loads(line) for line in
+                       (base / "log" / "stub-resolution.decisions.jsonl").read_text().splitlines()]
+            detected = next(r for r in records if r["event"] == "stubs_detected")
+            self.assertEqual(sorted(s["stub"] for s in detected["major"]),
+                             ["Stub 0", "Stub 1", "Stub 2"])
+            synthesized = [r for r in records if r["event"] == "stub_synthesized"]
+            self.assertEqual(sorted(r["title"] for r in synthesized),
+                             ["Stub 0", "Stub 1", "Stub 2"])
+            self.assertTrue(all(r["source_chunks"] for r in synthesized))
 
     def test_invalid_concept_downgrades_to_minor_stub(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,11 +218,16 @@ class IslandAuditTests(unittest.TestCase):
                 cluster.assert_balanced(self, expected_total=2)
             self.assertIn("Reviewing and bridging 2 small islands", out.stdout)
 
-            log = (base / "island_audit_log.jsonl").read_text().strip().splitlines()
-            self.assertEqual(len(log), 2)
-            for line in log:
-                self.assertEqual(json.loads(line)["decision"], "LINK")
-                self.assertIn("response", json.loads(line))
+            # Every verdict is a decision record; the old island_audit_log.jsonl is gone.
+            self.assertFalse((base / "island_audit_log.jsonl").exists())
+            records = [json.loads(line) for line in
+                       (base / "log" / "island-audit.decisions.jsonl").read_text().splitlines()]
+            verdicts = [r for r in records if r["event"] == "island_verdict"]
+            self.assertEqual(len(verdicts), 2)
+            for rec in verdicts:
+                self.assertEqual(rec["decision"], "LINK")
+                self.assertTrue(rec["applied"])
+                self.assertEqual(rec["target_sibling"], "Concept 0")
 
             data = json.loads((base / "global_concepts_refined.json").read_text())
             titles = {c["title"] for c in data["concepts"]}

@@ -10,14 +10,14 @@ Step 1 (Alphabet Macro Scan):
       * "link_pairs": [[id1, id2], ...]
       * "prune_ids": [id1, id2, ...]
   - Distributed across ALL configured vLLM servers in parallel with retry loops & error tracking.
-  - Raw responses logged to `macro_scan_log.jsonl`.
+  - Every LLM call logged to `log/<stage>.llm.jsonl`; macro-scan batches and
+    deep-verification decisions to `log/<stage>.decisions.jsonl`.
 
 Step 2 (Deep Verification with Briefs):
   - Reviews candidate pairs/prune items with their full briefs and top entities.
   - Decides canonical action: MERGE, LINK, PRUNE, or KEEP_SEPARATE.
   - Highly resilient action parser (handles dict, list, alias keys).
   - Distributed across ALL servers with retries & error handling.
-  - Decisions logged to `final_consolidation_log.jsonl`.
 
 Step 3 (Graph Update, Bidirectional Remapping & Markdown Export):
   - MERGE:
@@ -55,7 +55,8 @@ from tqdm import tqdm
 # budget and debug log.
 from pipeline_lib.atomic_io import atomic_write_json
 from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path, run_dir_for
 from pipeline_lib.errors import StageBudget, classify_error
 from pipeline_lib.retry import backoff_delay
 from pipeline_lib.json_repair import clean_json_string as _extract_json
@@ -169,7 +170,6 @@ async def run_macro_scan(
     concepts: List[Dict[str, Any]],
     domain_name: str,
     args,
-    macro_log_path: Path
 ) -> List[MacroCandidateCluster]:
     letter_groups: Dict[str, List[Dict[str, Any]]] = {}
     for c in concepts:
@@ -196,7 +196,7 @@ async def run_macro_scan(
     # timeouts), so it wires the call log by hand rather than via ServerPool.
     llm_log = LLMCallLog.from_args(args, MACRO_STAGE)
     budget = StageBudget(settings.budget_minutes)
-    debug = DebugLogger(Path(args.wiki_base_dir) / args.domain / "final_macro_scan_debug.jsonl",
+    debug = EventLog(log_path(run_dir_for(args), MACRO_STAGE, "debug"),
                         label=MACRO_STAGE)
     if batches and not settings.servers:
         raise RuntimeError("Final consolidation requires at least one configured LLM server.")
@@ -205,7 +205,6 @@ async def run_macro_scan(
 
     print(f"\nStep 1 (Macro Scan): Partitioned {len(concepts)} concepts into {len(batches)} alphabetical batches (A-Z & 0-9)...")
     print(f"Distributing across {len(settings.servers)} LLM servers: {settings.servers} (Concurrency per server: {settings.concurrency_per_server})")
-    print(f"Logging all raw LLM macro scan responses to: {macro_log_path}")
 
     # One queue per server with a deterministic partition (item i -> server
     # i % N). A single shared queue let the tail of the run race onto whichever
@@ -228,7 +227,8 @@ async def run_macro_scan(
     lock = asyncio.Lock()
     pbar = tqdm(total=len(batches), desc="Macro Scanning by Alphabet")
 
-    macro_log_file = open(macro_log_path, "w", encoding="utf-8")
+    macro_decisions = EventLog(log_path(run_dir_for(args), MACRO_STAGE, "decisions"),
+                               label=MACRO_STAGE)
 
     async def worker(client, server_url: str, work_queue: asyncio.Queue):
         while True:
@@ -334,14 +334,9 @@ async def run_macro_scan(
                     async with lock:
                         if batch_clusters:
                             all_clusters.extend(batch_clusters)
-                        macro_log_file.write(json.dumps({
-                            "letter": letter,
-                            "server": server_url,
-                            "count": len(batch_concepts),
-                            "raw_response": raw,
-                            "extracted_clusters": [c.model_dump() for c in batch_clusters]
-                        }) + "\n")
-                        macro_log_file.flush()
+                        macro_decisions.record("macro_scan", letter=letter, server=server_url,
+                                               batch_size=len(batch_concepts),
+                                               clusters=[c.model_dump() for c in batch_clusters])
                     completed = True
                     break
                 except Exception as e:
@@ -355,13 +350,8 @@ async def run_macro_scan(
                                 classification=classify_error(e), server=server_url)
                     if attempt == settings.attempts - 1:
                         async with lock:
-                            macro_log_file.write(json.dumps({
-                                "letter": letter,
-                                "server": server_url,
-                                "count": len(batch_concepts),
-                                "error": str(e)
-                            }) + "\n")
-                            macro_log_file.flush()
+                            macro_decisions.record("macro_scan_failed", letter=letter, server=server_url,
+                                       batch_size=len(batch_concepts), error=str(e))
                     if attempt < settings.attempts - 1:
                         await asyncio.sleep(budget.cap_sleep(backoff_delay(classify_error(e), attempt + 1)))
 
@@ -385,7 +375,7 @@ async def run_macro_scan(
 
     await asyncio.gather(*tasks)
     pbar.close()
-    macro_log_file.close()
+    macro_decisions.close()
     llm_log.close()
     debug.close()
     for hc in http_clients:
@@ -433,7 +423,6 @@ async def run_deep_verification(
     concepts: List[Dict[str, Any]],
     domain_name: str,
     args,
-    log_file_path: Path
 ) -> List[VerifiedAction]:
     concept_map = {c["title"].lower().strip(): c for c in concepts}
 
@@ -451,7 +440,7 @@ async def run_deep_verification(
     settings = resolve_settings(args, DEEP_STAGE)
     llm_log = LLMCallLog.from_args(args, DEEP_STAGE)
     budget = StageBudget(settings.budget_minutes)
-    debug = DebugLogger(Path(args.wiki_base_dir) / args.domain / "final_deep_verify_debug.jsonl",
+    debug = EventLog(log_path(run_dir_for(args), DEEP_STAGE, "debug"),
                         label=DEEP_STAGE)
     if valid_clusters and not settings.servers:
         raise RuntimeError("Deep final verification requires at least one configured LLM server.")
@@ -460,7 +449,6 @@ async def run_deep_verification(
 
     print(f"\nStep 2 (Deep Verification): Verifying {len(valid_clusters)} unique candidate groups using factual briefs...")
     print(f"Distributing across {len(settings.servers)} LLM servers: {settings.servers} (Concurrency per server: {settings.concurrency_per_server})")
-    print(f"Logging LLM verification queries and decisions to: {log_file_path}")
 
     # One queue per server with a deterministic partition (item i -> server
     # i % N). A single shared queue let the tail of the run race onto whichever
@@ -483,7 +471,8 @@ async def run_deep_verification(
     lock = asyncio.Lock()
     pbar = tqdm(total=len(valid_clusters), desc="Deep Verifying with Briefs")
 
-    log_f = open(log_file_path, "w", encoding="utf-8")
+    deep_decisions = EventLog(log_path(run_dir_for(args), DEEP_STAGE, "decisions"),
+                              label=DEEP_STAGE)
 
     async def worker(client, server_url: str, work_queue: asyncio.Queue):
         while True:
@@ -572,8 +561,7 @@ async def run_deep_verification(
                                 "raw_response": raw,
                                 "actions": [a.model_dump() for a in parsed_actions]
                             }
-                            log_f.write(json.dumps(log_entry) + "\n")
-                            log_f.flush()
+                            deep_decisions.record("deep_verification", **log_entry)
                         completed = True
                         break
                     if attempt < settings.attempts - 1:
@@ -589,12 +577,9 @@ async def run_deep_verification(
                                 classification=classify_error(e), server=server_url)
                     if attempt == settings.attempts - 1:
                         async with lock:
-                            log_f.write(json.dumps({
-                                "candidates": [c["title"] for c in concept_group],
-                                "server": server_url,
-                                "error": str(e)
-                            }) + "\n")
-                            log_f.flush()
+                            deep_decisions.record("deep_verification_failed",
+                                           candidates=[c["title"] for c in concept_group],
+                                           server=server_url, error=str(e))
                     if attempt < settings.attempts - 1:
                         await asyncio.sleep(budget.cap_sleep(backoff_delay(classify_error(e), attempt + 1)))
 
@@ -617,7 +602,7 @@ async def run_deep_verification(
 
     await asyncio.gather(*tasks)
     pbar.close()
-    log_f.close()
+    deep_decisions.close()
     llm_log.close()
     debug.close()
     for hc in http_clients:
@@ -825,11 +810,15 @@ async def main_pipeline(domain_dir: Path, domain_name: Optional[str], args):
 
     print(f"Loaded {len(concepts)} concepts for two-pass consolidation.")
 
-    log_file_path = domain_dir / "final_consolidation_log.jsonl"
+    # Deep-verification decisions live in log/. Runs made before that change kept
+    # them at the top level, so those names are still accepted for --from_log.
+    log_file_path = log_path(domain_dir, DEEP_STAGE, "decisions")
     if not log_file_path.exists():
-        fallback_log = domain_dir / "final_consolidation_log.json"
-        if fallback_log.exists():
-            log_file_path = fallback_log
+        for legacy in (domain_dir / "final_consolidation_log.jsonl",
+                       domain_dir / "final_consolidation_log.json"):
+            if legacy.exists():
+                log_file_path = legacy
+                break
 
     if args.from_log:
         if not log_file_path.exists():
@@ -856,11 +845,10 @@ async def main_pipeline(domain_dir: Path, domain_name: Optional[str], args):
         print(f"Loaded {len(actions)} verified actions from log!")
     else:
         # 1. Macro Scan by Alphabet with IDs
-        macro_log_path = domain_dir / "macro_scan_log.jsonl"
-        clusters = await run_macro_scan(concepts, domain_name, args, macro_log_path)
+        clusters = await run_macro_scan(concepts, domain_name, args)
 
         # 2. Deep Verification with Briefs & Logging
-        actions = await run_deep_verification(clusters, concepts, domain_name, args, log_file_path)
+        actions = await run_deep_verification(clusters, concepts, domain_name, args)
 
     # 3. Apply Actions (Merge remapping, relation concatenation, reciprocal linking, pruning)
     final_concepts = apply_all_resolutions(concepts, actions)
@@ -885,7 +873,8 @@ def main():
         stage=MACRO_STAGE,
         description="Two-Pass Global Knowledge Graph Consolidation & Hierarchy Resolution",
         include_max_tokens=False)
-    parser.add_argument("--from_log", action="store_true", help="Apply existing decisions from final_consolidation_log.json(l) without making LLM calls")
+    parser.add_argument("--from_log", action="store_true", help="Apply the deep-verification decisions in log/final-deep-verify.decisions.jsonl "
+                             "without making any LLM calls")
 
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain

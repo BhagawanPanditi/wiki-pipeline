@@ -18,7 +18,8 @@ from tqdm.asyncio import tqdm
 from pipeline_lib.checkpoint import load_json_log, save_log_async, save_log_sync
 from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.corpus import chunking_enabled
-from pipeline_lib.debug_log import DebugLogger
+from pipeline_lib.event_log import EventLog
+from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
@@ -91,9 +92,10 @@ class DocumentConsolidatorPipeline:
 
         self.consolidated_dir.mkdir(parents=True, exist_ok=True)
         self.settings = resolve_settings(args, STAGE)
-        self.debug = DebugLogger(self.base_wiki_dir / "doc_consolidation_debug.jsonl",
+        self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
                                  label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
+        self.decisions = EventLog(log_path(self.base_wiki_dir, STAGE, "decisions"), label=STAGE)
         self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}
         self.flush_count = 0
         self.log_data = load_json_log(
@@ -208,6 +210,11 @@ class DocumentConsolidatorPipeline:
         await asyncio.to_thread((output_dir / "merge_clusters.json").write_text,
                                 delta.model_dump_json(indent=2), encoding="utf-8")
 
+        self.decisions.record(
+            "document_consolidated", doc_id=doc_id,
+            concepts_before=len(item["raw_concepts"]), concepts_after=len(consolidated),
+            merges=[{"canonical": c.primary_title, "merged": list(c.merged_titles)}
+                    for c in delta.merge_clusters])
         self.log_data[doc_id] = True
         self.flush_count += 1
         if self.flush_count >= 10:
