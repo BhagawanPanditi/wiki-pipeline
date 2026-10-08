@@ -5,22 +5,21 @@ Document-Level Knowledge Graph Consolidation Pass
 
 import os
 import re
+import asyncio
 import json
 import time
-import asyncio
-import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import httpx
 from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
 # ── Server & Concurrency Configuration ───────────────────────────────────────
-from pipeline_config import load_global_config
-from pipeline_lib import clean_json_string, load_json_log, save_log_async, save_log_sync
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+from pipeline_lib import (DebugLogger, ServerPool, StageBudget, build_parser,
+                          clean_json_string, load_json_log, resolve_settings,
+                          save_log_async, save_log_sync)
+
+STAGE = "document-consolidation"
 
 # ── Pydantic Data Schemas for LLM Consolidation ──────────────────────────────
 class MergeCluster(BaseModel):
@@ -86,8 +85,12 @@ class DocumentConsolidatorPipeline:
         self.log_file = self.base_wiki_dir / "doc_consolidation_log.json"
 
         self.consolidated_dir.mkdir(parents=True, exist_ok=True)
-        self.servers = args.servers
-        self.concurrency = args.concurrency_per_server
+        self.settings = resolve_settings(args, STAGE)
+        self.debug = DebugLogger(self.base_wiki_dir / "doc_consolidation_debug.jsonl",
+                                 label=STAGE)
+        self.budget = StageBudget(self.settings.budget_minutes)
+        self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}
+        self.flush_count = 0
         self.log_data = load_json_log(
             self.log_file,
             corrupt_message="Consolidation log corrupted. Re-initializing.")
@@ -125,7 +128,27 @@ class DocumentConsolidatorPipeline:
                 })
         return doc_items
 
-    async def get_merge_clusters(self, client: AsyncOpenAI, doc_id: str, raw_concepts: List[Dict[str, Any]]) -> Tuple[Optional[DocumentConsolidationSchema], List[Dict[str, Any]]]:
+    def _record_attempt(self, doc_id: str, finish_reason, raw_text,
+                        error_type: str, error_message: str) -> None:
+        """Keep every attempt's full, untruncated evidence for the debug file."""
+        logs = self.attempt_errors.setdefault(doc_id, [])
+        logs.append({
+            "attempt": len(logs) + 1, "finish_reason": finish_reason,
+            "error_type": error_type, "error_message": error_message,
+            "raw_response": raw_text
+        })
+
+    async def get_merge_clusters(self, client, item: Dict[str, Any],
+                                 server_index: int) -> DocumentConsolidationSchema:
+        """One document's merge plan.
+
+        Raises on any unusable response so ServerPool classifies and retries it.
+        Token-limit truncation is raised as a plain ValueError, so - as before -
+        it stays retryable rather than failing fast.
+        """
+        doc_id = item["doc_id"]
+        raw_concepts = item["raw_concepts"]
+
         lightweight_concepts = []
         for idx, c in enumerate(raw_concepts, 1):
             relations_summary = [
@@ -139,38 +162,70 @@ class DocumentConsolidatorPipeline:
             })
 
         user_prompt = f"DOCUMENT ID: {doc_id}\nTOTAL EXTRACTED CONCEPTS ACROSS CHUNKS: {len(lightweight_concepts)}\n\nCONCEPT LIST:\n{json.dumps(lightweight_concepts, indent=2)}\n"
-        error_logs = []
 
-        for attempt in range(10):
-            raw_text = None
-            finish_reason = None
-            try:
-                response = await client.chat.completions.create(
-                    model=self.args.model_name,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT_CONSOLIDATE},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.1, max_tokens=self.args.max_tokens, response_format={"type": "json_object"}
-                )
-                choice = response.choices[0]
-                finish_reason = choice.finish_reason
-                raw_text = choice.message.content
+        raw_text = None
+        finish_reason = None
+        try:
+            response = await client.chat.completions.create(
+                model=self.settings.model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_CONSOLIDATE},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1, max_tokens=self.settings.max_tokens,
+                response_format={"type": "json_object"}
+            )
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            raw_text = choice.message.content
 
-                if finish_reason == "length":
-                    raise ValueError(f"Response truncated: Hit max_tokens ({self.args.max_tokens}).")
+            if finish_reason == "length":
+                raise ValueError(f"Response truncated: Hit max_tokens ({self.settings.max_tokens}).")
 
-                cleaned_json = clean_json_string(raw_text)
-                return DocumentConsolidationSchema.model_validate_json(cleaned_json), error_logs
-            except Exception as exc:
-                error_logs.append({
-                    "attempt": attempt + 1, "finish_reason": finish_reason,
-                    "error_type": type(exc).__name__, "error_message": str(exc), "raw_response": raw_text
-                })
-                if attempt == 9:
-                    return None, error_logs
-                await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
-        return None, error_logs
+            cleaned_json = clean_json_string(raw_text)
+            return DocumentConsolidationSchema.model_validate_json(cleaned_json)
+        except Exception as exc:
+            self._record_attempt(doc_id, finish_reason, raw_text,
+                                 type(exc).__name__, str(exc))
+            raise
+
+    async def persist_consolidation(self, item: Dict[str, Any],
+                                    delta: DocumentConsolidationSchema) -> None:
+        """SUCCESS: stream the merged document and advance the checkpoint."""
+        doc_id = item["doc_id"]
+        output_dir: Path = item["output_dir"]
+        await asyncio.to_thread(output_dir.mkdir, parents=True, exist_ok=True)
+
+        consolidated = self.execute_programmatic_merge(item["raw_concepts"], delta)
+        out_payload = json.dumps({"doc_id": doc_id, "concepts": consolidated}, indent=2)
+        await asyncio.to_thread((output_dir / "concepts.json").write_text,
+                                out_payload, encoding="utf-8")
+        await asyncio.to_thread((output_dir / "merge_clusters.json").write_text,
+                                delta.model_dump_json(indent=2), encoding="utf-8")
+
+        self.log_data[doc_id] = True
+        self.flush_count += 1
+        if self.flush_count >= 10:
+            await save_log_async(self.log_file, self.log_data)
+            self.flush_count = 0
+
+    async def write_failure_debug(self, item: Dict[str, Any],
+                                  failure: Dict[str, Any]) -> None:
+        """FAILURE: save every attempt for this document, untruncated."""
+        doc_id = item["doc_id"]
+        output_dir: Path = item["output_dir"]
+        await asyncio.to_thread(output_dir.mkdir, parents=True, exist_ok=True)
+        debug_data = {
+            "doc_id": doc_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "attempts": self.attempt_errors.get(doc_id, []),
+            "final_error": failure.get("error"),
+            "final_classification": failure.get("classification"),
+            "last_server": failure.get("server"),
+        }
+        payload = json.dumps(debug_data, indent=2)
+        await asyncio.to_thread((output_dir / "consolidation_debug.json").write_text,
+                                payload, encoding="utf-8")
 
     def execute_programmatic_merge(self, raw_concepts: List[Dict[str, Any]], consolidation_delta: DocumentConsolidationSchema) -> List[Dict[str, Any]]:
         title_map: Dict[str, str] = {}
@@ -260,46 +315,6 @@ class DocumentConsolidatorPipeline:
 
         return consolidated_concepts
 
-    async def worker_task(self, client: AsyncOpenAI, queue: asyncio.Queue, lock: asyncio.Lock, pbar: tqdm, flush_counter: dict):
-        while True:
-            item = await queue.get()
-            if item is None:
-                queue.task_done()
-                break
-
-            doc_id = item["doc_id"]
-            raw_concepts = item["raw_concepts"]
-            output_dir: Path = item["output_dir"]
-
-            async with lock:
-                if self.log_data.get(doc_id, False):
-                    queue.task_done()
-                    pbar.update(1)
-                    continue
-                self.log_data[doc_id] = False
-
-            delta, error_logs = await self.get_merge_clusters(client, doc_id, raw_concepts)
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            if delta is not None:
-                consolidated = self.execute_programmatic_merge(raw_concepts, delta)
-                out_payload = json.dumps({"doc_id": doc_id, "concepts": consolidated}, indent=2)
-                await asyncio.to_thread((output_dir / "concepts.json").write_text, out_payload, encoding="utf-8")
-                await asyncio.to_thread((output_dir / "merge_clusters.json").write_text, delta.model_dump_json(indent=2), encoding="utf-8")
-
-                async with lock:
-                    self.log_data[doc_id] = True
-                    flush_counter["count"] += 1
-                    if flush_counter["count"] >= 10:
-                        await save_log_async(self.log_file, self.log_data)
-                        flush_counter["count"] = 0
-            else:
-                debug_data = {"doc_id": doc_id, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "attempts": error_logs}
-                await asyncio.to_thread((output_dir / "consolidation_debug.json").write_text, json.dumps(debug_data, indent=2), encoding="utf-8")
-
-            pbar.update(1)
-            queue.task_done()
-
     async def run(self):
         doc_items = self.prepare_document_items()
         
@@ -311,28 +326,50 @@ class DocumentConsolidatorPipeline:
         print(f"Total documents: {len(doc_items)} | Pending consolidation: {len(pending)}")
         print(f"Total raw concepts before consolidation: {total_concepts_before}")
         
+        settings = self.settings
         if pending:
-            queue = asyncio.Queue()
-            for item in pending: await queue.put(item)
-            for _ in range(len(self.servers) * self.concurrency): await queue.put(None)
+            print(f"Spreading {len(pending)} document(s) across {len(settings.servers)} "
+                  f"server(s) at {settings.concurrency_per_server} concurrent request(s) "
+                  f"each (item i -> server i % N).")
+            print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+                  f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
 
-            lock = asyncio.Lock()
-            flush_counter = {"count": 0}
-            pbar = tqdm(total=len(pending), desc=f"Consolidating Documents [{self.domain}]")
+            # Mark every pending document in-progress, as the old worker did under
+            # a lock, so a later resume can see what was attempted.
+            for item in pending:
+                self.log_data.setdefault(item["doc_id"], False)
 
-            tasks, http_clients = [], []
-            for server_url in self.servers:
-                http_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=self.concurrency + 20), timeout=httpx.Timeout(300.0))
-                http_clients.append(http_client)
-                client = AsyncOpenAI(base_url=server_url, api_key="EMPTY", http_client=http_client, max_retries=0)
-                for _ in range(self.concurrency):
-                    tasks.append(asyncio.create_task(self.worker_task(client, queue, lock, pbar, flush_counter)))
-
+            pool = ServerPool(
+                settings.servers,
+                concurrency_per_server=settings.concurrency_per_server,
+                request_timeout=settings.profile.request_timeout,
+                connect_timeout=settings.profile.connect_timeout,
+                max_connections_slack=20,
+                label=STAGE,
+                failover=not getattr(self.args, "no_failover", False),
+            )
             try:
-                await asyncio.gather(*tasks)
+                async with pool:
+                    result = await pool.map(
+                        pending,
+                        self.get_merge_clusters,
+                        attempts=settings.attempts,
+                        desc=f"Consolidating Documents [{self.domain}]",
+                        key_fn=lambda it: it["doc_id"],
+                        budget=self.budget,
+                        debug=self.debug,
+                        attempt_timeout=settings.profile.attempt_timeout,
+                        on_result=self.persist_consolidation,
+                    )
             finally:
-                pbar.close()
-                for hc in http_clients: await hc.aclose()
+                self.debug.close()
+
+            for failure in result.failures:
+                await self.write_failure_debug(pending[failure["index"]], failure)
+
+            print("Requests served per server:")
+            for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+                print(f"  {url:<40} {count}")
         else:
             print("All documents are already consolidated!")
 
@@ -372,14 +409,9 @@ class DocumentConsolidatorPipeline:
         print(f"  - Concepts After:  {total_concepts_after}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Cross-Chunk Concept Consolidation Pipeline")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model_name", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
-    parser.add_argument("--max_tokens", type=int, default=8192)
-
+    parser = build_parser(
+        stage=STAGE,
+        description="Cross-Chunk Concept Consolidation Pipeline")
     args = parser.parse_args()
     pipeline = DocumentConsolidatorPipeline(args)
     asyncio.run(pipeline.run())

@@ -37,27 +37,33 @@ Step 3 (Graph Update, Bidirectional Remapping & Markdown Export):
   - Runs island analysis.
 """
 
-import os
-import re
+import asyncio
 import functools
 import json
-import asyncio
-import argparse
+import os
+import re
 from pathlib import Path
-from typing import Dict, List, Set, Any, Optional, Tuple
-from tqdm import tqdm
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
-from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
+from pydantic import BaseModel, Field
+from tqdm import tqdm
 
-from pipeline_config import load_global_config
+# This stage keeps its own per-server client construction (its two passes need
+# different request timeouts) but uses the shared partitioning, retry ladder,
+# budget and debug log.
+from pipeline_lib import (DebugLogger, StageBudget, atomic_write_json, backoff_delay,
+                          build_parser, classify_error, resolve_settings)
 from pipeline_lib import clean_json_string as _extract_json
 
 # This stage's payloads are sometimes JSON arrays rather than objects.
 clean_json_string = functools.partial(_extract_json, allow_array=True)
-from pipeline_lib import atomic_write_json
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+
+# The two passes have very different generation budgets, so each resolves its
+# own profile: the macro scan asks for 4096 tokens, deep verification 1000.
+MACRO_STAGE = "final-macro-scan"
+DEEP_STAGE = "final-deep-verify"
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
 class MacroCandidateCluster(BaseModel):
@@ -180,22 +186,34 @@ async def run_macro_scan(
                 sub_part = group[i:i + chunk_size]
                 batches.append((f"Letter '{letter}' (Part {part_idx})", sub_part))
 
-    if batches and not args.servers:
+    settings = resolve_settings(args, MACRO_STAGE)
+    budget = StageBudget(settings.budget_minutes)
+    debug = DebugLogger(Path(args.wiki_base_dir) / args.domain / "final_macro_scan_debug.jsonl",
+                        label=MACRO_STAGE)
+    if batches and not settings.servers:
         raise RuntimeError("Final consolidation requires at least one configured LLM server.")
-    if batches and args.concurrency_per_server < 1:
+    if batches and settings.concurrency_per_server < 1:
         raise ValueError("concurrency_per_server must be at least 1.")
 
     print(f"\nStep 1 (Macro Scan): Partitioned {len(concepts)} concepts into {len(batches)} alphabetical batches (A-Z & 0-9)...")
-    print(f"Distributing across {len(args.servers)} LLM servers: {args.servers} (Concurrency per server: {args.concurrency_per_server})")
+    print(f"Distributing across {len(settings.servers)} LLM servers: {settings.servers} (Concurrency per server: {settings.concurrency_per_server})")
     print(f"Logging all raw LLM macro scan responses to: {macro_log_path}")
 
-    queue = asyncio.Queue()
-    for b in batches:
-        await queue.put(b)
-
-    effective_concurrency = args.concurrency_per_server
-    for _ in range(len(args.servers) * effective_concurrency):
-        await queue.put(None)
+    # One queue per server with a deterministic partition (item i -> server
+    # i % N). A single shared queue let the tail of the run race onto whichever
+    # worker was free, so the last few batches could all land on one server.
+    effective_concurrency = settings.concurrency_per_server
+    server_count = len(settings.servers)
+    queues = [asyncio.Queue() for _ in range(server_count)]
+    for _i, b in enumerate(batches):
+        await queues[_i % server_count].put(b)
+    for _q in queues:
+        for _ in range(effective_concurrency):
+            await _q.put(None)
+    print(f"Spreading work across {server_count} server(s) at {effective_concurrency} "
+          f"concurrent request(s) each (item i -> server i % N).")
+    print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+          f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
 
     all_clusters: List[MacroCandidateCluster] = []
     failed_batches: List[str] = []
@@ -204,11 +222,11 @@ async def run_macro_scan(
 
     macro_log_file = open(macro_log_path, "w", encoding="utf-8")
 
-    async def worker(client: AsyncOpenAI, server_url: str):
+    async def worker(client, server_url: str, work_queue: asyncio.Queue):
         while True:
-            item = await queue.get()
+            item = await work_queue.get()
             if item is None:
-                queue.task_done()
+                work_queue.task_done()
                 break
 
             letter, batch_concepts = item
@@ -226,15 +244,16 @@ async def run_macro_scan(
             )
 
             completed = False
-            for attempt in range(10):
+            budget.check(MACRO_STAGE)
+            for attempt in range(settings.attempts):
                 try:
                     resp = await client.chat.completions.create(
-                        model=args.model,
+                        model=settings.model_name,
                         messages=[
                             {"role": "user", "content": prompt}
                         ],
                         temperature=0.1,
-                        max_tokens=4096,
+                        max_tokens=settings.max_tokens,
                         response_format={"type": "json_object"}
                     )
                     raw = resp.choices[0].message.content.strip()
@@ -309,7 +328,10 @@ async def run_macro_scan(
                     completed = True
                     break
                 except Exception as e:
-                    if attempt == 9:
+                    debug.error(f"{server_url}", e, attempt=attempt + 1,
+                                attempts=settings.attempts,
+                                classification=classify_error(e), server=server_url)
+                    if attempt == settings.attempts - 1:
                         async with lock:
                             macro_log_file.write(json.dumps({
                                 "letter": letter,
@@ -318,28 +340,29 @@ async def run_macro_scan(
                                 "error": str(e)
                             }) + "\n")
                             macro_log_file.flush()
-                    if attempt < 9:
-                        await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
+                    if attempt < settings.attempts - 1:
+                        await asyncio.sleep(budget.cap_sleep(backoff_delay(classify_error(e), attempt + 1)))
 
             if not completed:
                 async with lock:
                     failed_batches.append(letter)
 
             pbar.update(1)
-            queue.task_done()
+            work_queue.task_done()
 
     # Launch distributed workers across all servers
     tasks, http_clients = [], []
-    for url in args.servers:
+    for server_index, url in enumerate(settings.servers):
         hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=300.0)
         http_clients.append(hc)
         client = AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0)
         for _ in range(effective_concurrency):
-            tasks.append(asyncio.create_task(worker(client, url)))
+            tasks.append(asyncio.create_task(worker(client, url, queues[server_index])))
 
     await asyncio.gather(*tasks)
     pbar.close()
     macro_log_file.close()
+    debug.close()
     for hc in http_clients:
         await hc.aclose()
 
@@ -400,22 +423,34 @@ async def run_deep_verification(
                 seen_groups.add(group_key)
                 valid_clusters.append((cl.category, existing_in_graph))
 
-    if valid_clusters and not args.servers:
+    settings = resolve_settings(args, DEEP_STAGE)
+    budget = StageBudget(settings.budget_minutes)
+    debug = DebugLogger(Path(args.wiki_base_dir) / args.domain / "final_deep_verify_debug.jsonl",
+                        label=DEEP_STAGE)
+    if valid_clusters and not settings.servers:
         raise RuntimeError("Deep final verification requires at least one configured LLM server.")
-    if valid_clusters and args.concurrency_per_server < 1:
+    if valid_clusters and settings.concurrency_per_server < 1:
         raise ValueError("concurrency_per_server must be at least 1.")
 
     print(f"\nStep 2 (Deep Verification): Verifying {len(valid_clusters)} unique candidate groups using factual briefs...")
-    print(f"Distributing across {len(args.servers)} LLM servers: {args.servers} (Concurrency per server: {args.concurrency_per_server})")
+    print(f"Distributing across {len(settings.servers)} LLM servers: {settings.servers} (Concurrency per server: {settings.concurrency_per_server})")
     print(f"Logging LLM verification queries and decisions to: {log_file_path}")
 
-    queue = asyncio.Queue()
-    for item in valid_clusters:
-        await queue.put(item)
-
-    effective_concurrency = args.concurrency_per_server
-    for _ in range(len(args.servers) * effective_concurrency):
-        await queue.put(None)
+    # One queue per server with a deterministic partition (item i -> server
+    # i % N). A single shared queue let the tail of the run race onto whichever
+    # worker was free, so the last few batches could all land on one server.
+    effective_concurrency = settings.concurrency_per_server
+    server_count = len(settings.servers)
+    queues = [asyncio.Queue() for _ in range(server_count)]
+    for _i, item in enumerate(valid_clusters):
+        await queues[_i % server_count].put(item)
+    for _q in queues:
+        for _ in range(effective_concurrency):
+            await _q.put(None)
+    print(f"Spreading work across {server_count} server(s) at {effective_concurrency} "
+          f"concurrent request(s) each (item i -> server i % N).")
+    print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+          f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
 
     verified_actions: List[VerifiedAction] = []
     failed_groups: List[List[str]] = []
@@ -424,11 +459,11 @@ async def run_deep_verification(
 
     log_f = open(log_file_path, "w", encoding="utf-8")
 
-    async def worker(client: AsyncOpenAI, server_url: str):
+    async def worker(client, server_url: str, work_queue: asyncio.Queue):
         while True:
-            item = await queue.get()
+            item = await work_queue.get()
             if item is None:
-                queue.task_done()
+                work_queue.task_done()
                 break
 
             cat, concept_group = item
@@ -448,15 +483,16 @@ async def run_deep_verification(
             )
 
             completed = False
-            for attempt in range(10):
+            budget.check(DEEP_STAGE)
+            for attempt in range(settings.attempts):
                 try:
                     resp = await client.chat.completions.create(
-                        model=args.model,
+                        model=settings.model_name,
                         messages=[
                             {"role": "user", "content": prompt}
                         ],
                         temperature=0.1,
-                        max_tokens=1000,
+                        max_tokens=settings.max_tokens,
                         response_format={"type": "json_object"}
                     )
                     raw = resp.choices[0].message.content.strip()
@@ -508,10 +544,13 @@ async def run_deep_verification(
                             log_f.flush()
                         completed = True
                         break
-                    if attempt < 9:
-                        await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
+                    if attempt < settings.attempts - 1:
+                        await asyncio.sleep(budget.cap_sleep(backoff_delay(classify_error(e), attempt + 1)))
                 except Exception as e:
-                    if attempt == 9:
+                    debug.error(f"{server_url}", e, attempt=attempt + 1,
+                                attempts=settings.attempts,
+                                classification=classify_error(e), server=server_url)
+                    if attempt == settings.attempts - 1:
                         async with lock:
                             log_f.write(json.dumps({
                                 "candidates": [c["title"] for c in concept_group],
@@ -519,27 +558,28 @@ async def run_deep_verification(
                                 "error": str(e)
                             }) + "\n")
                             log_f.flush()
-                    if attempt < 9:
-                        await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
+                    if attempt < settings.attempts - 1:
+                        await asyncio.sleep(budget.cap_sleep(backoff_delay(classify_error(e), attempt + 1)))
 
             if not completed:
                 async with lock:
                     failed_groups.append([c["title"] for c in concept_group])
 
             pbar.update(1)
-            queue.task_done()
+            work_queue.task_done()
 
     tasks, http_clients = [], []
-    for url in args.servers:
+    for server_index, url in enumerate(settings.servers):
         hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=60.0)
         http_clients.append(hc)
         client = AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0)
         for _ in range(effective_concurrency):
-            tasks.append(asyncio.create_task(worker(client, url)))
+            tasks.append(asyncio.create_task(worker(client, url, queues[server_index])))
 
     await asyncio.gather(*tasks)
     pbar.close()
     log_f.close()
+    debug.close()
     for hc in http_clients:
         await hc.aclose()
 
@@ -801,12 +841,10 @@ async def main_pipeline(domain_dir: Path, domain_name: str, args):
     analyze_kg_islands(domain_dir)
 
 def main():
-    parser = argparse.ArgumentParser(description="Two-Pass Global Knowledge Graph Consolidation & Hierarchy Resolution")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
+    parser = build_parser(
+        stage=MACRO_STAGE,
+        description="Two-Pass Global Knowledge Graph Consolidation & Hierarchy Resolution",
+        include_max_tokens=False)
     parser.add_argument("--from_log", action="store_true", help="Apply existing decisions from final_consolidation_log.json(l) without making LLM calls")
 
     args = parser.parse_args()

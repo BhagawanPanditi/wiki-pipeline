@@ -12,22 +12,19 @@ Global Knowledge Graph Consolidation Pipeline
 8. Saves `global_concepts.json` and individual concept JSON files in `concepts/`.
 """
 
+import asyncio
+import json
 import os
 import re
-import json
-import asyncio
-import argparse
-from pathlib import Path
-from typing import Dict, List, Set, Any, Tuple, Optional
 from collections import Counter
-from tqdm import tqdm
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import httpx
 import networkx as nx
 import nltk
 from nltk.corpus import stopwords
 from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
+from tqdm import tqdm
 
 # Silent setup for NLTK Stopwords
 try:
@@ -37,10 +34,10 @@ except Exception:
     STOP_WORDS = {"a", "an", "the", "and", "or", "in", "of", "on", "at", "to", "for", "with", "by", "is", "it", "as", "that", "this", "are", "was"}
 
 # ── Server Configuration ─────────────────────────────────────────────────────
-from pipeline_config import load_global_config
-from pipeline_lib import clean_json_string
-from pipeline_lib import atomic_write_json
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
+                          build_parser, clean_json_string, resolve_settings)
+
+STAGE = "global-consolidation"
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
 class MergeCluster(BaseModel):
@@ -286,7 +283,14 @@ def build_fuzzy_candidate_clusters(concepts: List[Dict[str, Any]]) -> List[List[
     return candidate_clusters
 
 # ── Async LLM Verification Runner ────────────────────────────────────────────
-async def verify_cluster_llm(client: AsyncOpenAI, cluster: List[Dict[str, Any]], model_name: str, max_tokens: int) -> Optional[GlobalFuzzyMergeSchema]:
+async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) -> GlobalFuzzyMergeSchema:
+    """One cluster verdict.
+
+    Raises on any unusable response so ServerPool can classify and retry it.
+    Returning None after 10 silent attempts used to mean "this cluster failed";
+    an exhausted retry means the same thing now, except it is also recorded in
+    the debug log and counted per server.
+    """
     lightweight_concepts = []
     for idx, c in enumerate(cluster, 1):
         lightweight_concepts.append({
@@ -298,26 +302,20 @@ async def verify_cluster_llm(client: AsyncOpenAI, cluster: List[Dict[str, Any]],
 
     user_prompt = f"CANDIDATE CONCEPT CLUSTER FOR REVIEW:\n{json.dumps(lightweight_concepts, indent=2)}\n"
 
-    for attempt in range(10):
-        try:
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_FUZZY_MERGE},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.1,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"}
-            )
-            raw_text = response.choices[0].message.content
-            cleaned = clean_json_string(raw_text)
-            return GlobalFuzzyMergeSchema.model_validate_json(cleaned)
-        except Exception:
-            if attempt == 9:
-                return None
-            await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
-    return None
+    response = await client.chat.completions.create(
+        model=settings.model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_FUZZY_MERGE},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.1,
+        max_tokens=settings.max_tokens,
+        response_format={"type": "json_object"}
+    )
+    raw_text = response.choices[0].message.content
+    cleaned = clean_json_string(raw_text)
+    return GlobalFuzzyMergeSchema.model_validate_json(cleaned)
+
 
 async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], args) -> Tuple[List[MergeCluster], List[Dict[str, Any]]]:
     if not candidate_clusters:
@@ -325,60 +323,69 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
     if not args.servers:
         raise RuntimeError("Fuzzy concept clusters require at least one configured LLM server.")
 
+
+    settings = resolve_settings(args, STAGE)
     print(f"Evaluating {len(candidate_clusters)} fuzzy candidate clusters using LLM pool...")
-    queue = asyncio.Queue()
-    for item in candidate_clusters:
-        await queue.put(item)
+    print(f"Spreading clusters across {len(settings.servers)} server(s) at "
+          f"{settings.concurrency_per_server} concurrent request(s) each "
+          f"(item i -> server i % N).")
 
-    total_workers = len(args.servers) * args.concurrency_per_server
-    for _ in range(total_workers):
-        await queue.put(None)
+    debug_path = Path(args.wiki_base_dir) / args.domain / "global_consolidation_debug.jsonl"
+    debug = DebugLogger(debug_path, label=STAGE)
+    budget = StageBudget(settings.budget_minutes)
+    print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+          f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
 
-    approved_merges: List[MergeCluster] = []
-    llm_evaluations: List[Dict[str, Any]] = []
-    failed_clusters: List[List[str]] = []
-    lock = asyncio.Lock()
-    pbar = tqdm(total=len(candidate_clusters), desc="LLM Fuzzy Cluster Verification")
+    async def handler(client, cluster, server_index):
+        return await verify_cluster_llm(client, cluster, settings)
 
-    async def worker(client: AsyncOpenAI):
-        while True:
-            cluster = await queue.get()
-            if cluster is None:
-                queue.task_done()
-                break
+    async def record(cluster, result):
+        # Record the candidate titles sent, and the LLM's returned merge decisions
+        llm_evaluations.append({
+            "candidates_sent": [c.get("title", "Unknown") for c in cluster],
+            "decisions": [m.model_dump() for m in result.merge_clusters] if result and result.merge_clusters else []
+        })
+        if result and result.merge_clusters:
+            approved_merges.extend(result.merge_clusters)
 
-            result = await verify_cluster_llm(client, cluster, args.model_name, args.max_tokens)
-            
-            # NEW: Record the candidate titles sent, and the LLM's returned merge decisions
-            decision_record = {
-                "candidates_sent": [c.get("title", "Unknown") for c in cluster],
-                "decisions": [m.model_dump() for m in result.merge_clusters] if result and result.merge_clusters else []
-            }
-
-            async with lock:
-                if result and result.merge_clusters:
-                    approved_merges.extend(result.merge_clusters)
-                if result is None:
-                    failed_clusters.append([c.get("title", "Unknown") for c in cluster])
-                llm_evaluations.append(decision_record)
-
-            pbar.update(1)
-            queue.task_done()
-
-    tasks, http_clients = [], []
-    for server_url in args.servers:
-        http_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=args.concurrency_per_server + 20), timeout=httpx.Timeout(300.0))
-        http_clients.append(http_client)
-        client = AsyncOpenAI(base_url=server_url, api_key="EMPTY", http_client=http_client, max_retries=0)
-        for _ in range(args.concurrency_per_server):
-            tasks.append(asyncio.create_task(worker(client)))
-
+    pool = ServerPool(
+        settings.servers,
+        concurrency_per_server=settings.concurrency_per_server,
+        request_timeout=settings.profile.request_timeout,
+        connect_timeout=settings.profile.connect_timeout,
+        max_connections_slack=20,
+        label=STAGE,
+        failover=not getattr(args, "no_failover", False),
+    )
     try:
-        await asyncio.gather(*tasks)
+        async with pool:
+            result = await pool.map(
+                candidate_clusters,
+                handler,
+                attempts=settings.attempts,
+                desc="LLM Fuzzy Cluster Verification",
+                key_fn=lambda cl: "|".join(sorted(c.get("title", "") for c in cl)),
+                budget=budget,
+                debug=debug,
+                attempt_timeout=settings.profile.attempt_timeout,
+                on_result=record,
+            )
     finally:
-        pbar.close()
-        for hc in http_clients:
-            await hc.aclose()
+        debug.close()
+
+    # A cluster that never produced a verdict is still logged with empty
+    # decisions, exactly as the old worker did, and still fails the stage.
+    for failure in result.failures:
+        cluster = candidate_clusters[failure["index"]]
+        failed_clusters.append([c.get("title", "Unknown") for c in cluster])
+        llm_evaluations.append({
+            "candidates_sent": [c.get("title", "Unknown") for c in cluster],
+            "decisions": []
+        })
+
+    print("Requests served per server:")
+    for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+        print(f"  {url:<40} {count}")
 
     if failed_clusters:
         raise RuntimeError(
@@ -662,14 +669,9 @@ def global_consolidate(domain_dir: Path, args):
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Global Knowledge Graph Consolidation (Exact + Fuzzy Blocking + LLM Verification)")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model_name", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
-    parser.add_argument("--max_tokens", type=int, default=4096)
-
+    parser = build_parser(
+        stage=STAGE,
+        description="Global Knowledge Graph Consolidation (Exact + Fuzzy Blocking + LLM Verification)")
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain
 

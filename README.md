@@ -217,6 +217,13 @@ Requests served per server:
 
 You can change the server count between runs; nothing is pinned.
 
+Eleven of the twelve LLM stages run through `ServerPool` directly.
+`final_consolidate_and_link.py` is the exception: its two passes need different
+request timeouts (300 s for the macro scan, 60 s for deep verification), so it
+builds its own per-server clients — but it uses the same deterministic
+partition, the same classified retry ladder, the same wall-clock budget and the
+same untruncated debug log. No stage pulls from a single shared queue any more.
+
 ---
 
 ## Failure handling
@@ -290,7 +297,7 @@ analyze_islands.py              islands_report.json
 
 pipeline_lib/                   shared machinery (see below)
 pipeline_config.py              config.json loader + defaults
-tests/                          52 tests
+tests/                          74 tests
 ```
 
 ### `pipeline_lib/`
@@ -321,7 +328,7 @@ existing `sbatch` invocations keep working unchanged.
 python3 -m unittest discover -s tests -t .
 ```
 
-52 tests, no GPU required. `tests/fake_vllm.py` serves a real OpenAI-compatible
+74 tests, no GPU required. `tests/fake_vllm.py` serves a real OpenAI-compatible
 HTTP endpoint on localhost, so pooling, even spreading, retries, truncation
 fail-fast, resume and both verification phases are exercised end to end.
 `transformers` and `nltk` are cluster-only dependencies; the Pass 1 tests stub
