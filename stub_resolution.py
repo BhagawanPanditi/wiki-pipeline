@@ -22,6 +22,7 @@ from openai import AsyncOpenAI
 
 # ── Configuration ────────────────────────────────────────────────────────────
 from pipeline_config import load_global_config
+from atomic_io import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 class StubRelation(BaseModel):
@@ -162,11 +163,14 @@ class StubResolver:
         stub_name = stub["stub_name"]
         source_chunks = stub.get("source_chunks", [])
         sem = asyncio.Semaphore(5)
+        failed_chunks = []
 
         async def process_chunk(sc: str):
             async with sem:
                 context_str = self.build_single_chunk_prompt(stub_name, sc)
-                if not context_str.strip(): return sc, None
+                if not context_str.strip():
+                    failed_chunks.append(sc)
+                    return sc, None
                 user_prompt = f"TARGET STUB TO DEFINE: {stub_name}\n\n{context_str}"
                 
                 for attempt in range(10):
@@ -185,11 +189,16 @@ class StubResolver:
                         data = StubConceptExtraction.model_validate_json(clean_json_string(response.choices[0].message.content))
                         return sc, data
                     except Exception:
-                        if attempt == 9: return sc, None
+                        if attempt == 9:
+                            failed_chunks.append(sc)
+                            return sc, None
                         await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
 
         results = await asyncio.gather(*(process_chunk(sc) for sc in source_chunks))
         valid_extractions = [(sc, data) for sc, data in results if data and data.is_valid_concept]
+
+        if failed_chunks:
+            return {"status": "failed", "stub": stub_name, "failed_chunks": sorted(set(failed_chunks))}
         
         if not valid_extractions:
             return {"status": "downgraded", "stub": stub_name}
@@ -236,7 +245,10 @@ class StubResolver:
         minor_stubs_set = {s["stub_name"] for s in self.stubs if len(s.get("source_chunks", [])) <= 2}
         
         new_concepts = []
-        if major_stubs and self.servers:
+        failed_stubs = []
+        if major_stubs and not self.servers:
+            raise RuntimeError("Major stub resolution requires at least one configured LLM server.")
+        if major_stubs:
             print(f"Resolving {len(major_stubs)} Major Stubs (>2 chunks) via LLM pool...")
             queue = asyncio.Queue()
             for s in major_stubs: await queue.put(s)
@@ -252,6 +264,8 @@ class StubResolver:
                     res = await self.resolve_major_stub(client, stub)
                     if res["status"] == "success":
                         new_concepts.append(res["concept"])
+                    elif res["status"] == "failed":
+                        failed_stubs.append({"stub": res["stub"], "failed_chunks": res.get("failed_chunks", [])})
                     else:
                         minor_stubs_set.add(res["stub"])
                     pbar.update(1)
@@ -267,6 +281,12 @@ class StubResolver:
             await asyncio.gather(*tasks)
             pbar.close()
             for hc in http_clients: await hc.aclose()
+
+            if failed_stubs:
+                raise RuntimeError(
+                    f"Major stub resolution failed for {len(failed_stubs)} stub(s) after retries. "
+                    f"Examples: {failed_stubs[:5]}"
+                )
 
         minor_stubs_lower_map = {s.lower(): s for s in minor_stubs_set}
         print(f"Absorbing {len(minor_stubs_lower_map)} Minor Stubs directly into parent concepts...")
@@ -310,16 +330,14 @@ class StubResolver:
 
         print(f"Saving resolved concepts to {self.output_file}...")
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.output_file, "w", encoding="utf-8") as f:
-            json.dump({"concepts": self.global_concepts}, f, indent=2)
+        atomic_write_json(self.output_file, {"concepts": self.global_concepts})
 
         self.log_data["stub_resolution_summary"] = {
             "major_stubs_synthesized": len(new_concepts),
             "minor_stubs_absorbed": len(minor_stubs_set),
             "concepts_after_stub_pass": len(self.global_concepts)
         }
-        with open(self.log_file, "w", encoding="utf-8") as f:
-            json.dump(self.log_data, f, indent=2)
+        atomic_write_json(self.log_file, self.log_data)
 
         print(f"\n==================================================")
         print(f"STUB RESOLUTION COMPLETE")

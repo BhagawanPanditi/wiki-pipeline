@@ -231,19 +231,24 @@ class WikiSecondPassPipeline:
         chunks_map = load_cached_chunks(self.cache_dir)
 
         items = []
+        missing_or_invalid = []
         for key, chunk_data in chunks_map.items():
             doc_id, chunk_id = key.split("::")
             chunk_dir = self.staging_dir / doc_id / chunk_id
             concepts_file = chunk_dir / "concepts.json"
 
             if not concepts_file.exists():
+                missing_or_invalid.append(key)
                 continue
 
             # Load Pass 1 concepts
             try:
                 with open(concepts_file, "r", encoding="utf-8") as f:
                     pass1_concepts = json.load(f)
-            except Exception:
+                if not isinstance(pass1_concepts.get("concepts"), list):
+                    raise ValueError("concepts.json does not contain a concepts list")
+            except Exception as exc:
+                missing_or_invalid.append(f"{key} ({type(exc).__name__}: {exc})")
                 continue
 
             # Check if audit verification log exists for extra guidance
@@ -273,6 +278,12 @@ class WikiSecondPassPipeline:
                 "audit_feedback": audit_feedback,
                 "chunk_dir": chunk_dir
             })
+
+        if missing_or_invalid:
+            raise RuntimeError(
+                f"{len(missing_or_invalid)} cached chunk(s) are missing valid Pass 1 concepts. "
+                f"Examples: {missing_or_invalid[:10]}. Complete/resume Pass 1 before Pass 2."
+            )
 
         print(f"Loaded {len(items)} chunks ready for Second Pass refinement.")
         return items
@@ -560,7 +571,14 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
             for http_client in http_clients:
                 await http_client.aclose()
 
-        print(f"\nPass 2 refinement successfully finished for domain: {self.domain}!")
+        failed_items = [i["key"] for i in items if not self.pass2_log.get(i["key"], False)]
+        if failed_items:
+            print(f"[ERROR] {len(failed_items)} chunk(s) remain incomplete after Pass 2 retries. Examples: {failed_items[:10]}")
+            raise RuntimeError(
+                f"Pass 2 left {len(failed_items)} chunk(s) incomplete; rerun with --resume after checking server health."
+            )
+
+        print(f"\nPass 2 refinement successfully finished for domain: {self.domain}! All {len(items)} chunks are complete.")
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 

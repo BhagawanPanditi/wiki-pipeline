@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 
 from pipeline_config import load_global_config
+from atomic_io import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -180,6 +181,11 @@ async def run_macro_scan(
                 sub_part = group[i:i + chunk_size]
                 batches.append((f"Letter '{letter}' (Part {part_idx})", sub_part))
 
+    if batches and not args.servers:
+        raise RuntimeError("Final consolidation requires at least one configured LLM server.")
+    if batches and args.concurrency_per_server < 1:
+        raise ValueError("concurrency_per_server must be at least 1.")
+
     print(f"\nStep 1 (Macro Scan): Partitioned {len(concepts)} concepts into {len(batches)} alphabetical batches (A-Z & 0-9)...")
     print(f"Distributing across {len(args.servers)} LLM servers: {args.servers} (Concurrency per server: {args.concurrency_per_server})")
     print(f"Logging all raw LLM macro scan responses to: {macro_log_path}")
@@ -193,6 +199,7 @@ async def run_macro_scan(
         await queue.put(None)
 
     all_clusters: List[MacroCandidateCluster] = []
+    failed_batches: List[str] = []
     lock = asyncio.Lock()
     pbar = tqdm(total=len(batches), desc="Macro Scanning by Alphabet")
 
@@ -219,6 +226,7 @@ async def run_macro_scan(
                 indexed_titles=indexed_titles_str
             )
 
+            completed = False
             for attempt in range(10):
                 try:
                     resp = await client.chat.completions.create(
@@ -299,6 +307,7 @@ async def run_macro_scan(
                             "extracted_clusters": [c.model_dump() for c in batch_clusters]
                         }) + "\n")
                         macro_log_file.flush()
+                    completed = True
                     break
                 except Exception as e:
                     if attempt == 9:
@@ -310,7 +319,12 @@ async def run_macro_scan(
                                 "error": str(e)
                             }) + "\n")
                             macro_log_file.flush()
-                    await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
+                    if attempt < 9:
+                        await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
+
+            if not completed:
+                async with lock:
+                    failed_batches.append(letter)
 
             pbar.update(1)
             queue.task_done()
@@ -329,6 +343,11 @@ async def run_macro_scan(
     macro_log_file.close()
     for hc in http_clients:
         await hc.aclose()
+
+    if failed_batches:
+        raise RuntimeError(
+            f"Final macro scan failed for {len(failed_batches)} batch(es) after retries: {failed_batches[:10]}"
+        )
 
     print(f"Step 1 Complete: Found {len(all_clusters)} candidate clusters for deep brief verification.")
     return all_clusters
@@ -382,6 +401,11 @@ async def run_deep_verification(
                 seen_groups.add(group_key)
                 valid_clusters.append((cl.category, existing_in_graph))
 
+    if valid_clusters and not args.servers:
+        raise RuntimeError("Deep final verification requires at least one configured LLM server.")
+    if valid_clusters and args.concurrency_per_server < 1:
+        raise ValueError("concurrency_per_server must be at least 1.")
+
     print(f"\nStep 2 (Deep Verification): Verifying {len(valid_clusters)} unique candidate groups using factual briefs...")
     print(f"Distributing across {len(args.servers)} LLM servers: {args.servers} (Concurrency per server: {args.concurrency_per_server})")
     print(f"Logging LLM verification queries and decisions to: {log_file_path}")
@@ -395,6 +419,7 @@ async def run_deep_verification(
         await queue.put(None)
 
     verified_actions: List[VerifiedAction] = []
+    failed_groups: List[List[str]] = []
     lock = asyncio.Lock()
     pbar = tqdm(total=len(valid_clusters), desc="Deep Verifying with Briefs")
 
@@ -423,6 +448,7 @@ async def run_deep_verification(
                 candidates_json=json.dumps(candidates_payload, indent=2)
             )
 
+            completed = False
             for attempt in range(10):
                 try:
                     resp = await client.chat.completions.create(
@@ -481,7 +507,10 @@ async def run_deep_verification(
                             }
                             log_f.write(json.dumps(log_entry) + "\n")
                             log_f.flush()
+                        completed = True
                         break
+                    if attempt < 9:
+                        await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
                 except Exception as e:
                     if attempt == 9:
                         async with lock:
@@ -491,7 +520,12 @@ async def run_deep_verification(
                                 "error": str(e)
                             }) + "\n")
                             log_f.flush()
-                    await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
+                    if attempt < 9:
+                        await asyncio.sleep(min(1.5 * (attempt + 1), 10.0))
+
+            if not completed:
+                async with lock:
+                    failed_groups.append([c["title"] for c in concept_group])
 
             pbar.update(1)
             queue.task_done()
@@ -509,6 +543,12 @@ async def run_deep_verification(
     log_f.close()
     for hc in http_clients:
         await hc.aclose()
+
+    if failed_groups:
+        raise RuntimeError(
+            f"Deep final verification failed for {len(failed_groups)} group(s) after retries. "
+            f"Examples: {failed_groups[:5]}"
+        )
 
     return verified_actions
 
@@ -749,8 +789,7 @@ async def main_pipeline(domain_dir: Path, domain_name: str, args):
     # 4. Save JSON
     save_file = domain_dir / "global_concepts_refined.json"
     print(f"\nSaving updated graph to {save_file}...")
-    with open(save_file, "w", encoding="utf-8") as f:
-        json.dump({"concepts": final_concepts}, f, indent=2)
+    atomic_write_json(save_file, {"concepts": final_concepts})
 
     # 5. Re-export clean Markdown wiki in concepts_md/
     from export_markdown_wiki import export_wiki_markdown

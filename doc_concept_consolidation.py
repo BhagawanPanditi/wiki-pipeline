@@ -356,6 +356,17 @@ class DocumentConsolidatorPipeline:
         else:
             print("All documents are already consolidated!")
 
+        incomplete_docs = [
+            item["doc_id"] for item in doc_items
+            if not self.log_data.get(item["doc_id"], False)
+        ]
+        if incomplete_docs:
+            await save_log_async(self.log_file, self.log_data)
+            raise RuntimeError(
+                f"Document consolidation left {len(incomplete_docs)} document(s) incomplete. "
+                f"Examples: {incomplete_docs[:10]}. Rerun to retry pending documents."
+            )
+
         # Always calculate 'after' statistics directly from disk to ensure accuracy
         total_concepts_after = 0
         for doc_dir in self.consolidated_dir.iterdir():

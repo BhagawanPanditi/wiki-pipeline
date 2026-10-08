@@ -21,6 +21,7 @@ from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
 from citation_utils import clean_brief_text
+from atomic_io import atomic_write_json
 
 # ── Server Configuration ─────────────────────────────────────────────────────
 from pipeline_config import load_global_config
@@ -209,8 +210,7 @@ class ConceptBriefPipeline:
 
         # Save to global_concepts_refined.json
         print(f"\nSaving updated concepts to {self.refined_file}...")
-        with open(self.refined_file, "w", encoding="utf-8") as f:
-            json.dump({"concepts": reordered_concepts}, f, indent=2)
+        atomic_write_json(self.refined_file, {"concepts": reordered_concepts})
 
         # Repopulate concepts/ directory
         print(f"Updating individual concept JSON files in {self.concepts_dir}/...")

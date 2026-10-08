@@ -18,6 +18,8 @@ from typing import Dict, List, Set, Any, Tuple
 import networkx as nx
 from tqdm import tqdm
 
+from atomic_io import atomic_write_json
+
 
 def normalize_entity(ent: str) -> str:
     return ent.strip().lower()
@@ -148,8 +150,7 @@ def enrich_graph_via_entity_overlap(
 
     # Save to global_concepts_refined.json
     print(f"\nWriting updated concepts to {refined_file}...")
-    with open(refined_file, "w", encoding="utf-8") as f:
-        json.dump({"concepts": concepts}, f, indent=2)
+    atomic_write_json(refined_file, {"concepts": concepts})
 
     # Update individual concept files
     concepts_dir = domain_dir / "concepts"

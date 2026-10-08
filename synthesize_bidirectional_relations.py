@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 import httpx
 
 from pipeline_config import load_global_config
+from atomic_io import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 REVERSE_RELATION_PROMPT = """\
@@ -117,6 +118,7 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
             await queue.put(None)
 
         pbar = tqdm(total=len(missing_reverse), desc="LLM Reverse Relations")
+        failed_relations: List[Tuple[str, str]] = []
 
         async def worker(client: AsyncOpenAI):
             while True:
@@ -138,6 +140,7 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                 )
 
                 rev_text = f"Functionally related to {concept_a['title']}."
+                generated = False
                 for attempt in range(10):
                     try:
                         resp = await client.chat.completions.create(
@@ -146,12 +149,19 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                             temperature=0.2,
                             max_tokens=256
                         )
-                        raw = resp.choices[0].message.content.strip()
+                        raw = (resp.choices[0].message.content or "").strip()
                         if raw:
                             rev_text = raw
+                            generated = True
                             break
+                        if attempt < 9:
+                            await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
                     except Exception:
-                        await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
+                        if attempt < 9:
+                            await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
+
+                if not generated:
+                    failed_relations.append((src_b_lower, tgt_a_lower))
 
                 # If relation already exists update it with synthesized description otherwise append
                 existing_rel = None
@@ -183,6 +193,12 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
         pbar.close()
         for hc in http_clients:
             await hc.aclose()
+
+        if failed_relations:
+            raise RuntimeError(
+                f"Reverse-relation synthesis failed for {len(failed_relations)} edge(s) after retries. "
+                f"Examples: {failed_relations[:10]}"
+            )
 
     # STRICT STUB PURGE & DEDUPLICATION:
     # Ensure every single outbound relation targets an EXISTING canonical concept, no self-loops, and deduplicated
@@ -218,8 +234,7 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
 
     # Save updated file
     print(f"Writing updated concepts with bidirectional links to {refined_file}...")
-    with open(refined_file, "w", encoding="utf-8") as f:
-        json.dump({"concepts": concepts}, f, indent=2)
+    atomic_write_json(refined_file, {"concepts": concepts})
 
     print("Bidirectional relation synthesis complete! Zero stubs guaranteed.")
 

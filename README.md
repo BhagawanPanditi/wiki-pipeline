@@ -43,7 +43,7 @@ STAGE 2: ./run_stage2_post_embed.sh biology
 - Reuses all raw concepts already extracted in Pass 1 / Pass 2.
 - **Title Lemmatization & Normalization**: Strips plural suffixes (`hallucination` vs `hallucinations`) and hyphenation splits (`hand washing` vs `handwashing`).
 - **Scraping & Boilerplate Filter**: Automatically detects and drops paper meta-headers (`Study Participants`, `Statistical Methods`, cookie notices).
-- **Paragraph Citation Mapping**: Groups sentences by source chunks so paragraphs end with their citations `[canon_doc01::chunk_004]`.
+- **Paragraph Citation Mapping**: Uses chunk provenance internally, while exported description paragraphs end with document-level citations such as `[canon_doc01]` (never a `::chunk_...` suffix).
 
 ### 2. `stub_resolution.py`
 - Major stubs (> 2 source chunks) are synthesized into full concepts.
@@ -96,6 +96,26 @@ STAGE 2: ./run_stage2_post_embed.sh biology
 - Analyzes weakly connected components, giant component percentage, and reports small isolated islands.
 
 ---
+
+## Unattended Runs, Resume, and Skipping Embeddings
+
+For a single end-to-end run with embedding bridging disabled:
+
+```bash
+./run_entire_pipeline.sh biology --skip-embed --max-stage-attempts 5
+```
+
+The runner checkpoints each stage under `<wiki-base>/<domain>/.pipeline_state/` and writes a separate log for each stage under `pipeline_logs/`. If interrupted or if a stage exhausts its retries, restart with:
+
+```bash
+./run_entire_pipeline.sh biology --resume --skip-embed --max-stage-attempts 5
+```
+
+Completed stages with their expected outputs are skipped; the failed/incomplete stage is retried. Rerunning an upstream stage invalidates downstream completion markers, including those used by the separate stage wrappers and embedding job. Use `--retry-forever` only when you want the process to wait through outages indefinitely. It can also repeat permanent input/configuration failures, so the default bounded retries are safer for unattended jobs. Use `--fresh` to rerun the orchestration stages while preserving generated data, logs, and per-chunk extraction checkpoints; it resets only pipeline completion markers. `--skip-extraction` is accepted only when prior extraction and document consolidation produced valid, non-empty concept lists in `consolidated/canon_*/concepts.json`.
+
+`--skip-embed` skips only embedding-based semantic island bridging. The rest of the graph pipeline still runs, but the graph may have fewer semantic bridge links. Embedding is optional, not required for export.
+
+Retries cannot guarantee completion if servers, GPUs, storage, or input data remain unavailable or invalid. After the configured attempts, the runner exits non-zero, preserves checkpoints/logs, and can be resumed after fixing the cause.
 
 ## How to Cache Previous Stages & Run Anew
 

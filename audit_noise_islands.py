@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 import httpx
 
 from pipeline_config import load_global_config
+from atomic_io import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 SYSTEM_PROMPT_ISLAND_AUDIT = """\
@@ -101,8 +102,10 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
     print(f"Total graph nodes: {len(concepts)} | Giant component: {len(giant_component)} ({len(giant_component)/len(concepts)*100:.1f}%)")
     print(f"Reviewing and bridging {len(small_islands_to_review)} small islands (size 1 to {args.max_island_size}) via sibling document context...")
 
-    if not small_islands_to_review or not args.servers:
+    if not small_islands_to_review:
         return
+    if not args.servers:
+        raise RuntimeError("Island auditing found work to do, but no LLM servers are configured.")
 
     queue = asyncio.Queue()
     for comp in small_islands_to_review:
@@ -115,6 +118,7 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
     prune_titles_set: Set[str] = set()
     merge_actions: List[Dict[str, Any]] = []
     link_actions: List[Dict[str, Any]] = []
+    failed_components: List[List[str]] = []
 
     lock = asyncio.Lock()
     pbar = tqdm(total=len(small_islands_to_review), desc="Auditing & Connecting Islands")
@@ -221,6 +225,9 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
                             "rel_ab": rel_ab,
                             "rel_ba": rel_ba
                         })
+            else:
+                async with lock:
+                    failed_components.append(comp)
 
             pbar.update(1)
             queue.task_done()
@@ -238,6 +245,12 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
     log_f.close()
     for hc in http_clients:
         await hc.aclose()
+
+    if failed_components:
+        raise RuntimeError(
+            f"Island audit failed for {len(failed_components)} component(s) after retries. "
+            f"Examples: {failed_components[:5]}"
+        )
 
     print(f"\nAudit & Bridge Results:")
     print(f"  - Confirmed Noise Islands Pruned:   {len(prune_titles_set)}")
@@ -329,8 +342,7 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
 
     # Save updated clean graph
     print(f"\nSaving updated bridged graph ({len(surviving_concepts)} concepts) to {refined_file}...")
-    with open(refined_file, "w", encoding="utf-8") as f:
-        json.dump({"concepts": surviving_concepts}, f, indent=2)
+    atomic_write_json(refined_file, {"concepts": surviving_concepts})
 
     # Re-evaluate island metrics
     G_clean = nx.Graph()

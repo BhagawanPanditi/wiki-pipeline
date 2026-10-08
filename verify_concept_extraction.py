@@ -147,6 +147,7 @@ class WikiVerifierPipeline:
         self.servers = args.servers
         self.concurrency = args.concurrency_per_server
         self.verification_log = self._load_log()
+        self.verification_failures: Dict[str, str] = {}
 
     def _load_log(self) -> Dict[str, bool]:
         if self.verification_log_file.exists():
@@ -165,19 +166,49 @@ class WikiVerifierPipeline:
 
         print("Locating extracted concepts in staging directory...")
         verification_items = []
+        missing_extractions = []
 
         for key, chunk_data in chunks_map.items():
-            doc_id, chunk_id = key.split("::")
-            concepts_file = self.staging_dir / doc_id / chunk_id / "concepts.json"
+            doc_id, chunk_id = key.split("::", 1)
+            chunk_dir = self.staging_dir / doc_id / chunk_id
+            concepts_file = chunk_dir / "concepts.json"
 
-            if concepts_file.exists():
-                verification_items.append({
-                    "doc_id": doc_id,
-                    "chunk_id": chunk_id,
-                    "key": key,
-                    "current_chunk": chunk_data["current_chunk"],
-                    "concepts_file": concepts_file
-                })
+            if not concepts_file.exists():
+                missing_extractions.append(key)
+                continue
+
+            try:
+                with concepts_file.open("r", encoding="utf-8") as f:
+                    concepts_data = json.load(f)
+                if not isinstance(concepts_data.get("concepts"), list):
+                    raise ValueError("concepts.json does not contain a concepts list")
+            except Exception as exc:
+                missing_extractions.append(f"{key} ({type(exc).__name__}: {exc})")
+                continue
+
+            verification_file = chunk_dir / "verification.json"
+            if self.verification_log.get(key, False):
+                try:
+                    with verification_file.open("r", encoding="utf-8") as f:
+                        result = json.load(f)
+                    if not isinstance(result, dict) or "coverage_score" not in result:
+                        raise ValueError("verification.json is incomplete")
+                except Exception:
+                    self.verification_log[key] = False
+
+            verification_items.append({
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
+                "key": key,
+                "current_chunk": chunk_data["current_chunk"],
+                "concepts_file": concepts_file
+            })
+
+        if missing_extractions:
+            raise RuntimeError(
+                f"{len(missing_extractions)} cached chunk(s) do not have valid extracted concepts. "
+                f"Examples: {missing_extractions[:10]}. Complete Pass 1 before verification."
+            )
 
         print(f"Found {len(verification_items)} extracted chunks ready for verification.")
         return verification_items
@@ -211,6 +242,7 @@ EXTRACTED CONCEPTS JSON:
 {concepts_json_raw}
 """
         max_attempts = 3
+        last_error = None
         for attempt in range(max_attempts):
             try:
                 response = await client.chat.completions.create(
@@ -248,11 +280,17 @@ EXTRACTED CONCEPTS JSON:
                 parsed = VerificationResult.model_validate(parsed_data)
                 return parsed
             except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
                 if attempt == max_attempts - 1:
-                    print(f"\n[ERROR] Verification permanently failed for {item['key']}: {type(e).__name__}: {e}")
+                    print(f"\n[ERROR] Verification permanently failed for {item['key']}: {last_error}")
+                    self.verification_failures[item["key"]] = last_error
                     return None
                 sleep_time = min(2.0 ** attempt, 15.0)
                 await asyncio.sleep(sleep_time)
+
+        if last_error:
+            self.verification_failures[item["key"]] = last_error
+        return None
 
     async def worker_task(
         self,
@@ -303,6 +341,16 @@ EXTRACTED CONCEPTS JSON:
                 
                 if should_save:
                     await save_log_async(self.verification_log_file, log_snapshot)
+            else:
+                debug_file = self.staging_dir / doc_id / chunk_id / "verification_debug.json"
+                debug_data = {
+                    "key": key,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "error": self.verification_failures.get(key, "Verification failed after retries."),
+                }
+                await asyncio.to_thread(
+                    debug_file.write_text, json.dumps(debug_data, indent=2), encoding="utf-8"
+                )
 
             pbar.update(1)
             queue.task_done()
@@ -424,6 +472,14 @@ EXTRACTED CONCEPTS JSON:
 
             for http_client in http_clients:
                 await http_client.aclose()
+
+        failed_items = [i["key"] for i in items if not self.verification_log.get(i["key"], False)]
+        if failed_items:
+            self.generate_summary_report()
+            print(f"[ERROR] {len(failed_items)} chunk(s) remain unverified. Examples: {failed_items[:10]}")
+            raise RuntimeError(
+                f"Verification left {len(failed_items)} chunk(s) incomplete; rerun the stage to retry them."
+            )
 
         self.generate_summary_report()
 

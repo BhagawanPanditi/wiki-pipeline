@@ -12,13 +12,28 @@ Can run under an sbatch job with conda env: qwen-embed
 
 import json
 import argparse
+import hashlib
+import os
 from pathlib import Path
 from typing import Dict, List, Set, Any
 import numpy as np
 from tqdm import tqdm
 from pipeline_config import load_embedding_model
+from atomic_io import atomic_write_json
 
 DEFAULT_EMBEDDING_MODEL = load_embedding_model()
+
+
+def embedding_signature(model_name: str, texts: List[str]) -> str:
+    """Fingerprint the exact text/model inputs so cached vectors cannot go stale."""
+    digest = hashlib.sha256()
+    digest.update(model_name.encode("utf-8"))
+    for text in texts:
+        encoded = text.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
 
 def run_embedding_island_bridging(
     domain_dir: Path,
@@ -46,39 +61,75 @@ def run_embedding_island_bridging(
         rep = f"Concept: {title}\nSummary: {brief}\nEntities: {entities_str}"
         texts.append(rep)
 
-    try:
-        from sentence_transformers import SentenceTransformer
-        print(f"Loading embedding model: {model_name}...")
-        model = SentenceTransformer(model_name, trust_remote_code=True)
-        embeddings = model.encode(texts, batch_size=32, show_progress_bar=True, normalize_embeddings=True)
-    except Exception as e:
-        print(f"SentenceTransformer not available or failed: {e}")
-        print("Falling back to HuggingFace transformers pipeline...")
-        import torch
-        from transformers import AutoTokenizer, AutoModel
+    if not texts:
+        raise RuntimeError("Cannot embed an empty concept graph.")
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_name, trust_remote_code=True).cuda()
-        model.eval()
-
-        embed_list = []
-        batch_size = 16
-        for i in tqdm(range(0, len(texts), batch_size), desc="Encoding batches"):
-            batch_texts = texts[i:i + batch_size]
-            encoded = tokenizer(batch_texts, padding=True, truncation=True, max_length=512, return_tensors="pt").to("cuda")
-            with torch.no_grad():
-                out = model(**encoded)
-                # Mean pooling
-                mask = encoded["attention_mask"].unsqueeze(-1)
-                emb = (out.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1)
-                emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-                embed_list.append(emb.cpu().numpy())
-        embeddings = np.vstack(embed_list)
-
-    # Save embeddings to disk
     emb_cache_file = domain_dir / "concept_embeddings.npy"
-    np.save(emb_cache_file, embeddings)
-    print(f"Saved embeddings to {emb_cache_file}")
+    emb_manifest_file = domain_dir / "concept_embeddings.meta.json"
+    input_signature = embedding_signature(model_name, texts)
+    embeddings = None
+
+    # Reuse only a complete cache matching the current model and exact concept texts.
+    if emb_cache_file.exists() and emb_manifest_file.exists():
+        try:
+            with emb_manifest_file.open("r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            candidate = np.load(emb_cache_file, allow_pickle=False)
+            if (
+                manifest.get("signature") == input_signature
+                and candidate.ndim == 2
+                and candidate.shape[0] == len(texts)
+                and np.isfinite(candidate).all()
+            ):
+                embeddings = candidate
+                print(f"Reusing validated embedding cache: {emb_cache_file}")
+        except Exception as exc:
+            print(f"Ignoring incomplete/invalid embedding cache ({type(exc).__name__}: {exc}).")
+
+    if embeddings is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            print(f"Loading embedding model: {model_name}...")
+            model = SentenceTransformer(model_name, trust_remote_code=True)
+            embeddings = model.encode(texts, batch_size=32, show_progress_bar=True, normalize_embeddings=True)
+        except Exception as e:
+            print(f"SentenceTransformer not available or failed: {e}")
+            print("Falling back to HuggingFace transformers pipeline...")
+            import torch
+            from transformers import AutoTokenizer, AutoModel
+
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            model = AutoModel.from_pretrained(model_name, trust_remote_code=True).cuda()
+            model.eval()
+
+            embed_list = []
+            batch_size = 16
+            for i in tqdm(range(0, len(texts), batch_size), desc="Encoding batches"):
+                batch_texts = texts[i:i + batch_size]
+                encoded = tokenizer(batch_texts, padding=True, truncation=True, max_length=512, return_tensors="pt").to("cuda")
+                with torch.no_grad():
+                    out = model(**encoded)
+                    mask = encoded["attention_mask"].unsqueeze(-1)
+                    emb = (out.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1)
+                    emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+                    embed_list.append(emb.cpu().numpy())
+            embeddings = np.vstack(embed_list)
+
+        embeddings = np.asarray(embeddings)
+        if embeddings.ndim != 2 or embeddings.shape[0] != len(texts) or not np.isfinite(embeddings).all():
+            raise RuntimeError(f"Embedding output has invalid shape or values: {embeddings.shape}")
+
+        # Atomic cache writes keep a preempted/failed run from leaving a usable-looking partial file.
+        temp_embedding_file = emb_cache_file.with_name(emb_cache_file.name + ".tmp")
+        with temp_embedding_file.open("wb") as f:
+            np.save(f, embeddings)
+        os.replace(temp_embedding_file, emb_cache_file)
+
+        temp_manifest_file = emb_manifest_file.with_suffix(".json.tmp")
+        with temp_manifest_file.open("w", encoding="utf-8") as f:
+            json.dump({"model": model_name, "signature": input_signature, "count": len(texts)}, f, indent=2)
+        os.replace(temp_manifest_file, emb_manifest_file)
+        print(f"Saved validated embeddings to {emb_cache_file}")
 
     # Compute pairwise similarities for isolated or low-degree concepts
     print("Computing cosine similarities to bridge graph islands...")
@@ -112,8 +163,7 @@ def run_embedding_island_bridging(
     print(f"Added {added_edges} semantic similarity cross-links!")
 
     print(f"Saving updated graph to {refined_file}...")
-    with open(refined_file, "w", encoding="utf-8") as f:
-        json.dump({"concepts": concepts}, f, indent=2)
+    atomic_write_json(refined_file, {"concepts": concepts})
 
     print("Embedding bridging complete!")
 

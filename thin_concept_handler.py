@@ -23,6 +23,7 @@ from tqdm.asyncio import tqdm
 
 # ── Configuration ────────────────────────────────────────────────────────────
 from pipeline_config import load_global_config
+from atomic_io import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Pydantic Schema for LLM Decision ─────────────────────────────────────────
@@ -299,8 +300,7 @@ CANDIDATE HOST CONCEPTS:
         self.concepts_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"Saving refined global JSON to {self.output_file}...")
-        with open(self.output_file, "w", encoding="utf-8") as f:
-            json.dump({"concepts": final_concepts}, f, indent=2)
+        atomic_write_json(self.output_file, {"concepts": final_concepts})
 
         print(f"Saving individual concept JSON files to {self.concepts_dir}/...")
         for gc in tqdm(final_concepts, desc="Writing individual files"):
@@ -330,8 +330,7 @@ CANDIDATE HOST CONCEPTS:
             "final_clean_concepts_count": len(final_concepts)
         }
 
-        with open(self.log_file, "w", encoding="utf-8") as f:
-            json.dump(log_data, f, indent=2)
+        atomic_write_json(self.log_file, log_data)
 
         print(f"\n==================================================")
         print(f"LLM THIN CONCEPT HANDLING COMPLETE")

@@ -11,6 +11,8 @@ from pathlib import Path
 from collections import Counter
 import networkx as nx
 
+from atomic_io import atomic_write_json
+
 def analyze_kg_islands(domain_dir: Path):
     refined_file = domain_dir / "global_concepts_refined.json"
     report_file = domain_dir / "islands_report.json"
@@ -109,8 +111,7 @@ def analyze_kg_islands(domain_dir: Path):
         ]
     }
 
-    with open(report_file, "w", encoding="utf-8") as f:
-        json.dump(report_data, f, indent=2)
+    atomic_write_json(report_file, report_data)
 
     print(f"\nSaved full island report to: {report_file}")
 

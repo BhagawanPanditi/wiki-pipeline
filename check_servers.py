@@ -11,9 +11,17 @@ import httpx
 from pipeline_config import load_global_config
 
 def main():
-    servers, _, model = load_global_config()
+    servers, concurrency, model = load_global_config()
+    if not isinstance(servers, list) or not servers or any(not isinstance(s, str) or not s.strip() for s in servers):
+        print("ERROR: config.json must contain a non-empty 'servers' list of URLs.")
+        sys.exit(2)
+    if not isinstance(concurrency, int) or concurrency < 1:
+        print("ERROR: concurrency_per_server must be a positive integer.")
+        sys.exit(2)
+
     print("=" * 65)
     print(f" PRE-FLIGHT CHECK: Checking {len(servers)} configured vLLM servers...")
+    print(f" Concurrency per server: {concurrency}")
     print(f" Expected Model: {model}")
     print("=" * 65)
 

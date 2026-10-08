@@ -38,6 +38,7 @@ except Exception:
 
 # ── Server Configuration ─────────────────────────────────────────────────────
 from pipeline_config import load_global_config
+from atomic_io import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
@@ -323,8 +324,10 @@ async def verify_cluster_llm(client: AsyncOpenAI, cluster: List[Dict[str, Any]],
     return None
 
 async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], args) -> Tuple[List[MergeCluster], List[Dict[str, Any]]]:
-    if not candidate_clusters or not args.servers:
+    if not candidate_clusters:
         return [], []
+    if not args.servers:
+        raise RuntimeError("Fuzzy concept clusters require at least one configured LLM server.")
 
     print(f"Evaluating {len(candidate_clusters)} fuzzy candidate clusters using LLM pool...")
     queue = asyncio.Queue()
@@ -336,7 +339,8 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
         await queue.put(None)
 
     approved_merges: List[MergeCluster] = []
-    llm_evaluations: List[Dict[str, Any]] = [] # NEW: Track what is sent & decided
+    llm_evaluations: List[Dict[str, Any]] = []
+    failed_clusters: List[List[str]] = []
     lock = asyncio.Lock()
     pbar = tqdm(total=len(candidate_clusters), desc="LLM Fuzzy Cluster Verification")
 
@@ -358,7 +362,9 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
             async with lock:
                 if result and result.merge_clusters:
                     approved_merges.extend(result.merge_clusters)
-                llm_evaluations.append(decision_record) # Add to our tracking list
+                if result is None:
+                    failed_clusters.append([c.get("title", "Unknown") for c in cluster])
+                llm_evaluations.append(decision_record)
 
             pbar.update(1)
             queue.task_done()
@@ -378,8 +384,13 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
         for hc in http_clients:
             await hc.aclose()
 
+    if failed_clusters:
+        raise RuntimeError(
+            f"LLM fuzzy review failed for {len(failed_clusters)} cluster(s) after retries. "
+            f"Examples: {failed_clusters[:5]}"
+        )
+
     print(f"LLM approved {len(approved_merges)} fuzzy merge clusters.")
-    # Return both the flattened merges (for logic) and the evaluation log (for audit)
     return approved_merges, llm_evaluations
 
 # ── Core Pipeline Logic ──────────────────────────────────────────────────────
@@ -389,13 +400,14 @@ def global_consolidate(domain_dir: Path, args):
     log_file = domain_dir / "global_consolidation.json"
 
     if not consolidated_dir.exists():
-        print(f"Error: No consolidated directory found at {consolidated_dir}")
-        return
+        raise FileNotFoundError(f"No consolidated directory found at {consolidated_dir}")
 
     # 1. Load All Raw Concepts
     all_raw_concepts = []
     doc_files = list(consolidated_dir.glob("canon_*/concepts.json"))
-    
+    if not doc_files:
+        raise RuntimeError(f"No consolidated concept files found under {consolidated_dir}")
+
     print(f"Loading concepts from {len(doc_files)} canonical document files...")
     for doc_file in doc_files:
         with open(doc_file, "r", encoding="utf-8") as f:
@@ -617,15 +629,13 @@ def global_consolidate(domain_dir: Path, args):
         "unresolved_stubs": sorted_unresolved_stubs
     }
 
-    with open(log_file, "w", encoding="utf-8") as f:
-        json.dump(log_data, f, indent=2)
+    atomic_write_json(log_file, log_data)
 
     # 7. Output Results directly to domain root and `concepts/`
     concepts_dir.mkdir(parents=True, exist_ok=True)
 
     print("Saving global_concepts.json...")
-    with open(domain_dir / "global_concepts.json", "w", encoding="utf-8") as f:
-        json.dump({"concepts": global_concepts}, f, indent=2)
+    atomic_write_json(domain_dir / "global_concepts.json", {"concepts": global_concepts})
 
     print("Saving individual concept files...")
     for gc in global_concepts:

@@ -3,7 +3,6 @@ import os
 import re
 import json
 import time
-import shutil
 import hashlib
 import asyncio
 import argparse
@@ -15,6 +14,8 @@ from pydantic import BaseModel, Field, ValidationError
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer
+
+from atomic_io import atomic_write_json
 
 # ── Server & Concurrency Configuration ───────────────────────────────────────
 
@@ -185,32 +186,81 @@ class WikiExtractorPipeline:
         return {}
 
     def cleanup_incomplete_states(self):
-        """Purges staging directories marked False or left incomplete upon resume."""
+        """Remove partial concept output for failed chunks but preserve debug evidence."""
         print("Sanitizing incomplete extraction states...")
         purged = 0
         for key, completed in list(self.extraction_log.items()):
             if not completed:
-                doc_id, chunk_id = key.split("::")
+                doc_id, chunk_id = key.split("::", 1)
                 target_subfolder = self.staging_dir / doc_id / chunk_id
-                if target_subfolder.exists():
-                    shutil.rmtree(target_subfolder)
+                partial_concepts = target_subfolder / "concepts.json"
+                if partial_concepts.exists():
+                    partial_concepts.unlink()
                     purged += 1
                 del self.extraction_log[key]
         _save_log_sync(self.log_file, self.extraction_log)
-        print(f"Purged {purged} incomplete chunk directories.")
+        print(f"Cleared {purged} partial concept files; preserved per-chunk debug logs.")
+
+    def chunk_is_complete(self, chunk: Dict[str, Any]) -> bool:
+        """Trust a completion-log entry only when its extracted JSON is readable."""
+        key = f"{chunk['doc_id']}::{chunk['chunk_id']}"
+        if not self.extraction_log.get(key, False):
+            return False
+
+        concepts_file = self.staging_dir / chunk["doc_id"] / chunk["chunk_id"] / "concepts.json"
+        try:
+            with concepts_file.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return isinstance(data.get("concepts"), list)
+        except Exception:
+            self.extraction_log[key] = False
+            return False
 
     def prepare_chunks(self) -> List[Dict[str, Any]]:
-        """Deduplicates raw documents and caches tokenized sliding-window chunks."""
+        """Deduplicate documents and reuse chunks only when their inputs match."""
         chunks_cache_file = self.cache_dir / "chunks_cache.json"
-        
-        if chunks_cache_file.exists():
-            print(f"Loading cached chunks from {chunks_cache_file}...")
-            with open(chunks_cache_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-
+        cache_manifest_file = self.cache_dir / "chunks_cache_manifest.json"
+        mapping_file = self.cache_dir / "doc_mapping.json"
         doc_path = Path(self.args.data_dir) / f"{self.domain}.jsonl"
         if not doc_path.exists():
             raise FileNotFoundError(f"Missing domain file: {doc_path}")
+
+        # A pre-existing chunks_cache.json is not sufficient evidence that its
+        # chunks describe today's input. Hash the source and bind the cache to
+        # the tokenizer name and chunking parameters before reusing it.
+        source_digest = hashlib.sha256()
+        with doc_path.open("rb") as source_file:
+            for block in iter(lambda: source_file.read(1024 * 1024), b""):
+                source_digest.update(block)
+        expected_manifest = {
+            "format_version": 1,
+            "source_sha256": source_digest.hexdigest(),
+            "tokenizer": self.args.model_name,
+            "chunk_size": 4500,
+            "overlap": 400,
+        }
+
+        if chunks_cache_file.exists() and cache_manifest_file.exists() and mapping_file.exists():
+            try:
+                with cache_manifest_file.open("r", encoding="utf-8") as f:
+                    cached_manifest = json.load(f)
+                with chunks_cache_file.open("r", encoding="utf-8") as f:
+                    cached_chunks = json.load(f)
+                required_fields = {
+                    "doc_id", "chunk_id", "current_chunk", "context_before", "context_after"
+                }
+                chunks_are_valid = isinstance(cached_chunks, list) and all(
+                    isinstance(chunk, dict) and required_fields.issubset(chunk)
+                    for chunk in cached_chunks
+                )
+                if cached_manifest == expected_manifest and chunks_are_valid:
+                    print(f"Loading validated cached chunks from {chunks_cache_file}...")
+                    return cached_chunks
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+            print("Cached chunks are stale or invalid; rebuilding them from the current input.")
+        elif chunks_cache_file.exists():
+            print("Cached chunks are missing required metadata; rebuilding them for safety.")
 
         print(f"Loading documents from {doc_path}...")
         raw_docs = []
@@ -233,27 +283,20 @@ class WikiExtractorPipeline:
             if cid not in canon_docs:
                 canon_docs[cid] = d["content"]
 
-        mapping_file = self.cache_dir / "doc_mapping.json"
-        if not mapping_file.exists():
-            
-            # Helper to reverse CP437/Windows-1252 corruption back to standard UTF-8
-            def fix_mojibake(text: str) -> str:
-                try:
-                    return text.encode('cp437').decode('utf-8')
-                except (UnicodeEncodeError, UnicodeDecodeError, AttributeError):
-                    return text
+        # Refresh the mapping whenever the source signature changes, rather than
+        # retaining mappings that may belong to an older version of the corpus.
+        def fix_mojibake(text: str) -> str:
+            try:
+                return text.encode("cp437").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError, AttributeError):
+                return text
 
-            doc_mapping = {}
-            for d in raw_docs:
-                raw_id = d.get("id", d.get("doc_id", "UNKNOWN_ID")) 
-                clean_id = fix_mojibake(raw_id)
-                
-                h = short_hash(d["content"])
-                doc_mapping[clean_id] = f"canon_{h}"
-                
-            with open(mapping_file, "w", encoding="utf-8") as f:
-                # ensure_ascii=False keeps the characters readable instead of escaping them
-                json.dump(doc_mapping, f, indent=2, ensure_ascii=False)
+        doc_mapping = {}
+        for d in raw_docs:
+            raw_id = d.get("id", d.get("doc_id", "UNKNOWN_ID"))
+            clean_id = fix_mojibake(raw_id)
+            doc_mapping[clean_id] = f"canon_{short_hash(d['content'])}"
+        atomic_write_json(mapping_file, doc_mapping)
 
         print(f"Deduplicated {len(raw_docs)} docs down to {len(canon_docs)} unique canonical docs.")
         print("Tokenizing and creating chunks (4500 tokens window + overlap)...")
@@ -264,8 +307,8 @@ class WikiExtractorPipeline:
             doc_chunks = chunk_document(canon_id, content, tokenizer)
             all_chunks.extend(doc_chunks)
 
-        with open(chunks_cache_file, "w", encoding="utf-8") as f:
-            json.dump(all_chunks, f, indent=2)
+        atomic_write_json(chunks_cache_file, all_chunks)
+        atomic_write_json(cache_manifest_file, expected_manifest)
 
         print(f"Cached {len(all_chunks)} chunks to disk.")
         return all_chunks
@@ -420,10 +463,7 @@ class WikiExtractorPipeline:
             self.cleanup_incomplete_states()
 
         all_chunks = self.prepare_chunks()
-        pending_chunks = [
-            c for c in all_chunks 
-            if not self.extraction_log.get(f"{c['doc_id']}::{c['chunk_id']}", False)
-        ]
+        pending_chunks = [c for c in all_chunks if not self.chunk_is_complete(c)]
 
         total_pending = len(pending_chunks)
         print(f"Total chunks: {len(all_chunks)} | Pending chunks: {total_pending}")
@@ -485,7 +525,15 @@ class WikiExtractorPipeline:
             for http_client in http_clients:
                 await http_client.aclose()
 
-        print(f"\nSuccessfully finished extraction loop for domain: {self.domain}!")
+        failed_chunks = [c for c in all_chunks if not self.chunk_is_complete(c)]
+        if failed_chunks:
+            failed_keys = [f"{c['doc_id']}::{c['chunk_id']}" for c in failed_chunks]
+            print(f"[ERROR] {len(failed_chunks)} chunk(s) are incomplete after retries. Examples: {failed_keys[:10]}")
+            raise RuntimeError(
+                f"Pass 1 left {len(failed_chunks)} chunk(s) incomplete; rerun with --resume after checking server health."
+            )
+
+        print(f"\nSuccessfully finished extraction loop for domain: {self.domain}! All {len(all_chunks)} chunks are valid.")
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
