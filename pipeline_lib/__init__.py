@@ -17,7 +17,8 @@ dumping. That logic lives here once:
 ``reporting``    verification metrics and the Pass 1 -> Pass 2 improvement
 """
 
-from .atomic_io import atomic_write_json, atomic_write_text, read_json
+from .atomic_io import (atomic_write_json, atomic_write_text, read_json,
+                         sanitize_filename)
 from .checkpoint import (CheckpointLog, load_bool_log, load_json_log,
                          save_log_async, save_log_sync)
 from .chunks import load_cached_chunks
@@ -36,7 +37,7 @@ from .reporting import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
 from .retry import backoff_delay, retry_async
 
 __all__ = [
-    "atomic_write_json", "atomic_write_text", "read_json",
+    "atomic_write_json", "atomic_write_text", "read_json", "sanitize_filename",
     "CheckpointLog", "load_bool_log", "load_json_log", "load_cached_chunks",
     "save_log_async", "save_log_sync",
     "STAGE_PROFILES", "StageProfile", "StageSettings", "build_parser",

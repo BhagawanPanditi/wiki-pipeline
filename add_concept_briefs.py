@@ -17,7 +17,8 @@ from typing import Any, Dict, List
 from pydantic import BaseModel, Field
 
 from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
-                          build_parser, clean_json_string, resolve_settings)
+                          build_parser, clean_json_string, resolve_settings,
+                          sanitize_filename)
 from pipeline_lib.citation_utils import clean_brief_text
 
 STAGE = "brief-generation"
@@ -46,11 +47,6 @@ Return valid JSON:
 """
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
-
-def sanitize_filename(name: str) -> str:
-    keepchars = (' ', '.', '_', '-')
-    sanitized = "".join(c for c in name if c.isalnum() or c in keepchars).rstrip()
-    return sanitized.replace(" ", "_")[:100]
 
 def get_sentence_fallback(text: str, max_sentences: int = 2) -> str:
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]

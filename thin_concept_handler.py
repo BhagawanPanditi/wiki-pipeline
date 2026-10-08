@@ -20,7 +20,8 @@ from tqdm.asyncio import tqdm
 
 # ── Configuration ────────────────────────────────────────────────────────────
 from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
-                          build_parser, clean_json_string, resolve_settings)
+                          build_parser, clean_json_string, resolve_settings,
+                          sanitize_filename)
 
 STAGE = "thin-concept-folding"
 
@@ -57,11 +58,6 @@ If should_fold is false:
   "synthesized_description": null
 }
 """
-
-def sanitize_filename(name: str) -> str:
-    keepchars = (' ', '.', '_', '-')
-    sanitized = "".join(c for c in name if c.isalnum() or c in keepchars).rstrip()
-    return sanitized.replace(" ", "_")[:100]
 
 class ThinConceptHandler:
     def __init__(self, args):

@@ -35,7 +35,8 @@ except Exception:
 
 # ── Server Configuration ─────────────────────────────────────────────────────
 from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
-                          build_parser, clean_json_string, resolve_settings)
+                          build_parser, clean_json_string, resolve_settings,
+                          sanitize_filename)
 
 STAGE = "global-consolidation"
 
@@ -137,11 +138,6 @@ class UnionFind:
             self.parent[root2] = root1
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
-
-def sanitize_filename(name: str) -> str:
-    keepchars = (' ', '.', '_', '-')
-    sanitized = "".join(c for c in name if c.isalnum() or c in keepchars).rstrip()
-    return sanitized.replace(" ", "_")[:100]
 
 def snippet_description(text: str, max_words: int = 30) -> str:
     words = text.strip().split()
@@ -316,13 +312,11 @@ async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) ->
     cleaned = clean_json_string(raw_text)
     return GlobalFuzzyMergeSchema.model_validate_json(cleaned)
 
-
 async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], args) -> Tuple[List[MergeCluster], List[Dict[str, Any]]]:
     if not candidate_clusters:
         return [], []
     if not args.servers:
         raise RuntimeError("Fuzzy concept clusters require at least one configured LLM server.")
-
 
     settings = resolve_settings(args, STAGE)
     print(f"Evaluating {len(candidate_clusters)} fuzzy candidate clusters using LLM pool...")

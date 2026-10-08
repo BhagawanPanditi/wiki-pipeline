@@ -85,3 +85,15 @@ def read_json(path: PathLike, default: Any = None) -> Any:
             return json.load(f)
     except (OSError, json.JSONDecodeError, ValueError):
         return default
+
+
+def sanitize_filename(name: str) -> str:
+    """Make a concept title safe to use as a filename.
+
+    Three stages carried byte-identical copies of this. Kept exactly as they had
+    it: alphanumerics plus space/dot/underscore/hyphen, trailing space stripped,
+    spaces to underscores, capped at 100 characters.
+    """
+    keepchars = (' ', '.', '_', '-')
+    sanitized = "".join(c for c in name if c.isalnum() or c in keepchars).rstrip()
+    return sanitized.replace(" ", "_")[:100]
