@@ -90,7 +90,6 @@ class PipelineRunnerTests(unittest.TestCase):
                 str(RUNNER),
                 "biology",
                 "--skip-extraction",
-                "--skip-embed",
                 "--wiki-base-dir",
                 str(root / "wiki"),
                 "--max-stage-attempts",

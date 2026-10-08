@@ -15,11 +15,12 @@ from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer
 
-from atomic_io import atomic_write_json
+from pipeline_lib import atomic_write_json
 
 # ── Server & Concurrency Configuration ───────────────────────────────────────
 
 from pipeline_config import load_global_config
+from pipeline_lib import clean_json_string, load_bool_log, save_log_async, save_log_sync
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Pydantic Data Schemas for Extraction ──────────────────────────────────────
@@ -43,24 +44,6 @@ class ChunkExtractionSchema(BaseModel):
 def short_hash(text: str) -> str:
     """Computes MD5 hash for string deduplication."""
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
-
-def clean_json_string(raw_response: str) -> str:
-    """Extracts clean JSON string from raw model outputs."""
-    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return raw_response.strip()
-
-def _save_log_sync(log_file: Path, data: dict):
-    """Synchronous atomic write using a temporary file to avoid corrupt states."""
-    tmp_file = log_file.with_suffix(".json.tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_file, log_file)
-
-async def save_log_async(log_file: Path, data: dict):
-    """Offloads atomic log write to a thread pool to avoid blocking the event loop."""
-    await asyncio.to_thread(_save_log_sync, log_file, data)
 
 # ── Pre-Deduplication & Chunking ─────────────────────────────────────────────
 
@@ -173,17 +156,9 @@ class WikiExtractorPipeline:
 
         self.servers = args.servers
         self.concurrency = args.concurrency_per_server
-        self.extraction_log = self._load_log()
-
-    def _load_log(self) -> Dict[str, bool]:
-        if self.log_file.exists():
-            try:
-                with open(self.log_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                print("Warning: Log file corrupted. Initializing fresh extraction log.")
-                return {}
-        return {}
+        self.extraction_log = load_bool_log(
+            self.log_file,
+            corrupt_message="Log file corrupted. Initializing fresh extraction log.")
 
     def cleanup_incomplete_states(self):
         """Remove partial concept output for failed chunks but preserve debug evidence."""
@@ -198,7 +173,7 @@ class WikiExtractorPipeline:
                     partial_concepts.unlink()
                     purged += 1
                 del self.extraction_log[key]
-        _save_log_sync(self.log_file, self.extraction_log)
+        save_log_sync(self.log_file, self.extraction_log)
         print(f"Cleared {purged} partial concept files; preserved per-chunk debug logs.")
 
     def chunk_is_complete(self, chunk: Dict[str, Any]) -> bool:

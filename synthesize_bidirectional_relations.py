@@ -9,18 +9,17 @@ Makes all outbound relations bidirectional:
   (e.g., using A's brief, B's brief, and R_ab to articulate how Concept B is affected/utilized by A).
 """
 
-import json
-import argparse
 import asyncio
+import json
 from pathlib import Path
-from typing import Dict, List, Set, Any, Tuple
-from tqdm import tqdm
-from openai import AsyncOpenAI
-import httpx
+from typing import List, Set, Tuple
 
-from pipeline_config import load_global_config
-from atomic_io import atomic_write_json
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+from tqdm import tqdm
+
+from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
+                          build_parser, resolve_settings)
+
+STAGE = "reverse-relations"
 
 REVERSE_RELATION_PROMPT = """\
 You are an expert technical knowledge graph agent.
@@ -78,7 +77,9 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                     break
             missing_reverse.append((tgt, src, rel_text))
 
-    # Also rewrite template forward relations from embedding or entity linker
+    # Also rewrite template forward relations planted by the entity-overlap
+    # linker. "semantic affinity" is legacy wording from earlier graph files
+    # and is kept so re-running over old inputs still upgrades those edges.
     for c in concepts:
         for rel in c.get("outbound_relations", []):
             rel_str = rel.get("relation", "")
@@ -108,91 +109,100 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                 "source_chunks": []
             })
     else:
-        print(f"Synthesizing reverse relations using LLM pool across {len(args.servers)} servers...")
-        queue = asyncio.Queue()
-        for item in missing_reverse:
-            await queue.put(item)
-
-        effective_concurrency = args.concurrency_per_server
-        for _ in range(len(args.servers) * effective_concurrency):
-            await queue.put(None)
-
-        pbar = tqdm(total=len(missing_reverse), desc="LLM Reverse Relations")
+        settings = resolve_settings(args, STAGE)
+        debug = DebugLogger(domain_dir / "reverse_relations_debug.jsonl", label=STAGE)
+        budget = StageBudget(settings.budget_minutes)
         failed_relations: List[Tuple[str, str]] = []
 
-        async def worker(client: AsyncOpenAI):
-            while True:
-                item = await queue.get()
-                if item is None:
-                    queue.task_done()
+        async def synthesize_one(client, item, server_index):
+            """One reverse-relation sentence. Raises so the pool classifies/retries."""
+            src_b_lower, tgt_a_lower, rel_ab = item
+            concept_a = title_map[tgt_a_lower]
+            concept_b = title_map[src_b_lower]
+
+            prompt = REVERSE_RELATION_PROMPT.format(
+                title_a=concept_a["title"],
+                brief_a=concept_a.get("brief", ""),
+                title_b=concept_b["title"],
+                brief_b=concept_b.get("brief", ""),
+                rel_ab=rel_ab
+            )
+
+            resp = await client.chat.completions.create(
+                model=settings.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=settings.max_tokens
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            if not raw:
+                # Recoverable: the pool retries it on a short backoff, as before.
+                raise ValueError("empty completion for reverse relation")
+            return raw
+
+        async def attach_reverse_relation(item, rev_text):
+            """Insert or overwrite the back-link on concept B."""
+            src_b_lower, tgt_a_lower, _rel_ab = item
+            concept_a = title_map[tgt_a_lower]
+            concept_b = title_map[src_b_lower]
+
+            # If relation already exists update it with synthesized description otherwise append
+            existing_rel = None
+            for r in concept_b.get("outbound_relations", []):
+                if r.get("target_concept", "").lower().strip() == concept_a["title"].lower().strip():
+                    existing_rel = r
                     break
 
-                src_b_lower, tgt_a_lower, rel_ab = item
-                concept_b = title_map[src_b_lower]
-                concept_a = title_map[tgt_a_lower]
+            if existing_rel:
+                existing_rel["relation"] = rev_text
+            else:
+                concept_b.setdefault("outbound_relations", []).append({
+                    "target_concept": concept_a["title"],
+                    "relation": rev_text,
+                    "source_chunks": []
+                })
 
-                prompt = REVERSE_RELATION_PROMPT.format(
-                    title_a=concept_a["title"],
-                    brief_a=concept_a.get("brief", ""),
-                    title_b=concept_b["title"],
-                    brief_b=concept_b.get("brief", ""),
-                    rel_ab=rel_ab
+        print(f"Synthesizing reverse relations using LLM pool across {len(settings.servers)} servers...")
+        print(f"Spreading {len(missing_reverse)} edge(s) at {settings.concurrency_per_server} "
+              f"concurrent request(s) per server (item i -> server i % N).")
+        print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+              f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
+
+        pool = ServerPool(
+            settings.servers,
+            concurrency_per_server=settings.concurrency_per_server,
+            request_timeout=settings.profile.request_timeout,
+            connect_timeout=settings.profile.connect_timeout,
+            label=STAGE,
+            failover=not getattr(args, "no_failover", False),
+        )
+        try:
+            async with pool:
+                result = await pool.map(
+                    missing_reverse,
+                    synthesize_one,
+                    attempts=settings.attempts,
+                    desc="LLM Reverse Relations",
+                    key_fn=lambda it: f"{it[0]} <- {it[1]}",
+                    budget=budget,
+                    debug=debug,
+                    attempt_timeout=settings.profile.attempt_timeout,
+                    on_result=attach_reverse_relation,
                 )
+        finally:
+            debug.close()
 
-                rev_text = f"Functionally related to {concept_a['title']}."
-                generated = False
-                for attempt in range(10):
-                    try:
-                        resp = await client.chat.completions.create(
-                            model=args.model,
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.2,
-                            max_tokens=256
-                        )
-                        raw = (resp.choices[0].message.content or "").strip()
-                        if raw:
-                            rev_text = raw
-                            generated = True
-                            break
-                        if attempt < 9:
-                            await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
-                    except Exception:
-                        if attempt < 9:
-                            await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
+        print("Requests served per server:")
+        for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+            print(f"  {url:<40} {count}")
 
-                if not generated:
-                    failed_relations.append((src_b_lower, tgt_a_lower))
-
-                # If relation already exists update it with synthesized description otherwise append
-                existing_rel = None
-                for r in concept_b.get("outbound_relations", []):
-                    if r.get("target_concept", "").lower().strip() == concept_a["title"].lower().strip():
-                        existing_rel = r
-                        break
-
-                if existing_rel:
-                    existing_rel["relation"] = rev_text
-                else:
-                    concept_b.setdefault("outbound_relations", []).append({
-                        "target_concept": concept_a["title"],
-                        "relation": rev_text,
-                        "source_chunks": []
-                    })
-                pbar.update(1)
-                queue.task_done()
-
-        tasks, http_clients = [], []
-        for url in args.servers:
-            hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=httpx.Timeout(60.0))
-            http_clients.append(hc)
-            client = AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0)
-            for _ in range(effective_concurrency):
-                tasks.append(asyncio.create_task(worker(client)))
-
-        await asyncio.gather(*tasks)
-        pbar.close()
-        for hc in http_clients:
-            await hc.aclose()
+        # Unchanged contract: an edge that never produced text still receives the
+        # deterministic fallback wording, is recorded, and fails the stage loudly.
+        for failure in result.failures:
+            item = missing_reverse[failure["index"]]
+            concept_a = title_map[item[1]]
+            await attach_reverse_relation(item, f"Functionally related to {concept_a['title']}.")
+            failed_relations.append((item[0], item[1]))
 
         if failed_relations:
             raise RuntimeError(
@@ -238,20 +248,13 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
 
     print("Bidirectional relation synthesis complete! Zero stubs guaranteed.")
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Synthesize bidirectional relations")
-    parser.add_argument("--domain", type=str, required=True)
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
+    parser = build_parser(stage=STAGE, description="Synthesize bidirectional relations")
     parser.add_argument("--fast", action="store_true", help="Use template-based synthesis without LLM calls")
 
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain
     asyncio.run(synthesize_reverse_relations(domain_dir, args))
-
 
 if __name__ == "__main__":
     main()

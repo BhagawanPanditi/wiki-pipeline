@@ -19,6 +19,7 @@ from tqdm.asyncio import tqdm
 
 # ── Server & Concurrency Configuration ───────────────────────────────────────
 from pipeline_config import load_global_config
+from pipeline_lib import clean_json_string, load_json_log, save_log_async, save_log_sync
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Pydantic Data Schemas for LLM Consolidation ──────────────────────────────
@@ -36,26 +37,12 @@ class DocumentConsolidationSchema(BaseModel):
     )
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
-def clean_json_string(raw_response: str) -> str:
-    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return raw_response.strip()
 
 def snippet_description(text: str, max_words: int = 30) -> str:
     words = text.strip().split()
     if len(words) <= max_words:
         return text.strip()
     return " ".join(words[:max_words]) + "..."
-
-def _save_log_sync(log_file: Path, data: dict):
-    tmp_file = log_file.with_suffix(".json.tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_file, log_file)
-
-async def save_log_async(log_file: Path, data: dict):
-    await asyncio.to_thread(_save_log_sync, log_file, data)
 
 # ── System Prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT_CONSOLIDATE = """\
@@ -101,16 +88,9 @@ class DocumentConsolidatorPipeline:
         self.consolidated_dir.mkdir(parents=True, exist_ok=True)
         self.servers = args.servers
         self.concurrency = args.concurrency_per_server
-        self.log_data = self._load_log()
-
-    def _load_log(self) -> Dict[str, Any]:
-        if self.log_file.exists():
-            try:
-                with open(self.log_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                print("Warning: Consolidation log corrupted. Re-initializing.")
-        return {}
+        self.log_data = load_json_log(
+            self.log_file,
+            corrupt_message="Consolidation log corrupted. Re-initializing.")
 
     def prepare_document_items(self) -> List[Dict[str, Any]]:
         print(f"Scanning staging directory: {self.staging_dir}...")

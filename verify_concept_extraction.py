@@ -1,24 +1,39 @@
 #!/usr/bin/env python3
-import os
-import re
-import json
-import time
-import shutil
-import hashlib
+"""
+Extraction Verifier & Auditor - runs twice, once per extraction pass.
+----------------------------------------------------------------------
+Phase 1 audits the raw Pass 1 output and produces the ``missing_concepts`` /
+``missing_facts`` feedback that Pass 2 consumes as its repair instructions.
+Phase 2 re-audits the same chunks after Pass 2 has merged its repairs, so the
+two runs are directly comparable and their difference is the measured
+improvement.
+
+The phases write to separate files precisely because Pass 2 reads phase 1:
+
+    phase 1 -> staging/<doc>/<chunk>/verification.json         + verification_log.json
+    phase 2 -> staging/<doc>/<chunk>/verification_pass2.json   + verification_pass2_log.json
+
+Phase 2 additionally writes ``verification_summary.json`` in the domain
+directory holding both runs plus the deltas, and prints the improvement table.
+
+Requests are spread evenly across the configured vLLM servers (item i goes to
+server i % N), every failure is streamed to ``verification_debug.jsonl`` with
+the full untruncated prompt and raw response, and the stage stops on a
+wall-clock budget rather than idling on backoff.
+"""
+
 import asyncio
-import argparse
+import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
-import httpx
-from pydantic import BaseModel, Field, ValidationError
-from openai import AsyncOpenAI
-from tqdm.asyncio import tqdm
+from pydantic import BaseModel, Field
 
-# ── Server & Concurrency Configuration ───────────────────────────────────────
-
-from pipeline_config import load_global_config
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+from pipeline_lib import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
+                          CheckpointLog, DebugLogger, ServerPool, StageBudget,
+                          atomic_write_text, build_improvement, build_parser,
+                          clean_json_string, collect_metrics, format_improvement,
+                          format_report, load_cached_chunks, resolve_settings, write_summary)
 
 # ── Pydantic Data Schemas for Verification ────────────────────────────────────
 
@@ -94,79 +109,58 @@ Return ONLY valid JSON matching this exact structure:
 }
 """
 
-# ── Helper Utilities ─────────────────────────────────────────────────────────
-
-def clean_json_string(raw_response: str) -> str:
-    """Extracts clean JSON string from raw model outputs."""
-    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return raw_response.strip()
-
-def _save_log_sync(log_file: Path, data: dict):
-    """Synchronous atomic write using a temporary file."""
-    tmp_file = log_file.with_suffix(".json.tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_file, log_file)
-
-async def save_log_async(log_file: Path, data: dict):
-    """Offloads atomic write to thread pool to avoid blocking the event loop."""
-    await asyncio.to_thread(_save_log_sync, log_file, data)
-
 # ── Document Loading & Chunk Matching ────────────────────────────────────────
-
-def load_cached_chunks(cache_dir: Path) -> Dict[str, Dict[str, Any]]:
-    """Loads tokenized sliding-window chunks from the cache file."""
-    chunks_cache_file = cache_dir / "chunks_cache.json"
-    if not chunks_cache_file.exists():
-        raise FileNotFoundError(
-            f"Chunk cache file not found at {chunks_cache_file}. "
-            "Ensure you have run the chunking/extraction step first."
-        )
-
-    with open(chunks_cache_file, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
-
-    return {f"{c['doc_id']}::{c['chunk_id']}": c for c in chunks}
 
 # ── Verifier Pipeline ────────────────────────────────────────────────────────
 
 class WikiVerifierPipeline:
+    """Audits extracted concepts for one phase and reports aggregate quality."""
+
     def __init__(self, args):
         self.args = args
         self.domain = args.domain
+        self.phase = int(args.phase)
+        if self.phase not in (1, 2):
+            raise ValueError("--phase must be 1 or 2")
+
+        self.stage = "verification" if self.phase == 1 else "verification-pass2"
+        self.settings = resolve_settings(args, self.stage)
+
         self.base_wiki_dir = Path(args.wiki_base_dir) / self.domain
         self.staging_dir = self.base_wiki_dir / "staging"
         self.cache_dir = self.base_wiki_dir / "cache"
-        self.verification_log_file = self.base_wiki_dir / "verification_log.json"
+
+        # Phase-specific outputs: phase 2 must not overwrite phase 1, because
+        # Pass 2 consumes phase 1's missing_concepts / missing_facts.
+        self.result_filename = PASS1_RESULT if self.phase == 1 else PASS2_RESULT
+        log_name = "verification_log.json" if self.phase == 1 else "verification_pass2_log.json"
+        debug_name = "verification_debug.jsonl" if self.phase == 1 else "verification_pass2_debug.jsonl"
+        self.verification_log_file = self.base_wiki_dir / log_name
 
         if not self.staging_dir.exists():
-            raise FileNotFoundError(f"Staging directory missing at {self.staging_dir}. Run extraction first.")
+            raise FileNotFoundError(
+                f"Staging directory missing at {self.staging_dir}. Run extraction first."
+            )
 
-        self.servers = args.servers
-        self.concurrency = args.concurrency_per_server
-        self.verification_log = self._load_log()
+        self.checkpoint = CheckpointLog(self.verification_log_file, flush_every=50)
+        self.debug = DebugLogger(self.base_wiki_dir / debug_name, label=self.stage)
+        self.budget = StageBudget(self.settings.budget_minutes)
         self.verification_failures: Dict[str, str] = {}
 
-    def _load_log(self) -> Dict[str, bool]:
-        if self.verification_log_file.exists():
-            try:
-                with open(self.verification_log_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                print("Warning: Log file corrupted. Re-initializing verification log.")
-                return {}
-        return {}
+        if getattr(args, "resume", False):
+            cleared = self.checkpoint.reset_incomplete()
+            if cleared:
+                self.checkpoint.flush_sync()
+                print(f"Cleared {cleared} incomplete verification marks for resume.")
 
+    # ── item preparation ───────────────────────────────────────────────────
     def prepare_verification_items(self) -> List[Dict[str, Any]]:
-        """Pairs raw chunks with their corresponding extracted concepts.json files."""
-        print("Loading chunks index from cache...")
+        """Collect chunks whose extracted concepts are present and parseable."""
         chunks_map = load_cached_chunks(self.cache_dir)
 
         print("Locating extracted concepts in staging directory...")
-        verification_items = []
-        missing_extractions = []
+        verification_items: List[Dict[str, Any]] = []
+        missing_extractions: List[str] = []
 
         for key, chunk_data in chunks_map.items():
             doc_id, chunk_id = key.split("::", 1)
@@ -186,42 +180,40 @@ class WikiVerifierPipeline:
                 missing_extractions.append(f"{key} ({type(exc).__name__}: {exc})")
                 continue
 
-            verification_file = chunk_dir / "verification.json"
-            if self.verification_log.get(key, False):
+            # A result file that is missing or torn invalidates the mark, so a
+            # resumed run re-audits it instead of trusting a hollow checkpoint.
+            result_file = chunk_dir / self.result_filename
+            if self.checkpoint.is_done(key):
                 try:
-                    with verification_file.open("r", encoding="utf-8") as f:
-                        result = json.load(f)
-                    if not isinstance(result, dict) or "coverage_score" not in result:
-                        raise ValueError("verification.json is incomplete")
+                    with result_file.open("r", encoding="utf-8") as f:
+                        prior = json.load(f)
+                    if not isinstance(prior, dict) or "coverage_score" not in prior:
+                        raise ValueError(f"{self.result_filename} is incomplete")
                 except Exception:
-                    self.verification_log[key] = False
+                    self.checkpoint.mark(key, False)
 
             verification_items.append({
                 "doc_id": doc_id,
                 "chunk_id": chunk_id,
                 "key": key,
                 "current_chunk": chunk_data["current_chunk"],
-                "concepts_file": concepts_file
+                "concepts_file": concepts_file,
+                "result_file": result_file,
             })
 
         if missing_extractions:
+            stage_hint = "Pass 1" if self.phase == 1 else "Pass 2"
             raise RuntimeError(
                 f"{len(missing_extractions)} cached chunk(s) do not have valid extracted concepts. "
-                f"Examples: {missing_extractions[:10]}. Complete Pass 1 before verification."
+                f"Examples: {missing_extractions[:10]}. Complete {stage_hint} before verification."
             )
 
         print(f"Found {len(verification_items)} extracted chunks ready for verification.")
         return verification_items
 
-    async def verify_chunk(
-        self, client: AsyncOpenAI, item: Dict[str, Any]
-    ) -> Optional[VerificationResult]:
-        """Sends raw text and extracted concepts to LLM auditor with up to 5 retries."""
-        concepts_json_raw = await asyncio.to_thread(
-            item["concepts_file"].read_text, encoding="utf-8"
-        )
-
-        user_prompt = f"""\
+    # ── single LLM interaction ─────────────────────────────────────────────
+    def build_prompt(self, item: Dict[str, Any], concepts_json_raw: str) -> str:
+        return f"""\
 You are an auditor verifying the extraction quality. Compare the RAW CHUNK against EXTRACTED CONCEPTS JSON.
 Produce a verification report evaluating coverage and factual accuracy.
 
@@ -241,244 +233,184 @@ RAW CHUNK:
 EXTRACTED CONCEPTS JSON:
 {concepts_json_raw}
 """
-        max_attempts = 3
-        last_error = None
-        for attempt in range(max_attempts):
-            try:
-                response = await client.chat.completions.create(
-                    model=self.args.model_name,
-                    messages=[
-                        {"role": "system", "content": VERIFICATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.0,
-                    max_tokens=4096,
-                    response_format={"type": "json_object"}
-                )
-                raw_text = response.choices[0].message.content
-                cleaned_json = clean_json_string(raw_text)
-                parsed_data = json.loads(cleaned_json)
 
-                # Resilient handling: If LLM re-extracted concepts instead of auditing
-                if "coverage_score" not in parsed_data:
-                    # If model returned concepts extraction accidentally, check if concepts were extracted
-                    concepts_list = parsed_data.get("concepts", [])
-                    if concepts_list or "concepts" in parsed_data:
-                        # Model confused verification with re-extraction
-                        parsed_data["coverage_score"] = 0.85
-                        parsed_data["is_sufficient"] = True
-                        parsed_data["critique"] = "Extracted concepts verified."
-                    else:
-                        parsed_data.setdefault("coverage_score", 0.8)
-                        parsed_data.setdefault("is_sufficient", True)
-                        parsed_data.setdefault("critique", "Audit completed.")
+    def parse_verification(self, raw_text: Optional[str], key: str) -> VerificationResult:
+        """Parse an audit response, keeping the original resilient fallbacks.
 
-                parsed_data.setdefault("missing_concepts", [])
-                parsed_data.setdefault("missing_facts", [])
-                parsed_data.setdefault("hallucinations", [])
+        A malformed payload is streamed to the debug log in full before raising,
+        so the exact model output can be inspected offline; raising lets the
+        pool retry it as a recoverable failure.
+        """
+        if not raw_text:
+            self.debug.record("empty_response", key=key)
+            raise ValueError("Empty verification response")
 
-                parsed = VerificationResult.model_validate(parsed_data)
-                return parsed
-            except Exception as e:
-                last_error = f"{type(e).__name__}: {e}"
-                if attempt == max_attempts - 1:
-                    print(f"\n[ERROR] Verification permanently failed for {item['key']}: {last_error}")
-                    self.verification_failures[item["key"]] = last_error
-                    return None
-                sleep_time = min(2.0 ** attempt, 15.0)
-                await asyncio.sleep(sleep_time)
+        cleaned_json = clean_json_string(raw_text)
+        try:
+            parsed_data = json.loads(cleaned_json)
+        except json.JSONDecodeError:
+            self.debug.record("parse_failure", key=key, raw_response=raw_text)
+            raise
 
-        if last_error:
-            self.verification_failures[item["key"]] = last_error
-        return None
+        if not isinstance(parsed_data, dict):
+            self.debug.record("parse_failure", key=key, raw_response=raw_text,
+                              reason="top-level JSON is not an object")
+            raise ValueError("Verification response is not a JSON object")
 
-    async def worker_task(
-        self,
-        client: AsyncOpenAI,
-        queue: asyncio.Queue,
-        lock: asyncio.Lock,
-        pbar: tqdm,
-        flush_counter: dict
-    ):
-        """Worker task processing verification queue with atomic batched logging."""
-        while True:
-            item = await queue.get()
-            if item is None:
-                queue.task_done()
-                break
-
-            key = item["key"]
-            doc_id = item["doc_id"]
-            chunk_id = item["chunk_id"]
-
-            async with lock:
-                if self.verification_log.get(key, False):
-                    queue.task_done()
-                    pbar.update(1)
-                    continue
-                self.verification_log[key] = False
-
-            result = await self.verify_chunk(client, item)
-
-            if result is not None:
-                subfolder = self.staging_dir / doc_id / chunk_id
-                verification_file = subfolder / "verification.json"
-
-                payload = result.model_dump_json(indent=2)
-                await asyncio.to_thread(verification_file.write_text, payload, encoding="utf-8")
-
-                should_save = False
-                log_snapshot = None
-                
-                async with lock:
-                    self.verification_log[key] = True
-                    flush_counter["count"] += 1
-
-                    if flush_counter["count"] >= 50:
-                        should_save = True
-                        log_snapshot = self.verification_log.copy()
-                        flush_counter["count"] = 0
-                
-                if should_save:
-                    await save_log_async(self.verification_log_file, log_snapshot)
+        # Resilient handling: If LLM re-extracted concepts instead of auditing
+        if "coverage_score" not in parsed_data:
+            concepts_list = parsed_data.get("concepts", [])
+            if concepts_list or "concepts" in parsed_data:
+                # Model confused verification with re-extraction
+                parsed_data["coverage_score"] = 0.85
+                parsed_data["is_sufficient"] = True
+                parsed_data["critique"] = "Extracted concepts verified."
             else:
-                debug_file = self.staging_dir / doc_id / chunk_id / "verification_debug.json"
-                debug_data = {
-                    "key": key,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "error": self.verification_failures.get(key, "Verification failed after retries."),
-                }
-                await asyncio.to_thread(
-                    debug_file.write_text, json.dumps(debug_data, indent=2), encoding="utf-8"
-                )
+                parsed_data.setdefault("coverage_score", 0.8)
+                parsed_data.setdefault("is_sufficient", True)
+                parsed_data.setdefault("critique", "Audit completed.")
+            self.debug.record("recovered_response_shape", key=key,
+                              raw_response=raw_text, parsed=parsed_data)
 
-            pbar.update(1)
-            queue.task_done()
-
-    def generate_summary_report(self):
-        """Aggregates all verification results and prints global quality metrics."""
-        print("\n" + "=" * 60)
-        print(f"VERIFICATION SUMMARY REPORT [{self.domain.upper()}]")
-        print("=" * 60)
-
-        total_audited = 0
-        sufficient_count = 0
-        scores = []
-        all_missing_concepts = []
-        all_missing_facts = []
-
-        for subfolder in self.staging_dir.glob("*/*"):
-            vf = subfolder / "verification.json"
-            if vf.exists():
-                try:
-                    with open(vf, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    total_audited += 1
-                    scores.append(data.get("coverage_score", 0.0))
-                    if data.get("is_sufficient", False):
-                        sufficient_count += 1
-                    all_missing_concepts.extend(data.get("missing_concepts", []))
-                    all_missing_facts.extend(data.get("missing_facts", []))
-                except Exception:
-                    pass
-
-        if total_audited == 0:
-            print("No verification results found to summarize.")
-            return
-
-        avg_score = sum(scores) / len(scores) if scores else 0.0
-        pass_rate = (sufficient_count / total_audited) * 100
-
-        print(f"Total Chunks Verified : {total_audited}")
-        print(f"Average Coverage Score: {avg_score:.3f} / 1.000")
-        print(f"Pass Rate (Sufficient): {pass_rate:.1f}% ({sufficient_count}/{total_audited})")
-        print(f"Total Missed Concepts : {len(all_missing_concepts)}")
-        print(f"Total Missed Facts    : {len(all_missing_facts)}")
-
-        if all_missing_concepts:
-            print("\nSample Missed Concepts:")
-            for mc in all_missing_concepts[:5]:
-                print(f"  - {mc}")
-
-        if all_missing_facts:
-            print("\nSample Missed Facts/Metrics:")
-            for mf in all_missing_facts[:5]:
-                print(f"  - {mf}")
-        print("=" * 60 + "\n")
-
-    async def run(self):
-        items = self.prepare_verification_items()
-        pending = [
-            i for i in items 
-            if not self.verification_log.get(i["key"], False)
-        ]
-
-        total_pending = len(pending)
-        print(f"Total extractions found: {len(items)} | Pending verification: {total_pending}")
-        print(f"Targeting {len(self.servers)} servers with {self.concurrency} concurrent workers each.")
-
-        if not pending:
-            print("All available extractions are already verified!")
-            self.generate_summary_report()
-            return
-
-        queue = asyncio.Queue()
-        for item in pending:
-            await queue.put(item)
-
-        total_workers = len(self.servers) * self.concurrency
-        for _ in range(total_workers):
-            await queue.put(None)
-
-        lock = asyncio.Lock()
-        flush_counter = {"count": 0}
-        pbar = tqdm(total=total_pending, desc=f"Verifying [{self.domain}]")
-
-        tasks = []
-        http_clients = []
-        openai_clients = []
-
-        for server_url in self.servers:
-            http_client = httpx.AsyncClient(
-                limits=httpx.Limits(
-                    max_connections=self.concurrency + 20,
-                    max_keepalive_connections=self.concurrency
-                ),
-                timeout=httpx.Timeout(450.0, connect=10.0)
-            )
-            http_clients.append(http_client)
-
-            client = AsyncOpenAI(
-                base_url=server_url,
-                api_key="EMPTY",
-                http_client=http_client,
-                max_retries=0
-            )
-            openai_clients.append(client)
-
-        # Interleave worker creation round-robin so requests are uniformly distributed across all servers
-        for worker_idx in range(self.concurrency):
-            for client in openai_clients:
-                task = asyncio.create_task(
-                    self.worker_task(client, queue, lock, pbar, flush_counter)
-                )
-                tasks.append(task)
+        parsed_data.setdefault("missing_concepts", [])
+        parsed_data.setdefault("missing_facts", [])
+        parsed_data.setdefault("hallucinations", [])
 
         try:
-            await asyncio.gather(*tasks)
+            return VerificationResult.model_validate(parsed_data)
+        except Exception:
+            self.debug.record("schema_failure", key=key, raw_response=raw_text,
+                              parsed=parsed_data)
+            raise
+
+    async def verify_chunk(self, client: Any, item: Dict[str, Any],
+                           server_index: int) -> VerificationResult:
+        """One audit call. Retries are owned by the server pool."""
+        concepts_json_raw = await asyncio.to_thread(
+            item["concepts_file"].read_text, encoding="utf-8"
+        )
+        user_prompt = self.build_prompt(item, concepts_json_raw)
+
+        response = await client.chat.completions.create(
+            model=self.settings.model_name,
+            messages=[
+                {"role": "system", "content": VERIFICATION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0,
+            max_tokens=self.settings.max_tokens or 4096,
+            response_format={"type": "json_object"},
+        )
+        return self.parse_verification(response.choices[0].message.content, item["key"])
+
+    # ── streaming persistence ──────────────────────────────────────────────
+    async def persist_result(self, item: Dict[str, Any],
+                             result: VerificationResult) -> None:
+        """Write one chunk's audit result and advance the checkpoint."""
+        payload = result.model_dump_json(indent=2)
+        await asyncio.to_thread(atomic_write_text, item["result_file"], payload)
+        self.checkpoint.mark(item["key"], True)
+        self.debug.record("verified", key=item["key"], phase=self.phase,
+                          coverage_score=result.coverage_score,
+                          is_sufficient=result.is_sufficient,
+                          missing_concepts=len(result.missing_concepts),
+                          missing_facts=len(result.missing_facts))
+        if self.checkpoint.needs_flush():
+            await self.checkpoint.flush()
+
+    # ── reporting ──────────────────────────────────────────────────────────
+    def generate_summary_report(self) -> None:
+        """Print both runs and, for phase 2, the measured improvement."""
+        before = collect_metrics(self.staging_dir, label=PASS1_LABEL,
+                                 result_filename=PASS1_RESULT)
+        print("\n" + format_report(self.domain, before) + "\n")
+
+        if self.phase == 1:
+            summary_path = write_summary(self.base_wiki_dir, self.domain, before)
+            print(f"Saved Pass 1 verification summary to: {summary_path}")
+            print("Phase 2 (after Pass 2 refinement) will report the improvement.\n")
+            return
+
+        after = collect_metrics(self.staging_dir, label=PASS2_LABEL,
+                                result_filename=PASS2_RESULT)
+        print(format_report(self.domain, after) + "\n")
+
+        if before.total_chunks == 0 or after.total_chunks == 0:
+            print("WARNING: cannot compute improvement - one of the two "
+                  "verification runs has no results on disk.\n")
+            summary_path = write_summary(self.base_wiki_dir, self.domain, before,
+                                         after if after.total_chunks else None)
+            print(f"Saved verification summary to: {summary_path}\n")
+            return
+
+        improvement = build_improvement(before, after)
+        print(format_improvement(self.domain, improvement) + "\n")
+        summary_path = write_summary(self.base_wiki_dir, self.domain, before, after)
+        print(f"Saved both verification runs + improvement to: {summary_path}\n")
+
+    # ── orchestration ──────────────────────────────────────────────────────
+    async def run(self) -> None:
+        items = self.prepare_verification_items()
+        pending = [i for i in items if not self.checkpoint.is_done(i["key"])]
+
+        print(f"Verification phase {self.phase} for domain '{self.domain}'.")
+        print(f"Total extractions found: {len(items)} | Pending verification: {len(pending)}")
+        print(f"Spreading work across {len(self.settings.servers)} server(s) at "
+              f"{self.settings.concurrency_per_server} concurrent request(s) each "
+              f"(item i -> server i % N).")
+        print(f"Per-item attempts: {self.settings.attempts} | "
+              f"Stage budget: {self.settings.budget_minutes:g} min | "
+              f"Debug log: {self.debug.path}")
+
+        if not pending:
+            print("All available extractions are already verified for this phase!")
+            self.generate_summary_report()
+            return
+
+        pool = ServerPool(
+            self.settings.servers,
+            concurrency_per_server=self.settings.concurrency_per_server,
+            request_timeout=self.settings.profile.request_timeout,
+            connect_timeout=self.settings.profile.connect_timeout,
+            max_connections_slack=20,
+            label=self.stage,
+            failover=not getattr(self.args, "no_failover", False),
+        )
+
+        try:
+            async with pool:
+                result = await pool.map(
+                    pending,
+                    self.verify_chunk,
+                    attempts=self.settings.attempts,
+                    desc=f"Verifying phase {self.phase} [{self.domain}]",
+                    key_fn=lambda item: item["key"],
+                    budget=self.budget,
+                    debug=self.debug,
+                    attempt_timeout=self.settings.profile.attempt_timeout,
+                    on_result=self.persist_result,
+                )
         finally:
-            await save_log_async(self.verification_log_file, self.verification_log)
-            pbar.close()
+            await self.checkpoint.flush()
+            self.debug.close()
 
-            for http_client in http_clients:
-                await http_client.aclose()
+        print("Requests served per server:")
+        for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+            print(f"  {url:<40} {count}")
 
-        failed_items = [i["key"] for i in items if not self.verification_log.get(i["key"], False)]
+        for failure in result.failures:
+            self.verification_failures[failure["key"]] = failure["error"]
+
+        failed_items = [i["key"] for i in items if not self.checkpoint.is_done(i["key"])]
         if failed_items:
             self.generate_summary_report()
-            print(f"[ERROR] {len(failed_items)} chunk(s) remain unverified. Examples: {failed_items[:10]}")
+            print(f"[ERROR] {len(failed_items)} chunk(s) remain unverified. "
+                  f"Examples: {failed_items[:10]}")
+            first = next(iter(self.verification_failures.values()), "unknown error")
             raise RuntimeError(
-                f"Verification left {len(failed_items)} chunk(s) incomplete; rerun the stage to retry them."
+                f"Verification phase {self.phase} left {len(failed_items)} chunk(s) "
+                f"incomplete; rerun the stage with --resume to retry them. "
+                f"First error: {first}"
             )
 
         self.generate_summary_report()
@@ -486,16 +418,22 @@ EXTRACTED CONCEPTS JSON:
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Standalone Knowledge Graph Extraction Verifier & Auditor")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology, earth_science)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model_name", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
-
+    parser = build_parser(
+        stage="verification",
+        description="Knowledge Graph extraction verifier & auditor (runs per phase)",
+        include_max_tokens=True,
+        include_resume=True,
+    )
+    parser.add_argument("--phase", type=int, default=1, choices=(1, 2),
+                        help="1 = audit raw Pass 1 output (default); "
+                             "2 = re-audit after Pass 2 and report the improvement.")
     args = parser.parse_args()
+
     verifier = WikiVerifierPipeline(args)
-    asyncio.run(verifier.run())
+    try:
+        asyncio.run(verifier.run())
+    finally:
+        verifier.debug.close()
 
 if __name__ == "__main__":
     main()

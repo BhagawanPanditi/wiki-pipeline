@@ -7,6 +7,7 @@ Refinement Pass 2: Second-Pass Knowledge Graph Concept Extraction & Patching
 
 import os
 import re
+import functools
 import json
 import time
 import shutil
@@ -24,6 +25,12 @@ from tqdm.asyncio import tqdm
 # ── Server & Concurrency Configuration ───────────────────────────────────────
 
 from pipeline_config import load_global_config
+from pipeline_lib import load_cached_chunks
+from pipeline_lib import load_bool_log, save_log_async, save_log_sync
+from pipeline_lib import clean_json_string as _extract_json
+
+# Pass 2 historically also accepted an unfenced outermost JSON object.
+clean_json_string = functools.partial(_extract_json, allow_bare_object=True)
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Pydantic Data Schemas for Second Pass ─────────────────────────────────────
@@ -73,39 +80,6 @@ class Pass2ExtractionSchema(BaseModel):
     )
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
-
-def clean_json_string(raw_response: str) -> str:
-    """Extracts clean JSON string from raw model outputs."""
-    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    # Fallback: extract the outermost JSON object
-    match = re.search(r"(\{.*\})", raw_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return raw_response.strip()
-
-def _save_log_sync(log_file: Path, data: dict):
-    """Synchronous atomic write using a temporary file."""
-    tmp_file = log_file.with_suffix(".json.tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_file, log_file)
-
-async def save_log_async(log_file: Path, data: dict):
-    """Offloads atomic log write to a thread pool."""
-    await asyncio.to_thread(_save_log_sync, log_file, data)
-
-def load_cached_chunks(cache_dir: Path) -> Dict[str, Dict[str, Any]]:
-    """Loads tokenized sliding-window chunks from the cache file."""
-    chunks_cache_file = cache_dir / "chunks_cache.json"
-    if not chunks_cache_file.exists():
-        raise FileNotFoundError(f"Chunk cache file missing at {chunks_cache_file}.")
-
-    with open(chunks_cache_file, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
-
-    return {f"{c['doc_id']}::{c['chunk_id']}": c for c in chunks}
 
 # ── Second-Pass System Prompt ────────────────────────────────────────────────
 
@@ -183,17 +157,9 @@ class WikiSecondPassPipeline:
 
         self.servers = args.servers
         self.concurrency = args.concurrency_per_server
-        self.pass2_log = self._load_log()
-
-    def _load_log(self) -> Dict[str, bool]:
-        if self.pass2_log_file.exists():
-            try:
-                with open(self.pass2_log_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                print("Warning: Pass 2 log file corrupted. Re-initializing.")
-                return {}
-        return {}
+        self.pass2_log = load_bool_log(
+            self.pass2_log_file,
+            corrupt_message="Pass 2 log file corrupted. Re-initializing.")
 
     def cleanup_incomplete_states(self):
         """Purges pass2_log entries marked False and cleans up incomplete staging files upon resume."""
@@ -222,7 +188,7 @@ class WikiSecondPassPipeline:
                 del self.pass2_log[key]
                 purged += 1
 
-        _save_log_sync(self.pass2_log_file, self.pass2_log)
+        save_log_sync(self.pass2_log_file, self.pass2_log)
         print(f"Purged {purged} incomplete Pass 2 chunk entries.")
 
     def prepare_pass2_items(self) -> List[Dict[str, Any]]:

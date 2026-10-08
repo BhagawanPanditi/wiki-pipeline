@@ -5,7 +5,7 @@ import types
 import unittest
 from pathlib import Path
 
-from citation_utils import clean_brief_text, clean_chunk_citations
+from pipeline_lib.citation_utils import clean_brief_text, clean_chunk_citations
 
 # tqdm is only used for export progress; keep the formatter tests runnable in
 # minimal environments where optional CLI dependencies have not been installed.

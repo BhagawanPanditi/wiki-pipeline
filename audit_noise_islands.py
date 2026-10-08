@@ -25,7 +25,7 @@ from openai import AsyncOpenAI
 import httpx
 
 from pipeline_config import load_global_config
-from atomic_io import atomic_write_json
+from pipeline_lib import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 SYSTEM_PROMPT_ISLAND_AUDIT = """\
@@ -358,7 +358,6 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
     new_giant = len(new_components[0]) if new_components else 0
     print(f"Updated Graph: {len(new_components)} islands total. Giant component: {new_giant}/{len(surviving_concepts)} ({new_giant/len(surviving_concepts)*100:.2f}%)")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Audit, connect, and prune small islands using sibling document context")
     parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
@@ -371,7 +370,6 @@ def main():
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain
     asyncio.run(audit_and_connect_islands(domain_dir, args.domain, args))
-
 
 if __name__ == "__main__":
     main()

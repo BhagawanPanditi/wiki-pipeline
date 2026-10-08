@@ -26,11 +26,10 @@ from pathlib import Path
 from typing import List
 from tqdm import tqdm
 
-from citation_utils import (
+from pipeline_lib.citation_utils import (
     clean_brief_text,
     clean_chunk_citations as normalize_chunk_citations,
 )
-
 
 def sluggify(title: str) -> str:
     """Creates a clean, filesystem-safe filename for Markdown files."""
@@ -40,12 +39,10 @@ def sluggify(title: str) -> str:
     s = s.strip('_')
     return s[:120] if s else "unnamed_concept"
 
-
 def escape_yaml_string(s: str) -> str:
     """Escapes strings for YAML frontmatter."""
     escaped = s.replace('\\', '\\\\').replace('"', '\\"')
     return f'"{escaped}"'
-
 
 def extract_doc_id(sc: str) -> str:
     """Extract a document ID from a source chunk (canon_123::chunk_001 -> canon_123)."""
@@ -53,16 +50,13 @@ def extract_doc_id(sc: str) -> str:
         return ""
     return sc.split("::", 1)[0].strip()
 
-
 def clean_brief(brief: str) -> str:
     """Remove provenance IDs and flatten the brief to one line."""
     return clean_brief_text(brief)
 
-
 def clean_chunk_citations(text: str) -> str:
     """Convert chunk-level citations such as [canon_x::chunk_001] to [canon_x]."""
     return normalize_chunk_citations(text)
-
 
 def deduplicate_paragraph_citations(text: str) -> str:
     """Deduplicates repeated citations like [canon_1] [canon_1] [canon_1] -> [canon_1] at paragraph end."""
@@ -75,7 +69,6 @@ def deduplicate_paragraph_citations(text: str) -> str:
         dedup_cites_str = " ".join(f"[{d}]" for d in doc_ids)
         return f"{body_before} {dedup_cites_str}".strip() if body_before else dedup_cites_str
     return text
-
 
 def format_description_paragraphs(description: str, source_docs: List[str]) -> str:
     """
@@ -142,7 +135,6 @@ def format_description_paragraphs(description: str, source_docs: List[str]) -> s
         cited_paragraphs.append(paragraph)
 
     return "\n\n".join(cited_paragraphs) if cited_paragraphs else clean_desc.strip()
-
 
 def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
     refined_file = domain_dir / "global_concepts_refined.json"
@@ -280,7 +272,6 @@ def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
 
     print(f"\nSuccessfully exported {exported_count} Markdown wiki files to: {output_dir}/")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Export concepts to Obsidian Markdown format")
     parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
@@ -292,7 +283,6 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else (domain_dir / "concepts_md")
 
     export_wiki_markdown(domain_dir, output_dir)
-
 
 if __name__ == "__main__":
     main()

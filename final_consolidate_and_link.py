@@ -39,6 +39,7 @@ Step 3 (Graph Update, Bidirectional Remapping & Markdown Export):
 
 import os
 import re
+import functools
 import json
 import asyncio
 import argparse
@@ -51,7 +52,11 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 
 from pipeline_config import load_global_config
-from atomic_io import atomic_write_json
+from pipeline_lib import clean_json_string as _extract_json
+
+# This stage's payloads are sometimes JSON arrays rather than objects.
+clean_json_string = functools.partial(_extract_json, allow_array=True)
+from pipeline_lib import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -130,12 +135,6 @@ Return valid JSON with the exact key "actions":
   ]
 }}
 """
-
-def clean_json_string(raw: str) -> str:
-    match = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", raw, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return raw.strip()
 
 def deduplicate_sentences(text: str) -> str:
     """Splits text into sentences and deduplicates them preserving order."""

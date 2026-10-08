@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 # Resumable, retrying end-to-end runner for the Wiki knowledge graph pipeline.
 #
+# The pipeline is LLM-only: there is no embedding stage, no vector cache and no
+# GPU handoff, so a single run goes straight from extraction to Markdown export.
+#
 # Usage:
 #   ./run_entire_pipeline.sh [domain] [--resume | --fresh]
-#       [--skip-extraction] [--skip-embed]
-#       [--max-stage-attempts N | --retry-forever]
-#       [--wiki-base-dir PATH] [--data-dir PATH]
+#       [--skip-extraction] [--max-stage-attempts N | --retry-forever]
+#       [--wiki-base-dir PATH] [--data-dir PATH] [--servers URL [URL ...]]
+#       [--item-attempts N] [--stage-budget-minutes MIN]
 #
 # --resume skips completed steps recorded under <wiki-base-dir>/<domain>/.pipeline_state
-# and retries the failed/incomplete step. --fresh clears only those completion markers;
-# it does not delete generated wiki data or logs. --retry-forever is useful for a
-# monitored unattended run when transient service outages are expected, but will
-# also keep retrying permanent configuration/input errors.
+# and retries the failed/incomplete step. --fresh clears only those completion
+# markers; it does not delete generated wiki data or logs. --retry-forever waits
+# through outages indefinitely but will also loop on permanent errors, so the
+# bounded default is safer for unattended runs.
+#
+# Two levels of retry are independent:
+#   --max-stage-attempts  how many times the RUNNER restarts a whole stage
+#   --item-attempts       how many times a STAGE retries one LLM call
+# Each stage also enforces --stage-budget-minutes so backoff can never idle
+# forever; on expiry it fails fast and stays resumable.
 
 set -Eeuo pipefail
 
@@ -22,21 +31,31 @@ DOMAIN="biology"
 WIKI_BASE_DIR="${WIKI_BASE_DIR:-$DEFAULT_WIKI_BASE_DIR}"
 DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
 SKIP_EXTRACTION=false
-SKIP_EMBED=false
 RESUME=false
 FRESH=false
 RETRY_FOREVER=false
 MAX_STAGE_ATTEMPTS=3
+ITEM_ATTEMPTS=""
+STAGE_BUDGET_MINUTES=""
+SERVERS=()
 
 usage() {
     cat <<'EOF'
 Usage:
   ./run_entire_pipeline.sh [domain] [--resume | --fresh]
-      [--skip-extraction] [--skip-embed]
-      [--max-stage-attempts N | --retry-forever]
-      [--wiki-base-dir PATH] [--data-dir PATH]
+      [--skip-extraction] [--max-stage-attempts N | --retry-forever]
+      [--wiki-base-dir PATH] [--data-dir PATH] [--servers URL [URL ...]]
+      [--item-attempts N] [--stage-budget-minutes MIN]
+
+Stages: preflight, pass1-extraction, verification, pass2-refinement,
+        verification-pass2, document-consolidation, global-consolidation,
+        stub-resolution, thin-concept-folding, brief-generation,
+        entity-overlap, noise-audit, bidirectional-relations,
+        final-consolidation, final-analysis
 
 --resume skips completed steps and retries the failed/incomplete step.
+--servers overrides config.json for this run; work is spread evenly across them.
+--item-attempts / --stage-budget-minutes tune per-call retries and the stage clock.
 --retry-forever keeps waiting through failures; it can also loop on permanent errors.
 EOF
 }
@@ -50,10 +69,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-extraction)
             SKIP_EXTRACTION=true
-            shift
-            ;;
-        --skip-embed|--skip-embedding)
-            SKIP_EMBED=true
             shift
             ;;
         --resume)
@@ -76,6 +91,22 @@ while [[ $# -gt 0 ]]; do
             MAX_STAGE_ATTEMPTS="$2"
             shift 2
             ;;
+        --item-attempts)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --item-attempts" >&2
+                exit 2
+            fi
+            ITEM_ATTEMPTS="$2"
+            shift 2
+            ;;
+        --stage-budget-minutes)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --stage-budget-minutes" >&2
+                exit 2
+            fi
+            STAGE_BUDGET_MINUTES="$2"
+            shift 2
+            ;;
         --wiki-base-dir)
             if [[ $# -lt 2 ]]; then
                 echo "Missing value for --wiki-base-dir" >&2
@@ -91,6 +122,17 @@ while [[ $# -gt 0 ]]; do
             fi
             DATA_DIR="$2"
             shift 2
+            ;;
+        --servers)
+            shift
+            if [[ $# -eq 0 || "$1" == --* ]]; then
+                echo "--servers needs at least one URL" >&2
+                exit 2
+            fi
+            while [[ $# -gt 0 && "$1" != --* ]]; do
+                SERVERS+=("$1")
+                shift
+            done
             ;;
         -h|--help)
             usage
@@ -112,12 +154,36 @@ if [[ "$RETRY_FOREVER" != true && ! "$MAX_STAGE_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; t
     echo "--max-stage-attempts must be a positive integer." >&2
     exit 2
 fi
+if [[ -n "$ITEM_ATTEMPTS" && ! "$ITEM_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--item-attempts must be a positive integer." >&2
+    exit 2
+fi
+if [[ -n "$STAGE_BUDGET_MINUTES" ]] &&
+    ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$STAGE_BUDGET_MINUTES" 2>/dev/null; then
+    echo "--stage-budget-minutes must be a positive number." >&2
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOMAIN_DIR="${WIKI_BASE_DIR}/${DOMAIN}"
 STATE_DIR="${DOMAIN_DIR}/.pipeline_state"
 LOG_DIR="${DOMAIN_DIR}/pipeline_logs"
 mkdir -p "$STATE_DIR" "$LOG_DIR"
+
+# Arguments forwarded to every stage script so one command line controls the
+# whole run. Per-stage concurrency is deliberately NOT set here: each stage
+# resolves its own default from pipeline_lib.cli.STAGE_PROFILES, because the
+# sustainable fan-out depends on that stage's max_tokens.
+STAGE_ARGS=(--domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR")
+if [[ ${#SERVERS[@]} -gt 0 ]]; then
+    STAGE_ARGS+=(--servers "${SERVERS[@]}")
+fi
+if [[ -n "$ITEM_ATTEMPTS" ]]; then
+    STAGE_ARGS+=(--max_attempts "$ITEM_ATTEMPTS")
+fi
+if [[ -n "$STAGE_BUDGET_MINUTES" ]]; then
+    STAGE_ARGS+=(--stage_budget_minutes "$STAGE_BUDGET_MINUTES")
+fi
 
 if [[ "$SKIP_EXTRACTION" == true ]]; then
     if ! python3 - "$DOMAIN_DIR/consolidated" <<'PY'
@@ -179,10 +245,12 @@ except Exception:
 PY
 }
 
+# Ordered stage list. Rerunning any stage invalidates every marker after it.
 PIPELINE_STEPS=(
-    preflight pass1-extraction verification pass2-refinement document-consolidation
-    global-consolidation stub-resolution thin-concept-folding brief-generation entity-overlap
-    embedding-bridging noise-audit bidirectional-relations final-consolidation final-analysis
+    preflight pass1-extraction verification pass2-refinement verification-pass2
+    document-consolidation global-consolidation stub-resolution thin-concept-folding
+    brief-generation entity-overlap noise-audit bidirectional-relations
+    final-consolidation final-analysis
 )
 
 invalidate_downstream_markers() {
@@ -243,6 +311,43 @@ except Exception:
 PY
 }
 
+# A verification run is only complete when every chunk has a parseable result
+# file; the aggregate summary is written at the end of the second run.
+verification_complete() {
+    local result_name="$1"
+    python3 - "$DOMAIN_DIR/staging" "$DOMAIN_DIR/cache/chunks_cache.json" "$result_name" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+staging, chunks_path, result_name = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+try:
+    if not staging.is_dir() or not chunks_path.is_file():
+        raise SystemExit(1)
+    with chunks_path.open(encoding="utf-8") as f:
+        chunks = json.load(f)
+    if not isinstance(chunks, list) or not chunks:
+        raise SystemExit(1)
+    missing = 0
+    for chunk in chunks:
+        result = staging / str(chunk["doc_id"]) / str(chunk["chunk_id"]) / result_name
+        if not result.is_file():
+            missing += 1
+            continue
+        try:
+            with result.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            missing += 1
+            continue
+        if not isinstance(data, dict) or "coverage_score" not in data:
+            missing += 1
+    raise SystemExit(0 if missing == 0 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 step_outputs_ready() {
     local step="$1"
     local output_file
@@ -255,10 +360,14 @@ step_outputs_ready() {
                 -s "$DOMAIN_DIR/extraction_log.json" ]] && pass1_outputs_current
             ;;
         verification)
-            [[ -s "$DOMAIN_DIR/verification_log.json" ]]
+            [[ -s "$DOMAIN_DIR/verification_log.json" ]] && verification_complete "verification.json"
             ;;
         pass2-refinement)
             [[ -s "$DOMAIN_DIR/pass2_log.json" ]]
+            ;;
+        verification-pass2)
+            [[ -s "$DOMAIN_DIR/verification_pass2_log.json" && -s "$DOMAIN_DIR/verification_summary.json" ]] && \
+                verification_complete "verification_pass2.json"
             ;;
         document-consolidation)
             [[ -s "$DOMAIN_DIR/doc_consolidation_log.json" && -d "$DOMAIN_DIR/consolidated" ]] || return 1
@@ -278,9 +387,6 @@ step_outputs_ready() {
             ;;
         thin-concept-folding|brief-generation|entity-overlap)
             json_has_concepts "$DOMAIN_DIR/global_concepts_refined.json"
-            ;;
-        embedding-bridging)
-            [[ -s "$DOMAIN_DIR/concept_embeddings.npy" && -s "$DOMAIN_DIR/concept_embeddings.meta.json" ]] && json_has_concepts "$DOMAIN_DIR/global_concepts_refined.json"
             ;;
         noise-audit|bidirectional-relations)
             json_has_concepts "$DOMAIN_DIR/global_concepts_refined.json"
@@ -328,7 +434,9 @@ run_step() {
             printf '\n'
         } | tee -a "$step_log"
 
-        if "$@" 2>&1 | tee -a "$step_log"; then
+        # Unbuffered so a long stage streams into the log instead of appearing
+        # to hang; stderr is merged so failures are captured in order.
+        if PYTHONUNBUFFERED=1 "$@" 2>&1 | tee -a "$step_log"; then
             if [[ "$step" == "preflight" ]] || step_outputs_ready "$step"; then
                 printf 'completed_at=%s\nattempts=%s\n' "$(date -Is)" "$attempt" > "${marker}.tmp"
                 mv -f -- "${marker}.tmp" "$marker"
@@ -352,7 +460,7 @@ run_step() {
             return "$rc"
         fi
 
-        # A health probe on retries helps distinguish service outages from a
+        # A health probe on retries distinguishes a service outage from a
         # deterministic stage failure. The stage still owns its own validation.
         if [[ "$step" != "preflight" ]]; then
             echo ">>> Checking configured LLM servers before retry..." | tee -a "$step_log"
@@ -378,10 +486,12 @@ cat <<EOF
  Wiki base:        ${WIKI_BASE_DIR}
  Data directory:   ${DATA_DIR}
  Skip extraction:  ${SKIP_EXTRACTION}
- Skip embeddings:  ${SKIP_EMBED}
  Resume:           ${RESUME}
  Retry forever:    ${RETRY_FOREVER}
  Max stage tries:  ${MAX_STAGE_ATTEMPTS}
+ Item attempts:    ${ITEM_ATTEMPTS:-stage default}
+ Stage budget:     ${STAGE_BUDGET_MINUTES:-stage default} minutes
+ Server override:  ${SERVERS[*]:-from config.json}
  Checkpoints:      ${STATE_DIR}
  Logs:             ${LOG_DIR}
 ========================================================================
@@ -391,49 +501,46 @@ run_step preflight python3 "$SCRIPT_DIR/check_servers.py"
 
 if [[ "$SKIP_EXTRACTION" == false ]]; then
     run_step pass1-extraction python3 "$SCRIPT_DIR/concept_extraction_pass_1.py" \
-        --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR" --data_dir "$DATA_DIR" --resume
+        "${STAGE_ARGS[@]}" --data_dir "$DATA_DIR" --resume
+    # Verification runs twice: once over raw Pass 1 output, and again after
+    # Pass 2 has merged its repairs, so the improvement is measurable.
     run_step verification python3 "$SCRIPT_DIR/verify_concept_extraction.py" \
-        --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+        "${STAGE_ARGS[@]}" --phase 1 --resume
     run_step pass2-refinement python3 "$SCRIPT_DIR/concept_refinement_pass_2.py" \
-        --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR" --resume
+        "${STAGE_ARGS[@]}" --resume
+    run_step verification-pass2 python3 "$SCRIPT_DIR/verify_concept_extraction.py" \
+        "${STAGE_ARGS[@]}" --phase 2 --resume
     run_step document-consolidation python3 "$SCRIPT_DIR/doc_concept_consolidation.py" \
-        --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+        "${STAGE_ARGS[@]}"
 else
-    echo ">>> Skipping extraction, verification, Pass 2, and document consolidation."
+    echo ">>> Skipping extraction, both verification passes, Pass 2, and document consolidation."
 fi
 
 run_step global-consolidation python3 "$SCRIPT_DIR/global_concept_consolidation.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+    "${STAGE_ARGS[@]}"
 run_step stub-resolution python3 "$SCRIPT_DIR/stub_resolution.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+    "${STAGE_ARGS[@]}"
 run_step thin-concept-folding python3 "$SCRIPT_DIR/thin_concept_handler.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+    "${STAGE_ARGS[@]}"
 run_step brief-generation python3 "$SCRIPT_DIR/add_concept_briefs.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+    "${STAGE_ARGS[@]}"
 run_step entity-overlap python3 "$SCRIPT_DIR/link_entity_overlap.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR" --min_shared_entities 2
-
-if [[ "$SKIP_EMBED" == false ]]; then
-    run_step embedding-bridging python3 "$SCRIPT_DIR/embed_and_bridge_islands.py" \
-        --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
-else
-    echo ">>> Skipping embedding/island-bridging stage (--skip-embed)."
-fi
-
+    "${STAGE_ARGS[@]}" --min_shared_entities 2
 run_step noise-audit python3 "$SCRIPT_DIR/audit_noise_islands.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR" --max_island_size 5
+    "${STAGE_ARGS[@]}" --max_island_size 5
 run_step bidirectional-relations python3 "$SCRIPT_DIR/synthesize_bidirectional_relations.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+    "${STAGE_ARGS[@]}"
 run_step final-consolidation python3 "$SCRIPT_DIR/final_consolidate_and_link.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+    "${STAGE_ARGS[@]}"
 run_step final-analysis python3 "$SCRIPT_DIR/analyze_islands.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+    "${STAGE_ARGS[@]}"
 
 cat <<EOF
 ========================================================================
  PIPELINE RUN COMPLETE FOR DOMAIN: ${DOMAIN}
  Output Markdown files: ${DOMAIN_DIR}/concepts_md/
  Output Concept graph:  ${DOMAIN_DIR}/global_concepts_refined.json
+ Verification scores:   ${DOMAIN_DIR}/verification_summary.json
  Logs/checkpoints:      ${LOG_DIR}/ and ${STATE_DIR}/
 ========================================================================
 EOF

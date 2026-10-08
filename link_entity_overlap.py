@@ -18,12 +18,10 @@ from typing import Dict, List, Set, Any, Tuple
 import networkx as nx
 from tqdm import tqdm
 
-from atomic_io import atomic_write_json
-
+from pipeline_lib import atomic_write_json
 
 def normalize_entity(ent: str) -> str:
     return ent.strip().lower()
-
 
 def enrich_graph_via_entity_overlap(
     domain_dir: Path,
@@ -165,7 +163,6 @@ def enrich_graph_via_entity_overlap(
 
     print("Successfully enriched graph with entity overlap links!")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Enrich KG connections using entity overlap")
     parser.add_argument("--domain", type=str, required=True, help="Domain name (e.g. biology)")
@@ -182,7 +179,6 @@ def main():
         max_new_links_per_node=args.max_links_per_node,
         dry_run=args.dry_run
     )
-
 
 if __name__ == "__main__":
     main()

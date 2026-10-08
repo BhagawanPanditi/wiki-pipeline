@@ -22,7 +22,8 @@ from openai import AsyncOpenAI
 
 # ── Configuration ────────────────────────────────────────────────────────────
 from pipeline_config import load_global_config
-from atomic_io import atomic_write_json
+from pipeline_lib import clean_json_string
+from pipeline_lib import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 class StubRelation(BaseModel):
@@ -73,11 +74,6 @@ Return valid JSON:
   "outbound_relations": [{"target_concept": "Target Title", "relation": "1 sentence relation"}]
 }
 """
-
-def clean_json_string(raw: str) -> str:
-    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
-    if match: return match.group(1).strip()
-    return raw.strip()
 
 class StubResolver:
     def __init__(self, args):

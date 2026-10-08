@@ -38,7 +38,8 @@ except Exception:
 
 # ── Server Configuration ─────────────────────────────────────────────────────
 from pipeline_config import load_global_config
-from atomic_io import atomic_write_json
+from pipeline_lib import clean_json_string
+from pipeline_lib import atomic_write_json
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
@@ -139,11 +140,6 @@ class UnionFind:
             self.parent[root2] = root1
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
-def clean_json_string(raw_response: str) -> str:
-    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return raw_response.strip()
 
 def sanitize_filename(name: str) -> str:
     keepchars = (' ', '.', '_', '-')

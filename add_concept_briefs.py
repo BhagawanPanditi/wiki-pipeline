@@ -20,11 +20,12 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
-from citation_utils import clean_brief_text
-from atomic_io import atomic_write_json
+from pipeline_lib.citation_utils import clean_brief_text
+from pipeline_lib import atomic_write_json
 
 # ── Server Configuration ─────────────────────────────────────────────────────
 from pipeline_config import load_global_config
+from pipeline_lib import clean_json_string
 DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
 
 # ── Data Schema ──────────────────────────────────────────────────────────────
@@ -51,10 +52,6 @@ Return valid JSON:
 """
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
-def clean_json_string(raw: str) -> str:
-    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
-    if match: return match.group(1).strip()
-    return raw.strip()
 
 def sanitize_filename(name: str) -> str:
     keepchars = (' ', '.', '_', '-')

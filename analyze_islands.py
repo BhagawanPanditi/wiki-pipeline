@@ -11,7 +11,7 @@ from pathlib import Path
 from collections import Counter
 import networkx as nx
 
-from atomic_io import atomic_write_json
+from pipeline_lib import atomic_write_json
 
 def analyze_kg_islands(domain_dir: Path):
     refined_file = domain_dir / "global_concepts_refined.json"
