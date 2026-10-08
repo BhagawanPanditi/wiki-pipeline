@@ -32,10 +32,9 @@ Section 7.3 explains both paths.
 12. [Resuming, retries and time limits](#12-resuming-retries-and-time-limits)
 13. [Concurrency](#13-concurrency)
 14. [Verification and the improvement report](#14-verification-and-the-improvement-report)
-15. [Tests](#15-tests)
-16. [Code layout](#16-code-layout)
-17. [Upgrading from the earlier names](#17-upgrading-from-the-earlier-names)
-18. [Known limitations](#18-known-limitations)
+15. [Code layout](#15-code-layout)
+16. [Upgrading from the earlier names](#16-upgrading-from-the-earlier-names)
+17. [Known limitations](#17-known-limitations)
 
 ---
 
@@ -706,24 +705,7 @@ Both runs are kept in `verification_summary.json` in the run directory.
 
 ---
 
-## 15. Tests
-
-No GPU and no model server are needed. The tests start fake vLLM servers and run the
-real stage scripts against them.
-
-```bash
-python3 -m unittest discover -s tests -t . -v
-```
-
-The suite runs over 120 tests and takes about two minutes. It covers retry classification
-and the stage budget, the server pool and its even spread, every stage end to end, the
-resume paths (including markers written under the earlier step names), the log and
-decision records, the corpus formats, the `config.json` rules, and the runner's behaviour
-with a fake stage set.
-
----
-
-## 16. Code layout
+## 15. Code layout
 
 ```
 run_pipeline.sh                  the runner: every stage, in order, resumable
@@ -764,12 +746,11 @@ utils/                           shared code, one module per concern
   reporting.py      verification report and improvement table
   text.py           shared text helpers
   atomic_io.py      atomic writes
-tests/                           the test suite and its fake servers
 ```
 
 ---
 
-## 17. Upgrading from the earlier names
+## 16. Upgrading from the earlier names
 
 The stages, files and folders were renamed so that each name says what the file does.
 Data files were not renamed. Existing runs still resume.
@@ -834,19 +815,18 @@ The sub-stages `final-macro-scan` and `final-deep-verify` keep their names.
 
 ---
 
-## 18. Known limitations
+## 17. Known limitations
 
 - **Restart granularity.** Six LLM stages (write-briefs, consolidate-global, resolve-stubs,
   fold-thin-concepts, audit-islands and add-reverse-links) save their results only when
   they finish. If one of them is interrupted, it starts again from its input. The runner
   still skips every stage that finished. Per-item checkpoints for these six would cut the
   lost work, and they are not built yet.
-- **Tested with fake servers only.** The test suite runs the real stage scripts against
-  fake vLLM servers. The first run against your real servers is the first end-to-end test
+- **Not yet run against live model servers.** The stages have been exercised against fake
+  vLLM servers only. The first run against your real servers is the first end-to-end test
   of this version, so watch the first run closely.
 - **Long functions.** Twenty-four functions are longer than 80 lines. The longest is
-  `audit_and_connect_islands` in `audit_islands.py`, at about 330 lines. They are tested,
-  but harder to read than they should be. Splitting them is planned for after the first
+  `audit_and_connect_islands` in `audit_islands.py`, at about 330 lines. They are harder to read than they should be. Splitting them is planned for after the first
   real run.
 - **Preemption.** A preempted Slurm job is not restarted automatically. Submit the runner
   again, and it resumes.
