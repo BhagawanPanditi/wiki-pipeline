@@ -36,6 +36,7 @@ from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
+from pipeline_lib.llm_log import LLMCallLog
 from pipeline_lib.llm_pool import ServerPool
 from pipeline_lib.reporting import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
                                     build_improvement, collect_metrics,
@@ -380,6 +381,9 @@ EXTRACTED CONCEPTS JSON:
             connect_timeout=self.settings.profile.connect_timeout,
             max_connections_slack=20,
             label=self.stage,
+            # Each phase gets its own log file, matching its own debug log and
+            # checkpoint: logs/verification.jsonl vs logs/verification-pass2.jsonl.
+            llm_log=LLMCallLog.from_args(self.args, self.stage),
             failover=not getattr(self.args, "no_failover", False),
         )
 

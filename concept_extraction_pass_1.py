@@ -20,6 +20,7 @@ from pipeline_lib.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import PermanentFailure, StageBudget
 from pipeline_lib.json_repair import clean_json_string
+from pipeline_lib.llm_log import LLMCallLog
 from pipeline_lib.llm_pool import ServerPool
 
 STAGE = "pass1-extraction"
@@ -431,6 +432,7 @@ class WikiExtractorPipeline:
             connect_timeout=settings.profile.connect_timeout,
             max_connections_slack=20,
             label=STAGE,
+            llm_log=LLMCallLog.from_args(self.args, STAGE),
             failover=not getattr(self.args, "no_failover", False),
         )
         try:

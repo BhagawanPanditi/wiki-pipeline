@@ -25,6 +25,7 @@ from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string as _extract_json
+from pipeline_lib.llm_log import LLMCallLog
 from pipeline_lib.llm_pool import ServerPool
 
 # Pass 2 historically also accepted an unfenced outermost JSON object.
@@ -476,6 +477,7 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
             connect_timeout=settings.profile.connect_timeout,
             max_connections_slack=20,
             label=STAGE,
+            llm_log=LLMCallLog.from_args(self.args, STAGE),
             failover=not getattr(self.args, "no_failover", False),
         )
         try:

@@ -21,6 +21,7 @@ from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
+from pipeline_lib.llm_log import LLMCallLog
 from pipeline_lib.llm_pool import ServerPool
 from pipeline_lib.citation_utils import clean_brief_text
 
@@ -149,6 +150,7 @@ class ConceptBriefPipeline:
                 request_timeout=settings.profile.request_timeout,
                 connect_timeout=settings.profile.connect_timeout,
                 label=STAGE,
+                llm_log=LLMCallLog.from_args(self.args, STAGE),
                 failover=not getattr(self.args, "no_failover", False),
             )
             try:

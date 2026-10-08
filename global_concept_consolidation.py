@@ -48,6 +48,7 @@ from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
+from pipeline_lib.llm_log import LLMCallLog
 from pipeline_lib.llm_pool import ServerPool
 
 STAGE = "global-consolidation"
@@ -392,6 +393,7 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
         connect_timeout=settings.profile.connect_timeout,
         max_connections_slack=20,
         label=STAGE,
+        llm_log=LLMCallLog.from_args(args, STAGE),
         failover=not getattr(args, "no_failover", False),
     )
     try:

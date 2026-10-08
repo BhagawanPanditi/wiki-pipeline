@@ -20,6 +20,7 @@ from pipeline_lib.atomic_io import atomic_write_json
 from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget
+from pipeline_lib.llm_log import LLMCallLog
 from pipeline_lib.llm_pool import ServerPool
 
 STAGE = "reverse-relations"
@@ -177,6 +178,7 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
             request_timeout=settings.profile.request_timeout,
             connect_timeout=settings.profile.connect_timeout,
             label=STAGE,
+            llm_log=LLMCallLog.from_args(args, STAGE),
             failover=not getattr(args, "no_failover", False),
         )
         try:

@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 from tqdm import tqdm
 
 from .debug_log import DebugLogger
+from .llm_log import CURRENT_CALL, LLMCallLog, wrap_client
 from .errors import (AllServersUnhealthy, PermanentFailure, StageBudget,
                      TransientFailureExhausted, describe_error)
 from .retry import retry_async
@@ -59,7 +60,27 @@ class PoolResult:
 
 
 class ServerPool:
-    """Round-robin vLLM client pool with per-server concurrency caps."""
+    """Round-robin vLLM client pool with per-server concurrency caps.
+
+    Work is partitioned deterministically (item ``i`` goes to server ``i % N``)
+    and each server has its own queue and concurrency cap, so a slow tail cannot
+    pile onto whichever worker happens to be free.
+
+    Args:
+        servers: vLLM OpenAI-compatible base URLs.
+        concurrency_per_server: In-flight requests allowed per server.
+        request_timeout: Per-request read timeout in seconds.
+        connect_timeout: Optional separate connection timeout in seconds.
+        max_connections_slack: Extra httpx connections above the concurrency cap,
+            so a retry can start before the previous socket is released.
+        label: Stage name, used in log messages and retry labels.
+        failover: Whether to move work off a server that stops responding.
+        unhealthy_threshold: Consecutive failures before a server is marked
+            unhealthy.
+        llm_log: Optional :class:`~pipeline_lib.llm_log.LLMCallLog`. When given,
+            every request issued through this pool is appended to it, and the
+            log is closed when the pool closes.
+    """
 
     def __init__(
         self,
@@ -72,6 +93,7 @@ class ServerPool:
         label: str = "stage",
         failover: bool = True,
         unhealthy_threshold: int = 3,
+        llm_log: Optional[LLMCallLog] = None,
     ):
         cleaned = [s for s in servers if isinstance(s, str) and s.strip()]
         if not cleaned:
@@ -87,6 +109,10 @@ class ServerPool:
         self.label = label
         self.failover = failover
         self.unhealthy_threshold = max(1, unhealthy_threshold)
+        # When supplied, every request these clients issue is appended to this
+        # log. Wrapping happens in _build_clients, below the stage, so a stage
+        # cannot forget to record a call.
+        self.llm_log = llm_log
 
         self._http: List[httpx.AsyncClient] = []
         self._clients: List[AsyncOpenAI] = []
@@ -104,8 +130,9 @@ class ServerPool:
         for url in self.servers:
             http_client = httpx.AsyncClient(limits=limits, timeout=timeout)
             self._http.append(http_client)
-            self._clients.append(AsyncOpenAI(base_url=url, api_key="EMPTY",
-                                             http_client=http_client, max_retries=0))
+            client = AsyncOpenAI(base_url=url, api_key="EMPTY",
+                                 http_client=http_client, max_retries=0)
+            self._clients.append(wrap_client(client, url, self.llm_log))
         self._consecutive_failures = [0] * len(self.servers)
         self._healthy = [True] * len(self.servers)
         self._served = [0] * len(self.servers)
@@ -125,6 +152,11 @@ class ServerPool:
                 pass
         self._http.clear()
         self._clients.clear()
+        if self.llm_log is not None:
+            # Flushing here guarantees the trail survives a stage that dies
+            # after the pool closes. Re-opening is cheap if a later pool in the
+            # same process reuses the log.
+            self.llm_log.close()
 
     @property
     def healthy_servers(self) -> List[str]:
@@ -197,9 +229,29 @@ class ServerPool:
             client = self._clients[server_index]
             url = self.servers[server_index]
 
+            attempts_made = {"n": 0}
+
             async def call() -> Any:
                 self._served[server_index] += 1
-                return await handler(client, item, server_index)
+                attempts_made["n"] += 1
+                # Publish the item identity so the wrapped client can attribute
+                # this request without the handler threading it through.
+                token = CURRENT_CALL.set({
+                    "item": key, "index": index, "server": url,
+                    "server_index": server_index, "attempt": attempts_made["n"],
+                })
+                try:
+                    return await handler(client, item, server_index)
+                except Exception as exc:
+                    # The transport may have succeeded while the stage rejected
+                    # the body (bad JSON, schema mismatch, truncation). Record
+                    # that separately, or --llm_log errors would stay silent
+                    # about the most common failure in this pipeline.
+                    if self.llm_log is not None:
+                        self.llm_log.rejection(server=url, error=exc)
+                    raise
+                finally:
+                    CURRENT_CALL.reset(token)
 
             try:
                 value = await retry_async(

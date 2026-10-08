@@ -59,6 +59,7 @@ from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget, classify_error
 from pipeline_lib.retry import backoff_delay
 from pipeline_lib.json_repair import clean_json_string as _extract_json
+from pipeline_lib.llm_log import CURRENT_CALL, LLMCallLog, wrap_client
 from pipeline_lib.prompts import domain_scope
 
 # This stage's payloads are sometimes JSON arrays rather than objects.
@@ -191,6 +192,9 @@ async def run_macro_scan(
                 batches.append((f"Letter '{letter}' (Part {part_idx})", sub_part))
 
     settings = resolve_settings(args, MACRO_STAGE)
+    # This stage builds its own clients (its two passes need different request
+    # timeouts), so it wires the call log by hand rather than via ServerPool.
+    llm_log = LLMCallLog.from_args(args, MACRO_STAGE)
     budget = StageBudget(settings.budget_minutes)
     debug = DebugLogger(Path(args.wiki_base_dir) / args.domain / "final_macro_scan_debug.jsonl",
                         label=MACRO_STAGE)
@@ -234,6 +238,12 @@ async def run_macro_scan(
                 break
 
             letter, batch_concepts = item
+            # Publish item identity so the wrapped client can attribute each
+            # request. ServerPool normally does this; this stage drives its own
+            # queues. Each worker is a separate task, so the value cannot leak.
+            call_ctx = {"item": f"letter:{letter}", "server": server_url,
+                        "size": len(batch_concepts)}
+            CURRENT_CALL.set(call_ctx)
 
             # 1-indexed title list with IDs
             id_to_title = {idx + 1: c["title"] for idx, c in enumerate(batch_concepts)}
@@ -252,6 +262,7 @@ async def run_macro_scan(
             completed = False
             budget.check(MACRO_STAGE)
             for attempt in range(settings.attempts):
+                CURRENT_CALL.set({**call_ctx, "attempt": attempt + 1})
                 try:
                     resp = await client.chat.completions.create(
                         model=settings.model_name,
@@ -334,6 +345,11 @@ async def run_macro_scan(
                     completed = True
                     break
                 except Exception as e:
+                    # The transport may have succeeded while this stage rejected
+                    # the body; record that so --llm_log errors is not silent
+                    # about the most common failure mode here.
+                    llm_log.rejection(server=server_url, error=e,
+                                      classification=classify_error(e))
                     debug.error(f"{server_url}", e, attempt=attempt + 1,
                                 attempts=settings.attempts,
                                 classification=classify_error(e), server=server_url)
@@ -361,13 +377,16 @@ async def run_macro_scan(
     for server_index, url in enumerate(settings.servers):
         hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=300.0)
         http_clients.append(hc)
-        client = AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0)
+        client = wrap_client(
+            AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0),
+            url, llm_log)
         for _ in range(effective_concurrency):
             tasks.append(asyncio.create_task(worker(client, url, queues[server_index])))
 
     await asyncio.gather(*tasks)
     pbar.close()
     macro_log_file.close()
+    llm_log.close()
     debug.close()
     for hc in http_clients:
         await hc.aclose()
@@ -430,6 +449,7 @@ async def run_deep_verification(
                 valid_clusters.append((cl.category, existing_in_graph))
 
     settings = resolve_settings(args, DEEP_STAGE)
+    llm_log = LLMCallLog.from_args(args, DEEP_STAGE)
     budget = StageBudget(settings.budget_minutes)
     debug = DebugLogger(Path(args.wiki_base_dir) / args.domain / "final_deep_verify_debug.jsonl",
                         label=DEEP_STAGE)
@@ -473,6 +493,9 @@ async def run_deep_verification(
                 break
 
             cat, concept_group = item
+            call_ctx = {"item": f"category:{cat}", "server": server_url,
+                        "size": len(concept_group)}
+            CURRENT_CALL.set(call_ctx)
             candidates_payload = [
                 {
                     "title": c["title"],
@@ -493,6 +516,7 @@ async def run_deep_verification(
             completed = False
             budget.check(DEEP_STAGE)
             for attempt in range(settings.attempts):
+                CURRENT_CALL.set({**call_ctx, "attempt": attempt + 1})
                 try:
                     resp = await client.chat.completions.create(
                         model=settings.model_name,
@@ -555,6 +579,11 @@ async def run_deep_verification(
                     if attempt < settings.attempts - 1:
                         await asyncio.sleep(budget.cap_sleep(backoff_delay(classify_error(e), attempt + 1)))
                 except Exception as e:
+                    # The transport may have succeeded while this stage rejected
+                    # the body; record that so --llm_log errors is not silent
+                    # about the most common failure mode here.
+                    llm_log.rejection(server=server_url, error=e,
+                                      classification=classify_error(e))
                     debug.error(f"{server_url}", e, attempt=attempt + 1,
                                 attempts=settings.attempts,
                                 classification=classify_error(e), server=server_url)
@@ -580,13 +609,16 @@ async def run_deep_verification(
     for server_index, url in enumerate(settings.servers):
         hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=60.0)
         http_clients.append(hc)
-        client = AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0)
+        client = wrap_client(
+            AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0),
+            url, llm_log)
         for _ in range(effective_concurrency):
             tasks.append(asyncio.create_task(worker(client, url, queues[server_index])))
 
     await asyncio.gather(*tasks)
     pbar.close()
     log_f.close()
+    llm_log.close()
     debug.close()
     for hc in http_clients:
         await hc.aclose()
