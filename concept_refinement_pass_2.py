@@ -5,33 +5,29 @@ Refinement Pass 2: Second-Pass Knowledge Graph Concept Extraction & Patching
 - Supports adding/removing outbound relations, adding aliases, and adding brand new concepts.
 """
 
+import asyncio
+import functools
+import hashlib
+import json
 import os
 import re
-import functools
-import json
-import time
 import shutil
-import hashlib
-import asyncio
-import argparse
+import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
 from pydantic import BaseModel, Field, ValidationError
-from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
-# ── Server & Concurrency Configuration ───────────────────────────────────────
-
-from pipeline_config import load_global_config
-from pipeline_lib import load_cached_chunks
-from pipeline_lib import load_bool_log, save_log_async, save_log_sync
-from pipeline_lib import clean_json_string as _extract_json
+from pipeline_lib import (DebugLogger, ServerPool, StageBudget, build_parser,
+                          clean_json_string as _extract_json, load_bool_log,
+                          load_cached_chunks, resolve_settings, save_log_async,
+                          save_log_sync)
 
 # Pass 2 historically also accepted an unfenced outermost JSON object.
 clean_json_string = functools.partial(_extract_json, allow_bare_object=True)
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+
+STAGE = "pass2-refinement"
 
 # ── Pydantic Data Schemas for Second Pass ─────────────────────────────────────
 
@@ -155,8 +151,6 @@ class WikiSecondPassPipeline:
         if not self.staging_dir.exists():
             raise FileNotFoundError(f"Staging directory missing at {self.staging_dir}. Run Pass 1 extraction first.")
 
-        self.servers = args.servers
-        self.concurrency = args.concurrency_per_server
         self.pass2_log = load_bool_log(
             self.pass2_log_file,
             corrupt_message="Pass 2 log file corrupted. Re-initializing.")
@@ -254,10 +248,30 @@ class WikiSecondPassPipeline:
         print(f"Loaded {len(items)} chunks ready for Second Pass refinement.")
         return items
 
-    async def extract_pass2_refinement(
-        self, clients: List[AsyncOpenAI], item: Dict[str, Any], worker_id: int
-    ) -> Tuple[Optional[Pass2ExtractionSchema], List[Dict[str, Any]]]:
-        """Queries LLM for second-pass deltas and missing facts."""
+    def _record_attempt(self, key: str, server, finish_reason, raw_text,
+                        error_type: str, error_message: str) -> None:
+        """Keep every attempt's full, untruncated evidence for pass2_debug.json."""
+        logs = self.attempt_errors.setdefault(key, [])
+        logs.append({
+            "attempt": len(logs) + 1,
+            "server": str(server),
+            "finish_reason": finish_reason,
+            "error_type": error_type,
+            "error_message": error_message,
+            "raw_response": raw_text
+        })
+
+    async def extract_pass2_refinement(self, client, item: Dict[str, Any],
+                                       server_index: int) -> Pass2ExtractionSchema:
+        """Queries the LLM for second-pass deltas and missing facts.
+
+        Raises on any unusable response so ServerPool can classify it and apply
+        the retry ladder. Unlike Pass 1, token-limit truncation is raised as a
+        plain ValueError here, so it stays retryable on another server - that is
+        the behaviour this stage has always had. Manual client rotation per
+        attempt is gone because the pool re-dispatches to a healthy server.
+        """
+        key = item["key"]
         audit_str = ""
         if item["audit_feedback"]:
             audit_str = f"""
@@ -281,56 +295,79 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
 {json.dumps(item['pass1_concepts'], indent=2)}
 {audit_str}
 """
-        max_attempts = 3
-        error_logs = []
-        num_clients = len(clients)
+        raw_text = None
+        finish_reason = None
+        try:
+            response = await client.chat.completions.create(
+                model=self.settings.model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_PASS2},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=self.settings.max_tokens,
+                response_format={"type": "json_object"}
+            )
 
-        for attempt in range(max_attempts):
-            raw_text = None
-            finish_reason = None
-            # Automatically failover to a different server on every retry attempt
-            active_client = clients[(worker_id + attempt) % num_clients]
-            try:
-                response = await active_client.chat.completions.create(
-                    model=self.args.model_name,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT_PASS2},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.1,
-                    max_tokens=self.args.max_tokens,
-                    response_format={"type": "json_object"}
-                )
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            raw_text = choice.message.content
 
-                choice = response.choices[0]
-                finish_reason = choice.finish_reason
-                raw_text = choice.message.content
+            if finish_reason == "length":
+                raise ValueError(f"Response truncated: Hit max_tokens ({self.settings.max_tokens}).")
 
-                if finish_reason == "length":
-                    raise ValueError(f"Response truncated: Hit max_tokens ({self.args.max_tokens}).")
+            cleaned_json = clean_json_string(raw_text)
+            return Pass2ExtractionSchema.model_validate_json(cleaned_json)
 
-                cleaned_json = clean_json_string(raw_text)
-                parsed = Pass2ExtractionSchema.model_validate_json(cleaned_json)
-                return parsed, error_logs
+        except Exception as exc:
+            self._record_attempt(key, client.base_url, finish_reason, raw_text,
+                                 type(exc).__name__, str(exc))
+            raise
 
-            except Exception as exc:
-                error_info = {
-                    "attempt": attempt + 1,
-                    "server": str(active_client.base_url),
-                    "finish_reason": finish_reason,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                    "raw_response": raw_text
-                }
-                error_logs.append(error_info)
+    async def persist_refinement(self, item: Dict[str, Any],
+                                 delta: Pass2ExtractionSchema) -> None:
+        """SUCCESS: stream the delta, back up Pass 1, then merge into concepts.json."""
+        key = item["key"]
+        chunk_dir = item["chunk_dir"]
 
-                if attempt == max_attempts - 1:
-                    return None, error_logs
-                # Cap exponential backoff so workers do not freeze
-                sleep_seconds = min(2.0 ** attempt, 8.0)
-                await asyncio.sleep(sleep_seconds)
+        # 1. Save Pass 2 raw delta refinement JSON
+        pass2_file = chunk_dir / "pass2_refinement.json"
+        await asyncio.to_thread(
+            pass2_file.write_text, delta.model_dump_json(indent=2), encoding="utf-8"
+        )
 
-        return None, error_logs
+        # 2. Backup Pass 1 concepts.json if backup does not exist
+        pass1_backup = chunk_dir / "concepts_pass1_backup.json"
+        concepts_file = chunk_dir / "concepts.json"
+        if not pass1_backup.exists() and concepts_file.exists():
+            await asyncio.to_thread(shutil.copy, concepts_file, pass1_backup)
+
+        # 3. Apply updates & merged output to concepts.json
+        merged_data = self.apply_merges(item["pass1_concepts"], delta)
+        merged_payload = json.dumps(merged_data, indent=2)
+        await asyncio.to_thread(concepts_file.write_text, merged_payload, encoding="utf-8")
+
+        self.pass2_log[key] = True
+        self.flush_count += 1
+        if self.flush_count >= 50:
+            await save_log_async(self.pass2_log_file, self.pass2_log.copy())
+            self.flush_count = 0
+
+    async def write_failure_debug(self, item: Dict[str, Any],
+                                  failure: Dict[str, Any]) -> None:
+        """FAILURE: save the Pass 2 debug log with every attempt, untruncated."""
+        key = item["key"]
+        debug_data = {
+            "key": key,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "attempts": self.attempt_errors.get(key, []),
+            "final_error": failure.get("error"),
+            "final_classification": failure.get("classification"),
+            "last_server": failure.get("server"),
+        }
+        payload = json.dumps(debug_data, indent=2)
+        await asyncio.to_thread((item["chunk_dir"] / "pass2_debug.json").write_text,
+                                payload, encoding="utf-8")
 
     def apply_merges(
         self, pass1_data: Dict[str, Any], pass2_delta: Pass2ExtractionSchema
@@ -393,82 +430,14 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
 
         return {"concepts": concepts_list}
 
-    async def worker_task(
-        self,
-        clients: List[AsyncOpenAI],
-        worker_id: int,
-        queue: asyncio.Queue,
-        lock: asyncio.Lock,
-        pbar: tqdm,
-        flush_counter: dict
-    ):
-        """Worker task executing Pass 2 extraction and atomic updating."""
-        while True:
-            item = await queue.get()
-            if item is None:
-                queue.task_done()
-                break
-
-            key = item["key"]
-            chunk_dir = item["chunk_dir"]
-
-            async with lock:
-                if self.pass2_log.get(key, False):
-                    queue.task_done()
-                    pbar.update(1)
-                    continue
-                self.pass2_log[key] = False
-
-            delta, error_logs = await self.extract_pass2_refinement(clients, item, worker_id)
-
-            if delta is not None:
-                # 1. Save Pass 2 raw delta refinement JSON
-                pass2_file = chunk_dir / "pass2_refinement.json"
-                await asyncio.to_thread(
-                    pass2_file.write_text, delta.model_dump_json(indent=2), encoding="utf-8"
-                )
-
-                # 2. Backup Pass 1 concepts.json if backup does not exist
-                pass1_backup = chunk_dir / "concepts_pass1_backup.json"
-                concepts_file = chunk_dir / "concepts.json"
-                if not pass1_backup.exists() and concepts_file.exists():
-                    await asyncio.to_thread(shutil.copy, concepts_file, pass1_backup)
-
-                # 3. Apply updates & merged output to concepts.json
-                merged_data = self.apply_merges(item["pass1_concepts"], delta)
-                merged_payload = json.dumps(merged_data, indent=2)
-                await asyncio.to_thread(concepts_file.write_text, merged_payload, encoding="utf-8")
-
-                should_save = False
-                log_snapshot = None
-
-                async with lock:
-                    self.pass2_log[key] = True
-                    flush_counter["count"] += 1
-
-                    if flush_counter["count"] >= 50:
-                        should_save = True
-                        log_snapshot = self.pass2_log.copy()
-                        flush_counter["count"] = 0
-
-                if should_save:
-                    await save_log_async(self.pass2_log_file, log_snapshot)
-            else:
-                # Save Pass 2 debug log on failure
-                debug_file = chunk_dir / "pass2_debug.json"
-                debug_data = {
-                    "key": key,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "attempts": error_logs
-                }
-                await asyncio.to_thread(
-                    debug_file.write_text, json.dumps(debug_data, indent=2), encoding="utf-8"
-                )
-
-            pbar.update(1)
-            queue.task_done()
-
     async def run(self):
+        self.settings = resolve_settings(self.args, STAGE)
+        self.debug = DebugLogger(self.base_wiki_dir / "pass2_refinement_debug.jsonl",
+                                 label=STAGE)
+        self.budget = StageBudget(self.settings.budget_minutes)
+        self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}
+        self.flush_count = 0
+
         # Trigger cleanup if the resume flag is passed
         if hasattr(self.args, 'resume') and self.args.resume:
             self.cleanup_incomplete_states()
@@ -479,63 +448,56 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
             if not self.pass2_log.get(i["key"], False)
         ]
 
+        settings = self.settings
         total_pending = len(pending)
         print(f"Total chunks: {len(items)} | Pending Pass 2 refinement: {total_pending}")
-        print(f"Targeting {len(self.servers)} servers with {self.concurrency} concurrent workers each.")
+        print(f"Spreading work across {len(settings.servers)} server(s) at "
+              f"{settings.concurrency_per_server} concurrent request(s) each "
+              f"(item i -> server i % N).")
+        print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+              f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
 
         if not pending:
             print("All chunks are already refined in Pass 2!")
             return
 
-        queue = asyncio.Queue()
+        # Mark every pending chunk in-progress, as the old worker did under a lock,
+        # so --resume can purge anything left half-written.
         for item in pending:
-            await queue.put(item)
+            self.pass2_log.setdefault(item["key"], False)
 
-        total_workers = len(self.servers) * self.concurrency
-        for _ in range(total_workers):
-            await queue.put(None)
-
-        lock = asyncio.Lock()
-        flush_counter = {"count": 0}
-        pbar = tqdm(total=total_pending, desc=f"Pass 2 Refinement [{self.domain}]")
-
-        tasks = []
-        http_clients = []
-        openai_clients = []
-
-        for server_url in self.servers:
-            http_client = httpx.AsyncClient(
-                limits=httpx.Limits(
-                    max_connections=self.concurrency + 20,
-                    max_keepalive_connections=self.concurrency
-                ),
-                timeout=httpx.Timeout(300.0, connect=10.0)
-            )
-            http_clients.append(http_client)
-
-            client = AsyncOpenAI(
-                base_url=server_url,
-                api_key="EMPTY",
-                http_client=http_client,
-                max_retries=0,
-                timeout=300.0
-            )
-            openai_clients.append(client)
-
-        for worker_id in range(total_workers):
-            task = asyncio.create_task(
-                self.worker_task(openai_clients, worker_id, queue, lock, pbar, flush_counter)
-            )
-            tasks.append(task)
-
+        pool = ServerPool(
+            settings.servers,
+            concurrency_per_server=settings.concurrency_per_server,
+            request_timeout=settings.profile.request_timeout,
+            connect_timeout=settings.profile.connect_timeout,
+            max_connections_slack=20,
+            label=STAGE,
+            failover=not getattr(self.args, "no_failover", False),
+        )
         try:
-            await asyncio.gather(*tasks)
+            async with pool:
+                result = await pool.map(
+                    pending,
+                    self.extract_pass2_refinement,
+                    attempts=settings.attempts,
+                    desc=f"Pass 2 Refinement [{self.domain}]",
+                    key_fn=lambda i: i["key"],
+                    budget=self.budget,
+                    debug=self.debug,
+                    attempt_timeout=settings.profile.attempt_timeout,
+                    on_result=self.persist_refinement,
+                )
         finally:
             await save_log_async(self.pass2_log_file, self.pass2_log)
-            pbar.close()
+            self.debug.close()
 
-            for http_client in http_clients:
-                await http_client.aclose()
+        for failure in result.failures:
+            await self.write_failure_debug(pending[failure["index"]], failure)
+
+        print("Requests served per server:")
+        for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+            print(f"  {url:<40} {count}")
 
         failed_items = [i["key"] for i in items if not self.pass2_log.get(i["key"], False)]
         if failed_items:
@@ -549,15 +511,10 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Second-Pass Concept Extraction & Patching Pipeline")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology, earth_science)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model_name", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
-    parser.add_argument("--max_tokens", type=int, default=8192, help="Max output tokens for LLM generation.")
-    parser.add_argument("--resume", action="store_true", help="Purge incomplete extractions and resume processing.")
-
+    parser = build_parser(
+        stage=STAGE,
+        description="Second-Pass Concept Extraction & Patching Pipeline",
+        include_resume=True)
     args = parser.parse_args()
     pipeline = WikiSecondPassPipeline(args)
     asyncio.run(pipeline.run())
