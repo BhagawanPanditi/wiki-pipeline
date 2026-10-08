@@ -80,7 +80,7 @@ def make_pipeline(root: Path, servers):
     pipe.debug = pass1.EventLog(pass1.log_path(pipe.base_wiki_dir, pass1.STAGE, "debug"),
                                    label=pass1.STAGE)
     pipe.budget = pass1.StageBudget(pipe.settings.budget_minutes)
-    pipe.attempt_errors = {}
+    pipe.attempts = pass1.AttemptHistory()
     pipe.flush_count = 0
     return pipe
 
@@ -163,7 +163,7 @@ class Pass1PoolTests(unittest.TestCase):
                     d = pipe.staging_dir / c["doc_id"] / c["chunk_id"] / "debug.json"
                     self.assertFalse(d.is_file())  # written by the caller, not the handler
                     self.assertFalse((d.parent / "concepts.json").exists())
-                    attempts = pipe.attempt_errors[f"{c['doc_id']}::{c['chunk_id']}"]
+                    attempts = pipe.attempts.get(f"{c['doc_id']}::{c['chunk_id']}")
                     self.assertEqual(len(attempts), 1)
                     self.assertEqual(attempts[0]["error_type"], "TokenLimitExceeded")
                     self.assertTrue(attempts[0]["truncated"])

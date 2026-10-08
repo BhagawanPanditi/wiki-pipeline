@@ -18,13 +18,14 @@ from tqdm.asyncio import tqdm
 from pipeline_lib.checkpoint import load_json_log, save_log_async, save_log_sync
 from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.corpus import chunking_enabled
+from pipeline_lib.attempts import AttemptHistory
 from pipeline_lib.event_log import EventLog
 from pipeline_lib.text import snippet_description
 from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.llm_pool import ServerPool, pool_for_stage
 
 STAGE = "document-consolidation"
 
@@ -99,7 +100,7 @@ class DocumentConsolidatorPipeline:
                                  label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
         self.decisions = EventLog(log_path(self.base_wiki_dir, STAGE, "decisions"), label=STAGE)
-        self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}
+        self.attempts = AttemptHistory()
         self.flush_count = 0
         self.log_data = load_json_log(
             self.log_file,
@@ -151,16 +152,6 @@ class DocumentConsolidatorPipeline:
                 })
         return doc_items
 
-    def _record_attempt(self, doc_id: str, finish_reason, raw_text,
-                        error_type: str, error_message: str) -> None:
-        """Keep every attempt's full, untruncated evidence for the debug file."""
-        logs = self.attempt_errors.setdefault(doc_id, [])
-        logs.append({
-            "attempt": len(logs) + 1, "finish_reason": finish_reason,
-            "error_type": error_type, "error_message": error_message,
-            "raw_response": raw_text
-        })
-
     async def get_merge_clusters(self, client, item: Dict[str, Any],
                                  server_index: int) -> DocumentConsolidationSchema:
         """One document's merge plan.
@@ -208,8 +199,8 @@ class DocumentConsolidatorPipeline:
             cleaned_json = clean_json_string(raw_text)
             return DocumentConsolidationSchema.model_validate_json(cleaned_json)
         except Exception as exc:
-            self._record_attempt(doc_id, finish_reason, raw_text,
-                                 type(exc).__name__, str(exc))
+            self.attempts.record(doc_id, finish_reason=finish_reason, raw_text=raw_text,
+                                 error_type=type(exc).__name__, error_message=str(exc))
             raise
 
     async def persist_consolidation(self, item: Dict[str, Any],
@@ -246,7 +237,7 @@ class DocumentConsolidatorPipeline:
         debug_data = {
             "doc_id": doc_id,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "attempts": self.attempt_errors.get(doc_id, []),
+            "attempts": self.attempts.get(doc_id),
             "final_error": failure.get("error"),
             "final_classification": failure.get("classification"),
             "last_server": failure.get("server"),
@@ -430,16 +421,7 @@ class DocumentConsolidatorPipeline:
             for item in pending:
                 self.log_data.setdefault(item["doc_id"], False)
 
-            pool = ServerPool(
-                settings.servers,
-                concurrency_per_server=settings.concurrency_per_server,
-                request_timeout=settings.profile.request_timeout,
-                connect_timeout=settings.profile.connect_timeout,
-                max_connections_slack=20,
-                label=STAGE,
-                llm_log=LLMCallLog.from_args(self.args, STAGE),
-                failover=not getattr(self.args, "no_failover", False),
-            )
+            pool = pool_for_stage(self.args, settings, STAGE)
             try:
                 async with pool:
                     result = await pool.map(

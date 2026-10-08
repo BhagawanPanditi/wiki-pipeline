@@ -38,7 +38,7 @@ from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.llm_pool import pool_for_stage
 from pipeline_lib.reporting import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
                                     build_improvement, collect_metrics,
                                     format_improvement, format_report, write_summary)
@@ -406,18 +406,7 @@ EXTRACTED CONCEPTS JSON:
             self.generate_summary_report()
             return
 
-        pool = ServerPool(
-            self.settings.servers,
-            concurrency_per_server=self.settings.concurrency_per_server,
-            request_timeout=self.settings.profile.request_timeout,
-            connect_timeout=self.settings.profile.connect_timeout,
-            max_connections_slack=20,
-            label=self.stage,
-            # Each phase gets its own log file, matching its own debug log and
-            # checkpoint: log/verification.llm.jsonl vs log/verification-pass2.llm.jsonl.
-            llm_log=LLMCallLog.from_args(self.args, self.stage),
-            failover=not getattr(self.args, "no_failover", False),
-        )
+        pool = pool_for_stage(self.args, self.settings, self.stage)
 
         try:
             async with pool:

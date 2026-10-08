@@ -635,7 +635,8 @@ pipeline_lib/                   shared code
   cli.py            argument parsing and per-stage tuning
   corpus.py         corpus formats, deduplication, chunking, cache manifest
   layout.py         where every file of a run lives
-  llm_pool.py       ServerPool: even spread, concurrency caps, failover
+  llm_pool.py       ServerPool: even spread, concurrency caps, failover; pool_for_stage
+  attempts.py       every attempt for each item, written next to failed items
   llm_log.py        the LLM call log
   event_log.py      the JSONL writer behind every log
   retry.py          retry ladder

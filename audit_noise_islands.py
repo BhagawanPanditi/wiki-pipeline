@@ -28,7 +28,7 @@ from pipeline_lib.event_log import EventLog
 from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.llm_pool import pool_for_stage
 from pipeline_lib.prompts import domain_scope, out_of_domain_clause
 
 STAGE = "island-audit"
@@ -254,15 +254,7 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
                 "rel_ba": rel_ba
             })
 
-    pool = ServerPool(
-        settings.servers,
-        concurrency_per_server=settings.concurrency_per_server,
-        request_timeout=settings.profile.request_timeout,
-        connect_timeout=settings.profile.connect_timeout,
-        label=STAGE,
-        llm_log=LLMCallLog.from_args(args, STAGE),
-        failover=not getattr(args, "no_failover", False),
-    )
+    pool = pool_for_stage(args, settings, STAGE)
     try:
         async with pool:
             result = await pool.map(

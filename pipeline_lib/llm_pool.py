@@ -462,3 +462,30 @@ class ServerPool:
                 f"with --resume."
             )
         return result
+
+
+def pool_for_stage(args: Any, settings: Any, stage: str) -> ServerPool:
+    """Build the ServerPool a stage sends its requests through.
+
+    Every stage configures its pool the same way: the resolved servers,
+    concurrency and timeouts, its call log, and whether to fail over. Building it
+    here keeps those choices in one place.
+
+    Args:
+        args: Parsed CLI namespace. Supplies the call-log path and ``--no_failover``.
+        settings: The stage's resolved settings from ``resolve_settings``.
+        stage: Stage key, used as the pool's label and as its log name.
+
+    Returns:
+        An unopened ServerPool. Enter it with ``async with``.
+    """
+    return ServerPool(
+        settings.servers,
+        concurrency_per_server=settings.concurrency_per_server,
+        request_timeout=settings.profile.request_timeout,
+        connect_timeout=settings.profile.connect_timeout,
+        max_connections_slack=20,
+        label=stage,
+        llm_log=LLMCallLog.from_args(args, stage),
+        failover=not getattr(args, "no_failover", False),
+    )

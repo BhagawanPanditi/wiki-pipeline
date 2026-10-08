@@ -578,3 +578,33 @@ class StageProfileParityTests(unittest.TestCase):
         light = [p for p in STAGE_PROFILES.values() if p.max_tokens <= 1024]
         self.assertLess(max(p.concurrency_per_server for p in heavy),
                         min(p.concurrency_per_server for p in light))
+
+
+class AttemptHistoryTests(unittest.TestCase):
+    """The per-item attempt history that stages write next to failed items."""
+
+    def test_attempts_are_numbered_and_flag_truncation(self):
+        """Each attempt is numbered in order, and a length stop is flagged as truncated."""
+        from pipeline_lib.attempts import AttemptHistory
+
+        history = AttemptHistory()
+        history.record("doc::chunk", finish_reason="length", raw_text="cut off",
+                       error_type="TokenLimitExceeded", error_message="too long")
+        history.record("doc::chunk", finish_reason="stop", raw_text="{bad", error_type="JSONDecodeError",
+                       error_message="Expecting value", server="http://s0/v1")
+        attempts = history.get("doc::chunk")
+        self.assertEqual([a["attempt"] for a in attempts], [1, 2])
+        self.assertTrue(attempts[0]["truncated"])
+        self.assertFalse(attempts[1]["truncated"])
+        self.assertEqual(attempts[1]["server"], "http://s0/v1")
+        self.assertEqual(attempts[0]["raw_response"], "cut off")
+
+    def test_unknown_items_have_no_history_and_reads_are_copies(self):
+        """An item with no attempts yields an empty list, and a returned list is a copy."""
+        from pipeline_lib.attempts import AttemptHistory
+
+        history = AttemptHistory()
+        self.assertEqual(history.get("nothing"), [])
+        history.record("x", error_type="E", error_message="m")
+        history.get("x").clear()
+        self.assertEqual(len(history.get("x")), 1)

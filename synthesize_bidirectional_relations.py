@@ -22,7 +22,7 @@ from pipeline_lib.event_log import EventLog
 from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.llm_pool import pool_for_stage
 
 STAGE = "reverse-relations"
 
@@ -195,15 +195,7 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
         print(f"Per-item attempts: {settings.attempts} | Stage budget: "
               f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
 
-        pool = ServerPool(
-            settings.servers,
-            concurrency_per_server=settings.concurrency_per_server,
-            request_timeout=settings.profile.request_timeout,
-            connect_timeout=settings.profile.connect_timeout,
-            label=STAGE,
-            llm_log=LLMCallLog.from_args(args, STAGE),
-            failover=not getattr(args, "no_failover", False),
-        )
+        pool = pool_for_stage(args, settings, STAGE)
         try:
             async with pool:
                 result = await pool.map(

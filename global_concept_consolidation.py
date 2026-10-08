@@ -51,7 +51,7 @@ from pipeline_lib.layout import log_path, run_dir_for
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.llm_pool import ServerPool, pool_for_stage
 
 STAGE = "global-consolidation"
 
@@ -448,16 +448,7 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
         if result and result.merge_clusters:
             approved_merges.extend(result.merge_clusters)
 
-    pool = ServerPool(
-        settings.servers,
-        concurrency_per_server=settings.concurrency_per_server,
-        request_timeout=settings.profile.request_timeout,
-        connect_timeout=settings.profile.connect_timeout,
-        max_connections_slack=20,
-        label=STAGE,
-        llm_log=LLMCallLog.from_args(args, STAGE),
-        failover=not getattr(args, "no_failover", False),
-    )
+    pool = pool_for_stage(args, settings, STAGE)
     try:
         async with pool:
             result = await pool.map(

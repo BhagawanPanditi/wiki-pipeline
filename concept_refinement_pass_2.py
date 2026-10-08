@@ -22,12 +22,13 @@ from tqdm.asyncio import tqdm
 from pipeline_lib.checkpoint import load_bool_log, save_log_async, save_log_sync
 from pipeline_lib.chunks import load_cached_chunks
 from pipeline_lib.cli import build_parser, resolve_settings
+from pipeline_lib.attempts import AttemptHistory
 from pipeline_lib.event_log import EventLog
 from pipeline_lib.layout import log_path
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.json_repair import clean_json_string as _extract_json
 from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.llm_pool import ServerPool, pool_for_stage
 
 # Pass 2 historically also accepted an unfenced outermost JSON object.
 clean_json_string = functools.partial(_extract_json, allow_bare_object=True)
@@ -260,19 +261,6 @@ class WikiSecondPassPipeline:
         print(f"Loaded {len(items)} chunks ready for Second Pass refinement.")
         return items
 
-    def _record_attempt(self, key: str, server, finish_reason, raw_text,
-                        error_type: str, error_message: str) -> None:
-        """Keep every attempt's full, untruncated evidence for pass2_debug.json."""
-        logs = self.attempt_errors.setdefault(key, [])
-        logs.append({
-            "attempt": len(logs) + 1,
-            "server": str(server),
-            "finish_reason": finish_reason,
-            "error_type": error_type,
-            "error_message": error_message,
-            "raw_response": raw_text
-        })
-
     async def extract_pass2_refinement(self, client, item: Dict[str, Any],
                                        server_index: int) -> Pass2ExtractionSchema:
         """Queries the LLM for second-pass deltas and missing facts.
@@ -332,8 +320,9 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
             return Pass2ExtractionSchema.model_validate_json(cleaned_json)
 
         except Exception as exc:
-            self._record_attempt(key, client.base_url, finish_reason, raw_text,
-                                 type(exc).__name__, str(exc))
+            self.attempts.record(key, server=str(client.base_url), finish_reason=finish_reason,
+                                     raw_text=raw_text, error_type=type(exc).__name__,
+                                     error_message=str(exc))
             raise
 
     async def persist_refinement(self, item: Dict[str, Any],
@@ -377,7 +366,7 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
         debug_data = {
             "key": key,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "attempts": self.attempt_errors.get(key, []),
+            "attempts": self.attempts.get(key),
             "final_error": failure.get("error"),
             "final_classification": failure.get("classification"),
             "last_server": failure.get("server"),
@@ -463,7 +452,7 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
         self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
                                  label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
-        self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}
+        self.attempts = AttemptHistory()
         self.flush_count = 0
 
         # Trigger cleanup if the resume flag is passed
@@ -494,16 +483,7 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
         for item in pending:
             self.pass2_log.setdefault(item["key"], False)
 
-        pool = ServerPool(
-            settings.servers,
-            concurrency_per_server=settings.concurrency_per_server,
-            request_timeout=settings.profile.request_timeout,
-            connect_timeout=settings.profile.connect_timeout,
-            max_connections_slack=20,
-            label=STAGE,
-            llm_log=LLMCallLog.from_args(self.args, STAGE),
-            failover=not getattr(self.args, "no_failover", False),
-        )
+        pool = pool_for_stage(self.args, settings, STAGE)
         try:
             async with pool:
                 result = await pool.map(

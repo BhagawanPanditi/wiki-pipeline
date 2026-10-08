@@ -17,12 +17,13 @@ from pipeline_lib.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
                                  build_units, cache_manifest, deduplicate,
                                  load_corpus, resolve_corpus_path,
                                  save_run_config)
+from pipeline_lib.attempts import AttemptHistory
 from pipeline_lib.event_log import EventLog
 from pipeline_lib.layout import log_path
 from pipeline_lib.errors import PermanentFailure, StageBudget
 from pipeline_lib.json_repair import clean_json_string
 from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.llm_pool import ServerPool, pool_for_stage
 
 STAGE = "pass1-extraction"
 
@@ -276,19 +277,6 @@ class WikiExtractorPipeline:
         print(f"Cached {len(all_chunks)} unit(s) to disk.")
         return all_chunks
 
-    def _record_attempt(self, key: str, finish_reason, raw_text, error_type: str,
-                        error_message: str) -> None:
-        """Keep every attempt's full, untruncated evidence for debug.json."""
-        logs = self.attempt_errors.setdefault(key, [])
-        logs.append({
-            "attempt": len(logs) + 1,
-            "finish_reason": finish_reason,
-            "truncated": finish_reason == "length",
-            "error_type": error_type,
-            "error_message": error_message,
-            "raw_response": raw_text
-        })
-
     async def extract_chunk(self, client, chunk_data: Dict[str, Any], server_index: int):
         """Performs one LLM call and validates the response via Pydantic.
 
@@ -327,8 +315,9 @@ class WikiExtractorPipeline:
 
             if finish_reason == "length":
                 # FAIL FAST: Do not retry if we hit the token limit
-                self._record_attempt(key, finish_reason, raw_text, "TokenLimitExceeded",
-                                     "Response truncated: Hit max_tokens limit.")
+                self.attempts.record(key, finish_reason=finish_reason, raw_text=raw_text,
+                                     error_type="TokenLimitExceeded",
+                                     error_message="Response truncated: Hit max_tokens limit.")
                 raise PermanentFailure(
                     f"{key}: response truncated, hit max_tokens limit",
                     cause=ValueError("Response truncated: Hit max_tokens limit."))
@@ -339,7 +328,8 @@ class WikiExtractorPipeline:
         except PermanentFailure:
             raise
         except Exception as exc:
-            self._record_attempt(key, finish_reason, raw_text, type(exc).__name__, str(exc))
+            self.attempts.record(key, finish_reason=finish_reason, raw_text=raw_text,
+                                 error_type=type(exc).__name__, error_message=str(exc))
             raise
 
     async def persist_extraction(self, chunk_data: Dict[str, Any],
@@ -380,7 +370,7 @@ class WikiExtractorPipeline:
         subfolder = self.staging_dir / doc_id / chunk_id
         await asyncio.to_thread(subfolder.mkdir, parents=True, exist_ok=True)
 
-        error_logs = self.attempt_errors.get(key, [])
+        error_logs = self.attempts.get(key)
         debug_data = {
             "doc_id": doc_id,
             "chunk_id": chunk_id,
@@ -420,7 +410,7 @@ class WikiExtractorPipeline:
         self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
                                  label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
-        self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}
+        self.attempts = AttemptHistory()
         self.flush_count = 0
 
         if self.args.resume:
@@ -450,16 +440,7 @@ class WikiExtractorPipeline:
             key = f"{chunk['doc_id']}::{chunk['chunk_id']}"
             self.extraction_log.setdefault(key, False)
 
-        pool = ServerPool(
-            settings.servers,
-            concurrency_per_server=settings.concurrency_per_server,
-            request_timeout=settings.profile.request_timeout,
-            connect_timeout=settings.profile.connect_timeout,
-            max_connections_slack=20,
-            label=STAGE,
-            llm_log=LLMCallLog.from_args(self.args, STAGE),
-            failover=not getattr(self.args, "no_failover", False),
-        )
+        pool = pool_for_stage(self.args, settings, STAGE)
         try:
             async with pool:
                 result = await pool.map(
