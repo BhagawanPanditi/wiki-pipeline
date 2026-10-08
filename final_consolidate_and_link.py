@@ -59,6 +59,7 @@ from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget, classify_error
 from pipeline_lib.retry import backoff_delay
 from pipeline_lib.json_repair import clean_json_string as _extract_json
+from pipeline_lib.prompts import domain_scope
 
 # This stage's payloads are sometimes JSON arrays rather than objects.
 clean_json_string = functools.partial(_extract_json, allow_array=True)
@@ -82,7 +83,7 @@ class VerifiedAction(BaseModel):
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 PROMPT_MACRO_SCAN = """\
-You are an expert technical knowledge graph consolidator auditing concepts for domain: "{domain}".
+{scope}.
 You are provided with an indexed list of concept titles beginning with letter/group: "{letter}".
 
 Indexed Titles:
@@ -116,7 +117,7 @@ Return ONLY valid JSON matching this schema:
 """
 
 PROMPT_DEEP_VERIFICATION = """\
-You are an expert technical knowledge graph consolidator verifying candidate concept groups for domain: "{domain}".
+{scope}.
 You are provided with candidate concept titles, their factual briefs, and top entities.
 
 CANDIDATES FOR REVIEW:
@@ -241,7 +242,9 @@ async def run_macro_scan(
             indexed_titles_str = "\n".join(indexed_lines)
 
             prompt = PROMPT_MACRO_SCAN.format(
-                domain=domain_name,
+                scope=domain_scope(
+                    "You are an expert technical knowledge graph consolidator "
+                    "auditing concepts", domain_name),
                 letter=letter,
                 indexed_titles=indexed_titles_str
             )
@@ -480,7 +483,9 @@ async def run_deep_verification(
             ]
 
             prompt = PROMPT_DEEP_VERIFICATION.format(
-                domain=domain_name,
+                scope=domain_scope(
+                    "You are an expert technical knowledge graph consolidator "
+                    "verifying candidate concept groups", domain_name),
                 suggested_category=cat,
                 candidates_json=json.dumps(candidates_payload, indent=2)
             )
@@ -773,7 +778,7 @@ def apply_all_resolutions(concepts: List[Dict[str, Any]], actions: List[Verified
 
     return surviving_concepts
 
-async def main_pipeline(domain_dir: Path, domain_name: str, args):
+async def main_pipeline(domain_dir: Path, domain_name: Optional[str], args):
     refined_file = domain_dir / "global_concepts_refined.json"
     if not refined_file.exists():
         fallback = domain_dir / "global_concepts_stubs_resolved.json"
@@ -852,7 +857,9 @@ def main():
 
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain
-    asyncio.run(main_pipeline(domain_dir, args.domain, args))
+    # domain_name feeds prompts only, so pass the optional hint (None when
+    # --domain was omitted); args.domain stays the output folder name.
+    asyncio.run(main_pipeline(domain_dir, args.domain_label, args))
 
 if __name__ == "__main__":
     main()

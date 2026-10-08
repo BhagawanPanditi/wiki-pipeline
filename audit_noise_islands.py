@@ -27,12 +27,13 @@ from pipeline_lib.cli import build_parser, resolve_settings
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import StageBudget
 from pipeline_lib.llm_pool import ServerPool
+from pipeline_lib.prompts import domain_scope, out_of_domain_clause
 
 STAGE = "island-audit"
 
 SYSTEM_PROMPT_ISLAND_AUDIT = """\
 You are an expert technical knowledge graph quality auditor.
-Your job is to examine an isolated concept or small island from an automated document extraction pipeline for domain: "{domain}".
+{scope}.
 You are also provided with other concepts extracted from the EXACT SAME source document(s).
 
 ISLAND CONCEPT(S) TO EVALUATE:
@@ -43,7 +44,7 @@ SIBLING CONCEPTS FROM THE SAME SOURCE DOCUMENT:
 
 TASK:
 Determine how to handle the island concept(s):
-1. "PRUNE": Web scraping noise, site boilerplate, disclaimers, cookies, unrelated legal/author/hardware text, or content completely outside the domain of "{domain}".
+1. "PRUNE": Web scraping noise, site boilerplate, disclaimers, cookies, unrelated legal/author/hardware text, or {off_topic}.
 2. "MERGE": The island concept is an identical or heavily overlapping duplicate of one of the sibling concepts from the same document.
 3. "LINK": The island concept is a legitimate domain concept that is contextually related to one of the sibling concepts in the same document. Provide reciprocal link descriptions.
 4. "KEEP": A legitimate domain concept, but none of the sibling concepts from the same document are suitable to link with.
@@ -58,7 +59,7 @@ Return ONLY valid JSON matching this schema:
 }}
 """
 
-async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
+async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str], args):
     refined_file = domain_dir / "global_concepts_refined.json"
     if not refined_file.exists():
         fallback_file = domain_dir / "global_concepts.json"
@@ -169,7 +170,10 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
         doc_context_str = json.dumps(sibling_concepts, indent=2) if sibling_concepts else "No other concepts in same document."
 
         return SYSTEM_PROMPT_ISLAND_AUDIT.format(
-            domain=domain_name,
+            scope=domain_scope(
+                "Your job is to examine an isolated concept or small island from "
+                "an automated document extraction pipeline", domain_name),
+            off_topic=out_of_domain_clause(domain_name),
             island_concepts=json.dumps(island_payload, indent=2),
             document_context=doc_context_str
         )
@@ -368,7 +372,9 @@ def main():
 
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain
-    asyncio.run(audit_and_connect_islands(domain_dir, args.domain, args))
+    # domain_name feeds prompts only, so pass the optional hint (None when
+    # --domain was omitted); args.domain stays the output folder name.
+    asyncio.run(audit_and_connect_islands(domain_dir, args.domain_label, args))
 
 if __name__ == "__main__":
     main()

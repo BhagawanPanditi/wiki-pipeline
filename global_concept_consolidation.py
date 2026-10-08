@@ -21,13 +21,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
-import nltk
-from nltk.corpus import stopwords
+# nltk only supplies a stopword list for the fuzzy-similarity heuristics. It is
+# optional: without it the module falls back to a small built-in list rather than
+# refusing to import, so the pipeline runs on a bare environment.
+try:
+    import nltk
+    from nltk.corpus import stopwords
+except ImportError:  # pragma: no cover - depends on the environment
+    nltk = None
+    stopwords = None
 from pydantic import BaseModel, Field
 from tqdm import tqdm
 
 # Silent setup for NLTK Stopwords
 try:
+    if nltk is None:
+        raise ImportError("nltk is not installed")
     nltk.download('stopwords', quiet=True)
     STOP_WORDS = set(stopwords.words('english'))
 except Exception:
@@ -333,10 +342,41 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
     print(f"Per-item attempts: {settings.attempts} | Stage budget: "
           f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
 
+    # Accumulators shared by the result callback and the failure sweep below.
+    approved_merges: List[MergeCluster] = []
+    llm_evaluations: List[Dict[str, Any]] = []
+    failed_clusters: List[List[str]] = []
+
     async def handler(client, cluster, server_index):
+        """Verify one fuzzy candidate cluster through the pool.
+
+        Args:
+            client: The ``AsyncOpenAI`` client bound to one server.
+            cluster: The candidate concepts proposed for merging.
+            server_index: Index of the server handling this item, used only for
+                per-server accounting.
+
+        Returns:
+            The parsed ``GlobalFuzzyMergeSchema`` verdict.
+
+        Raises:
+            Whatever :func:`verify_cluster_llm` raises, so the pool can classify
+            and retry it; failures are collected after the map completes.
+        """
         return await verify_cluster_llm(client, cluster, settings)
 
     async def record(cluster, result):
+        """Append one successful verdict to the shared accumulators.
+
+        Args:
+            cluster: The candidate concepts that were sent to the model.
+            result: The parsed ``GlobalFuzzyMergeSchema`` verdict.
+
+        Returns:
+            None. Mutates ``llm_evaluations`` (always, so the audit trail shows
+            which candidates were sent) and ``approved_merges`` (only when the
+            model actually approved a merge).
+        """
         # Record the candidate titles sent, and the LLM's returned merge decisions
         llm_evaluations.append({
             "candidates_sent": [c.get("title", "Unknown") for c in cluster],
