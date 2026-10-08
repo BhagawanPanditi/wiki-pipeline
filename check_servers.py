@@ -2,16 +2,37 @@
 """
 Pre-flight vLLM Server Health Check
 -----------------------------------
-Pings every vLLM server defined in config.json (or pipeline_config.py defaults)
+Pings every vLLM server defined in config.json (or config.py defaults)
 via GET /models to verify liveness and responsiveness before pipeline tasks launch.
 """
 
 import sys
 import httpx
-from pipeline_config import load_global_config
+from config import load_global_config, load_stage_overrides
 
 def main():
-    servers, _, model = load_global_config()
+    """Probe every configured LLM server and report which are healthy.
+
+    Reads ``config.json``, sends each server a short request, and prints the result
+    per server. The runner calls this before every stage and again before each retry.
+
+    Returns:
+        None. Exits 2 when ``config.json`` is invalid and 1 when any server is
+        unreachable, so a caller can tell the two apart."""
+    try:
+        servers, model = load_global_config()
+        overrides = load_stage_overrides()
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(2)
+    for name, value in overrides.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float, dict)):
+            print(f"ERROR: config.json stage_concurrency['{name}'] must be a number or an object.")
+            sys.exit(2)
+    if not isinstance(servers, list) or not servers or any(not isinstance(s, str) or not s.strip() for s in servers):
+        print("ERROR: config.json must contain a non-empty 'servers' list of URLs.")
+        sys.exit(2)
+
     print("=" * 65)
     print(f" PRE-FLIGHT CHECK: Checking {len(servers)} configured vLLM servers...")
     print(f" Expected Model: {model}")
