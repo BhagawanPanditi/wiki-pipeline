@@ -9,22 +9,22 @@ Step 4A: Dedicated Stub Resolution Pipeline
 4. Outputs: `domain_dir/global_concepts_stubs_resolved.json`.
 """
 
-import re
-import json
 import asyncio
-import argparse
+import json
+import re
 from pathlib import Path
-from typing import Dict, List, Set, Any, Optional
-from tqdm.asyncio import tqdm
+from typing import Any, Dict, List, Optional, Set
+
 from pydantic import BaseModel, Field
-import httpx
-from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm
 
 # ── Configuration ────────────────────────────────────────────────────────────
-from pipeline_config import load_global_config
-from pipeline_lib import clean_json_string
-from pipeline_lib import atomic_write_json
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+from pipeline_lib import (DebugLogger, PermanentFailure, ServerPool, StageBudget,
+                          TransientFailureExhausted, atomic_write_json,
+                          build_parser, clean_json_string, resolve_settings,
+                          retry_async)
+
+STAGE = "stub-resolution"
 
 class StubRelation(BaseModel):
     target_concept: str
@@ -84,10 +84,11 @@ class StubResolver:
         self.output_file = self.domain_dir / "global_concepts_stubs_resolved.json"
         self.log_file = self.domain_dir / "global_consolidation.json"
         
-        self.model_name = args.model
-        self.max_tokens = args.max_tokens
-        self.servers = args.servers
-        self.concurrency = args.concurrency_per_server
+        self.args = args
+        self.settings = resolve_settings(args, STAGE)
+        self.debug = DebugLogger(self.domain_dir / "stub_resolution_debug.jsonl",
+                                 label=STAGE)
+        self.budget = StageBudget(self.settings.budget_minutes)
 
         self.global_concepts = []
         self.canonical_titles = set()
@@ -155,7 +156,7 @@ class StubResolver:
             
         return "\n".join(context_lines)
 
-    async def resolve_major_stub(self, client: AsyncOpenAI, stub: dict) -> dict:
+    async def resolve_major_stub(self, client, stub: dict, server_index: int = 0) -> dict:
         stub_name = stub["stub_name"]
         source_chunks = stub.get("source_chunks", [])
         sem = asyncio.Semaphore(5)
@@ -169,26 +170,36 @@ class StubResolver:
                     return sc, None
                 user_prompt = f"TARGET STUB TO DEFINE: {stub_name}\n\n{context_str}"
                 
-                for attempt in range(10):
-                    try:
-                        response = await asyncio.wait_for(
-                            client.chat.completions.create(
-                                model=self.model_name,
-                                messages=[
-                                    {"role": "system", "content": SYSTEM_PROMPT},
-                                    {"role": "user", "content": user_prompt}
-                                ],
-                                temperature=0.1, max_tokens=self.max_tokens, response_format={"type": "json_object"}
-                            ),
-                            timeout=60.0
-                        )
-                        data = StubConceptExtraction.model_validate_json(clean_json_string(response.choices[0].message.content))
-                        return sc, data
-                    except Exception:
-                        if attempt == 9:
-                            failed_chunks.append(sc)
-                            return sc, None
-                        await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
+                async def call():
+                    response = await client.chat.completions.create(
+                        model=self.settings.model_name,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.1, max_tokens=self.settings.max_tokens,
+                        response_format={"type": "json_object"}
+                    )
+                    return StubConceptExtraction.model_validate_json(
+                        clean_json_string(response.choices[0].message.content))
+
+                try:
+                    return sc, await retry_async(
+                        call,
+                        attempts=self.settings.attempts,
+                        label=f"stub[{stub_name}][{sc}]",
+                        budget=self.budget,
+                        debug=self.debug,
+                        attempt_timeout=60.0,
+                        server=str(client.base_url),
+                    )
+                except (PermanentFailure, TransientFailureExhausted):
+                    # A chunk that never produced a valid concept downgrades the
+                    # whole stub, exactly as the old 10-attempt loop did. A
+                    # StageBudgetExceeded is deliberately NOT caught: the stage
+                    # must stop and stay resumable.
+                    failed_chunks.append(sc)
+                    return sc, None
 
         results = await asyncio.gather(*(process_chunk(sc) for sc in source_chunks))
         valid_extractions = [(sc, data) for sc, data in results if data and data.is_valid_concept]
@@ -242,41 +253,53 @@ class StubResolver:
         
         new_concepts = []
         failed_stubs = []
-        if major_stubs and not self.servers:
+        settings = self.settings
+        if major_stubs and not settings.servers:
             raise RuntimeError("Major stub resolution requires at least one configured LLM server.")
         if major_stubs:
             print(f"Resolving {len(major_stubs)} Major Stubs (>2 chunks) via LLM pool...")
-            queue = asyncio.Queue()
-            for s in major_stubs: await queue.put(s)
-            
-            effective_concurrency = min(self.concurrency, 15)
-            for _ in range(len(self.servers) * effective_concurrency): await queue.put(None)
+            print(f"Spreading stubs across {len(settings.servers)} server(s) at "
+                  f"{settings.concurrency_per_server} concurrent stub(s) each "
+                  f"(item i -> server i % N); each stub fans out over its own "
+                  f"chunks 5 at a time.")
+            print(f"Per-chunk attempts: {settings.attempts} | Stage budget: "
+                  f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
 
-            pbar = tqdm(total=len(major_stubs), desc="LLM Major Stub Resolution")
-            async def worker(client: AsyncOpenAI):
-                while True:
-                    stub = await queue.get()
-                    if stub is None: queue.task_done(); break
-                    res = await self.resolve_major_stub(client, stub)
-                    if res["status"] == "success":
-                        new_concepts.append(res["concept"])
-                    elif res["status"] == "failed":
-                        failed_stubs.append({"stub": res["stub"], "failed_chunks": res.get("failed_chunks", [])})
-                    else:
-                        minor_stubs_set.add(res["stub"])
-                    pbar.update(1)
-                    queue.task_done()
+            async def classify_result(stub, res):
+                if res["status"] == "success":
+                    new_concepts.append(res["concept"])
+                elif res["status"] == "failed":
+                    failed_stubs.append({"stub": res["stub"],
+                                         "failed_chunks": res.get("failed_chunks", [])})
+                else:
+                    minor_stubs_set.add(res["stub"])
 
-            tasks, http_clients = [], []
-            for url in self.servers:
-                hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=httpx.Timeout(45.0))
-                http_clients.append(hc)
-                client = AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0)
-                for _ in range(effective_concurrency): tasks.append(asyncio.create_task(worker(client)))
+            pool = ServerPool(
+                settings.servers,
+                concurrency_per_server=settings.concurrency_per_server,
+                request_timeout=settings.profile.request_timeout,
+                connect_timeout=settings.profile.connect_timeout,
+                label=STAGE,
+                failover=not getattr(self.args, "no_failover", False),
+            )
+            try:
+                async with pool:
+                    result = await pool.map(
+                        major_stubs,
+                        self.resolve_major_stub,
+                        attempts=settings.attempts,
+                        desc="LLM Major Stub Resolution",
+                        key_fn=lambda st: st["stub_name"],
+                        budget=self.budget,
+                        debug=self.debug,
+                        on_result=classify_result,
+                    )
+            finally:
+                self.debug.close()
 
-            await asyncio.gather(*tasks)
-            pbar.close()
-            for hc in http_clients: await hc.aclose()
+            print("Requests served per server:")
+            for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+                print(f"  {url:<40} {count}")
 
             if failed_stubs:
                 raise RuntimeError(
@@ -344,14 +367,7 @@ class StubResolver:
         print(f"Output: {self.output_file}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Step 4A: Resolve Stubs")
-    parser.add_argument("--domain", type=str, required=True)
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--max_tokens", type=int, default=8192)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
-    
+    parser = build_parser(stage=STAGE, description="Step 4A: Resolve Stubs")
     args = parser.parse_args()
     resolver = StubResolver(args)
     asyncio.run(resolver.run())

@@ -8,24 +8,21 @@ Step 4B: LLM-Driven Thin Concept Folding & Pruning Pipeline
 4. Clears stale files in `concepts/` and outputs clean `global_concepts_refined.json` and individual concept JSONs.
 """
 
-import re
-import json
 import asyncio
-import argparse
-from pathlib import Path
-from typing import Dict, List, Set, Any, Optional, Tuple
+import json
+import re
 from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import httpx
 from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
 # ── Configuration ────────────────────────────────────────────────────────────
-from pipeline_config import load_global_config
-from pipeline_lib import clean_json_string
-from pipeline_lib import atomic_write_json
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
+                          build_parser, clean_json_string, resolve_settings)
+
+STAGE = "thin-concept-folding"
 
 # ── Pydantic Schema for LLM Decision ─────────────────────────────────────────
 class FoldDecisionSchema(BaseModel):
@@ -74,10 +71,10 @@ class ThinConceptHandler:
         self.concepts_dir = self.domain_dir / "concepts"
         self.log_file = self.domain_dir / "global_consolidation.json"
 
-        self.model_name = args.model
-        self.max_tokens = args.max_tokens
-        self.servers = args.servers
-        self.concurrency = args.concurrency_per_server
+        self.args = args
+        self.settings = resolve_settings(args, STAGE)
+        self.debug = DebugLogger(self.domain_dir / "thin_concept_debug.jsonl", label=STAGE)
+        self.budget = StageBudget(self.settings.budget_minutes)
         self.min_words = args.min_concept_words
 
         self.concepts: List[Dict[str, Any]] = []
@@ -124,7 +121,16 @@ class ThinConceptHandler:
 
         return candidates[:3]  # Top 3 candidate hosts
 
-    async def evaluate_folding_llm(self, client: AsyncOpenAI, thin_concept: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Optional[FoldDecisionSchema]:
+    async def evaluate_folding_llm(self, client, item: Tuple[Dict[str, Any],
+                                     List[Dict[str, Any]]], server_index: int):
+        """One fold decision.
+
+        Raises on any unusable response so ServerPool classifies and retries it.
+        Returning None after 10 silent attempts used to mean "do not fold"; a
+        raised-and-exhausted error means the same thing now, except it is also
+        recorded in the debug log and counted in the per-server report.
+        """
+        thin_concept, candidates = item
         user_prompt = f"""THIN CONCEPT TO EVALUATE:
 Title: {thin_concept['title']}
 Aliases: {thin_concept.get('aliases', [])}
@@ -135,29 +141,18 @@ CANDIDATE HOST CONCEPTS:
         for idx, cand in enumerate(candidates, 1):
             user_prompt += f"\n--- Candidate Host {idx} ---\nTitle: {cand['title']}\nDescription: {cand.get('description', '')}\n"
 
-        for attempt in range(10):
-            try:
-                response = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=self.model_name,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT_FOLD},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        temperature=0.1,
-                        max_tokens=self.max_tokens,
-                        response_format={"type": "json_object"}
-                    ),
-                    timeout=60.0  # Hard timeout protection
-                )
-                raw_text = response.choices[0].message.content
-                return FoldDecisionSchema.model_validate_json(clean_json_string(raw_text))
-            except Exception:
-                if attempt == 9:
-                    return None
-                await asyncio.sleep(min(2.0 * (attempt + 1), 10.0))
-
-        return None
+        response = await client.chat.completions.create(
+            model=self.settings.model_name,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_FOLD},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=self.settings.max_tokens,
+            response_format={"type": "json_object"}
+        )
+        raw_text = response.choices[0].message.content
+        return FoldDecisionSchema.model_validate_json(clean_json_string(raw_text))
 
     async def run(self):
         self.load_data()
@@ -188,70 +183,86 @@ CANDIDATE HOST CONCEPTS:
         pruned_titles: Set[str] = set()
 
         # Run Async LLM Evaluation
-        if thin_tasks and self.servers:
-            queue = asyncio.Queue()
-            for item in thin_tasks: await queue.put(item)
+        settings = self.settings
+        if thin_tasks and settings.servers:
+            print(f"Spreading {len(thin_tasks)} thin concept(s) across "
+                  f"{len(settings.servers)} server(s) at "
+                  f"{settings.concurrency_per_server} concurrent request(s) each "
+                  f"(item i -> server i % N).")
+            print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+                  f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
 
-            effective_concurrency = min(self.concurrency, 15)
-            total_workers = len(self.servers) * effective_concurrency
-            for _ in range(total_workers): await queue.put(None)
+            async def apply_fold(item, decision):
+                """Merge a thin concept into its host, in completion order.
 
-            lock = asyncio.Lock()
-            pbar = tqdm(total=len(thin_tasks), desc="LLM Thin Concept Folding")
+                There are no awaits inside, so this is already atomic with
+                respect to the event loop and needs no lock. The ordering
+                matters: a host can only be folded into once, guarded by
+                folded_titles.
+                """
+                thin_concept, _candidates = item
+                if not (decision and decision.should_fold and decision.target_host_title):
+                    return
+                target_host = self.title_map.get(decision.target_host_title.lower())
+                if not target_host or target_host["title"].lower() in folded_titles:
+                    return
 
-            async def worker(client: AsyncOpenAI):
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        queue.task_done()
-                        break
+                # Apply Merged Synthesis
+                if decision.synthesized_description:
+                    target_host["description"] = decision.synthesized_description
 
-                    thin_concept, candidates = item
-                    decision = await self.evaluate_folding_llm(client, thin_concept, candidates)
+                # Add Entities & Aliases
+                if thin_concept["title"] not in target_host.get("entities", []):
+                    target_host.setdefault("entities", []).append(thin_concept["title"])
+                    target_host["entities"].sort()
 
-                    if decision and decision.should_fold and decision.target_host_title:
-                        target_host = self.title_map.get(decision.target_host_title.lower())
-                        if target_host and target_host["title"].lower() not in folded_titles:
-                            async with lock:
-                                # Apply Merged Synthesis
-                                if decision.synthesized_description:
-                                    target_host["description"] = decision.synthesized_description
+                for alias in thin_concept.get("aliases", []):
+                    if alias not in target_host.get("aliases", []) and alias.lower() != target_host["title"].lower():
+                        target_host.setdefault("aliases", []).append(alias)
 
-                                # Add Entities & Aliases
-                                if thin_concept["title"] not in target_host.get("entities", []):
-                                    target_host.setdefault("entities", []).append(thin_concept["title"])
-                                    target_host["entities"].sort()
+                # Merge Citation Source Chunks
+                host_chunks = set(target_host.get("source_chunks", []))
+                host_chunks.update(thin_concept.get("source_chunks", []))
+                target_host["source_chunks"] = sorted(list(host_chunks))
 
-                                for alias in thin_concept.get("aliases", []):
-                                    if alias not in target_host.get("aliases", []) and alias.lower() != target_host["title"].lower():
-                                        target_host.setdefault("aliases", []).append(alias)
+                # Remove Outbound Link to Folded Concept
+                target_host["outbound_relations"] = [
+                    r for r in target_host.get("outbound_relations", [])
+                    if r.get("target_concept", "").strip().lower() != thin_concept["title"].lower()
+                ]
 
-                                # Merge Citation Source Chunks
-                                host_chunks = set(target_host.get("source_chunks", []))
-                                host_chunks.update(thin_concept.get("source_chunks", []))
-                                target_host["source_chunks"] = sorted(list(host_chunks))
+                folded_titles.add(thin_concept["title"].lower())
 
-                                # Remove Outbound Link to Folded Concept
-                                target_host["outbound_relations"] = [
-                                    r for r in target_host.get("outbound_relations", [])
-                                    if r.get("target_concept", "").strip().lower() != thin_concept["title"].lower()
-                                ]
+            pool = ServerPool(
+                settings.servers,
+                concurrency_per_server=settings.concurrency_per_server,
+                request_timeout=settings.profile.request_timeout,
+                connect_timeout=settings.profile.connect_timeout,
+                label=STAGE,
+                failover=not getattr(self.args, "no_failover", False),
+            )
+            try:
+                async with pool:
+                    result = await pool.map(
+                        thin_tasks,
+                        self.evaluate_folding_llm,
+                        attempts=settings.attempts,
+                        desc="LLM Thin Concept Folding",
+                        key_fn=lambda it: it[0].get("title", ""),
+                        budget=self.budget,
+                        debug=self.debug,
+                        attempt_timeout=settings.profile.attempt_timeout,
+                        on_result=apply_fold,
+                    )
+            finally:
+                self.debug.close()
 
-                                folded_titles.add(thin_concept["title"].lower())
-
-                    pbar.update(1)
-                    queue.task_done()
-
-            tasks, http_clients = [], []
-            for url in self.servers:
-                hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=httpx.Timeout(45.0))
-                http_clients.append(hc)
-                client = AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0)
-                for _ in range(effective_concurrency): tasks.append(asyncio.create_task(worker(client)))
-
-            await asyncio.gather(*tasks)
-            pbar.close()
-            for hc in http_clients: await hc.aclose()
+            print("Requests served per server:")
+            for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+                print(f"  {url:<40} {count}")
+            if result.failures:
+                print(f"\u26a0\ufe0f  {result.failed_count} thin concept(s) got no fold "
+                      f"decision and were left to the deterministic rules below.")
 
         # Strict enforcement: Any concept that remains below min_words and was not folded is evaluated
         # If it has viable candidates or is too thin (< 35 words / < 3 sentences), it is folded into best host or pruned
@@ -339,13 +350,9 @@ CANDIDATE HOST CONCEPTS:
         print(f"Outputs written to:\n  - {self.output_file}\n  - {self.concepts_dir}/")
 
 def main():
-    parser = argparse.ArgumentParser(description="Step 4B: LLM-Driven Thin Concept Folding & Pruning")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--max_tokens", type=int, default=4096)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
+    parser = build_parser(
+        stage=STAGE,
+        description="Step 4B: LLM-Driven Thin Concept Folding & Pruning")
     parser.add_argument("--min_concept_words", type=int, default=30)
 
     args = parser.parse_args()

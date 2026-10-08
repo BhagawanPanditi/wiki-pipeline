@@ -54,7 +54,11 @@ STAGE_PROFILES: Dict[str, StageProfile] = {
     "pass1-extraction":       StageProfile("pass1-extraction", 8, 300.0, 30.0, 8192),
     "pass2-refinement":       StageProfile("pass2-refinement", 8, 300.0, 10.0, 8192),
     "document-consolidation": StageProfile("document-consolidation", 6, 300.0, None, 8192),
-    "stub-resolution":        StageProfile("stub-resolution", 10, 45.0, None, 8192),
+    # Each stub fans out over its own source chunks 5 at a time, so 2 stubs in
+    # flight is ~10 concurrent 8192-token requests per server - the KV-correct
+    # figure. The old code ran 15 stubs x 5 chunks = 75 in flight, which
+    # oversubscribed KV cache ~7x and caused preemption and recompute.
+    "stub-resolution":        StageProfile("stub-resolution", 2, 45.0, None, 8192),
 
     # ── verification: long prompt, structured JSON out ─────────────────────
     "verification":           StageProfile("verification", 12, 450.0, 10.0, 4096),
@@ -66,7 +70,9 @@ STAGE_PROFILES: Dict[str, StageProfile] = {
     "final-deep-verify":      StageProfile("final-deep-verify", 24, 60.0, None, 1000),
 
     # ── graph enrichment: small outputs, high fan-out ──────────────────────
-    "thin-concept-folding":   StageProfile("thin-concept-folding", 24, 45.0, None, 1024),
+    # max_tokens is 4096 because that is what this stage has always requested;
+    # a smaller budget would truncate fold decisions and change output quality.
+    "thin-concept-folding":   StageProfile("thin-concept-folding", 16, 45.0, None, 4096),
     "brief-generation":       StageProfile("brief-generation", 40, 40.0, None, 256),
     "island-audit":           StageProfile("island-audit", 32, 60.0, None, 400),
     "reverse-relations":      StageProfile("reverse-relations", 48, 60.0, None, 256),

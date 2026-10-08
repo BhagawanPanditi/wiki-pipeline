@@ -14,19 +14,18 @@ Island & Isolated Node Relevance Auditor and Sibling Connector
    pulling legitimate isolated nodes into the mainland graph.
 """
 
-import json
-import argparse
 import asyncio
+import json
 from pathlib import Path
-from typing import Dict, List, Set, Any, Optional
+from typing import Any, Dict, List, Optional, Set
+
 import networkx as nx
 from tqdm import tqdm
-from openai import AsyncOpenAI
-import httpx
 
-from pipeline_config import load_global_config
-from pipeline_lib import atomic_write_json
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
+                          build_parser, resolve_settings)
+
+STAGE = "island-audit"
 
 SYSTEM_PROMPT_ISLAND_AUDIT = """\
 You are an expert technical knowledge graph quality auditor.
@@ -107,144 +106,144 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
     if not args.servers:
         raise RuntimeError("Island auditing found work to do, but no LLM servers are configured.")
 
-    queue = asyncio.Queue()
-    for comp in small_islands_to_review:
-        await queue.put(comp)
-
-    effective_concurrency = args.concurrency_per_server
-    for _ in range(len(args.servers) * effective_concurrency):
-        await queue.put(None)
+    settings = resolve_settings(args, STAGE)
+    debug = DebugLogger(domain_dir / "island_audit_debug.jsonl", label=STAGE)
+    budget = StageBudget(settings.budget_minutes)
 
     prune_titles_set: Set[str] = set()
     merge_actions: List[Dict[str, Any]] = []
     link_actions: List[Dict[str, Any]] = []
     failed_components: List[List[str]] = []
 
-    lock = asyncio.Lock()
-    pbar = tqdm(total=len(small_islands_to_review), desc="Auditing & Connecting Islands")
+    print(f"Spreading {len(small_islands_to_review)} island(s) across "
+          f"{len(settings.servers)} server(s) at {settings.concurrency_per_server} "
+          f"concurrent request(s) each (item i -> server i % N).")
+    print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+          f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
 
     audit_log_path = domain_dir / "island_audit_log.jsonl"
     log_f = open(audit_log_path, "w", encoding="utf-8")
 
-    async def worker(client: AsyncOpenAI):
-        while True:
-            comp = await queue.get()
-            if comp is None:
-                queue.task_done()
-                break
+    def build_audit_prompt(comp: List[str]) -> str:
+        island_payload = []
+        source_docs = set()
+        for t_lower in comp:
+            c = title_map.get(t_lower)
+            if c:
+                island_payload.append({
+                    "title": c["title"],
+                    "brief": c.get("brief", ""),
+                    "aliases": c.get("aliases", []),
+                    "entities": c.get("entities", [])[:5]
+                })
+                for sc in c.get("source_chunks", []):
+                    doc_id = sc.split("::", 1)[0] if "::" in sc else sc.strip()
+                    if doc_id:
+                        source_docs.add(doc_id)
 
-            island_payload = []
-            source_docs = set()
-            for t_lower in comp:
-                c = title_map.get(t_lower)
-                if c:
-                    island_payload.append({
-                        "title": c["title"],
-                        "brief": c.get("brief", ""),
-                        "aliases": c.get("aliases", []),
-                        "entities": c.get("entities", [])[:5]
+        # Gather sibling concepts from same documents (prioritize giant component / mainland concepts)
+        sibling_concepts = []
+        seen_siblings = set(comp)
+        for doc_id in source_docs:
+            for sib in doc_to_concepts.get(doc_id, []):
+                sib_lower = sib["title"].lower().strip()
+                if sib_lower not in seen_siblings:
+                    seen_siblings.add(sib_lower)
+                    sibling_concepts.append({
+                        "title": sib["title"],
+                        "brief": sib.get("brief", ""),
+                        "aliases": sib.get("aliases", []),
+                        "is_in_mainland": sib_lower in giant_component
                     })
-                    for sc in c.get("source_chunks", []):
-                        doc_id = sc.split("::", 1)[0] if "::" in sc else sc.strip()
-                        if doc_id:
-                            source_docs.add(doc_id)
-
-            # Gather sibling concepts from same documents (prioritize giant component / mainland concepts)
-            sibling_concepts = []
-            seen_siblings = set(comp)
-            for doc_id in source_docs:
-                for sib in doc_to_concepts.get(doc_id, []):
-                    sib_lower = sib["title"].lower().strip()
-                    if sib_lower not in seen_siblings:
-                        seen_siblings.add(sib_lower)
-                        sibling_concepts.append({
-                            "title": sib["title"],
-                            "brief": sib.get("brief", ""),
-                            "aliases": sib.get("aliases", []),
-                            "is_in_mainland": sib_lower in giant_component
-                        })
-                    if len(sibling_concepts) >= 12:
-                        break
                 if len(sibling_concepts) >= 12:
                     break
+            if len(sibling_concepts) >= 12:
+                break
 
-            # Sort siblings so mainland concepts come first
-            sibling_concepts.sort(key=lambda s: not s.get("is_in_mainland", False))
+        # Sort siblings so mainland concepts come first
+        sibling_concepts.sort(key=lambda s: not s.get("is_in_mainland", False))
 
-            doc_context_str = json.dumps(sibling_concepts, indent=2) if sibling_concepts else "No other concepts in same document."
+        doc_context_str = json.dumps(sibling_concepts, indent=2) if sibling_concepts else "No other concepts in same document."
 
-            prompt = SYSTEM_PROMPT_ISLAND_AUDIT.format(
-                domain=domain_name,
-                island_concepts=json.dumps(island_payload, indent=2),
-                document_context=doc_context_str
+        return SYSTEM_PROMPT_ISLAND_AUDIT.format(
+            domain=domain_name,
+            island_concepts=json.dumps(island_payload, indent=2),
+            document_context=doc_context_str
+        )
+
+    async def audit_island(client, comp: List[str], server_index: int):
+        """One island verdict. Raises so the pool retries; this stage has always
+        parsed the reply with a plain json.loads, and still does."""
+        resp = await client.chat.completions.create(
+            model=settings.model_name,
+            messages=[{"role": "user", "content": build_audit_prompt(comp)}],
+            temperature=0.1,
+            max_tokens=settings.max_tokens,
+            response_format={"type": "json_object"}
+        )
+        raw = resp.choices[0].message.content.strip()
+        return json.loads(raw)
+
+    async def record_verdict(comp: List[str], res_json: Dict[str, Any]):
+        """Append the audit line and queue the graph action. No awaits inside, so
+        this is already atomic with respect to the event loop - no lock needed."""
+        decision = str(res_json.get("decision", "KEEP")).strip().upper()
+        target_sib = res_json.get("target_sibling")
+        rel_ab = res_json.get("relation_to_sibling")
+        rel_ba = res_json.get("relation_from_sibling")
+
+        log_entry = {"comp": comp, "decision": decision, "response": res_json}
+        log_f.write(json.dumps(log_entry) + "\n")
+        log_f.flush()
+
+        if decision == "PRUNE":
+            for t_lower in comp:
+                prune_titles_set.add(t_lower)
+        elif decision == "MERGE" and target_sib and target_sib.lower().strip() in title_map:
+            merge_actions.append({
+                "island_titles": comp,
+                "target_sibling": target_sib
+            })
+        elif decision == "LINK" and target_sib and target_sib.lower().strip() in title_map:
+            link_actions.append({
+                "island_titles": comp,
+                "target_sibling": target_sib,
+                "rel_ab": rel_ab,
+                "rel_ba": rel_ba
+            })
+
+    pool = ServerPool(
+        settings.servers,
+        concurrency_per_server=settings.concurrency_per_server,
+        request_timeout=settings.profile.request_timeout,
+        connect_timeout=settings.profile.connect_timeout,
+        label=STAGE,
+        failover=not getattr(args, "no_failover", False),
+    )
+    try:
+        async with pool:
+            result = await pool.map(
+                small_islands_to_review,
+                audit_island,
+                attempts=settings.attempts,
+                desc="Auditing & Connecting Islands",
+                key_fn=lambda comp: "|".join(sorted(comp)),
+                budget=budget,
+                debug=debug,
+                attempt_timeout=settings.profile.attempt_timeout,
+                on_result=record_verdict,
             )
+    finally:
+        log_f.close()
+        debug.close()
 
-            res_json = None
-            for attempt in range(10):
-                try:
-                    resp = await client.chat.completions.create(
-                        model=args.model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.1,
-                        max_tokens=400,
-                        response_format={"type": "json_object"}
-                    )
-                    raw = resp.choices[0].message.content.strip()
-                    res_json = json.loads(raw)
-                    break
-                except Exception:
-                    await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
+    # An island that never produced a verdict is a failure, exactly as before.
+    for failure in result.failures:
+        failed_components.append(small_islands_to_review[failure["index"]])
 
-            if res_json:
-                decision = str(res_json.get("decision", "KEEP")).strip().upper()
-                target_sib = res_json.get("target_sibling")
-                rel_ab = res_json.get("relation_to_sibling")
-                rel_ba = res_json.get("relation_from_sibling")
-
-                async with lock:
-                    log_entry = {
-                        "comp": comp,
-                        "decision": decision,
-                        "response": res_json
-                    }
-                    log_f.write(json.dumps(log_entry) + "\n")
-                    log_f.flush()
-
-                    if decision == "PRUNE":
-                        for t_lower in comp:
-                            prune_titles_set.add(t_lower)
-                    elif decision == "MERGE" and target_sib and target_sib.lower().strip() in title_map:
-                        merge_actions.append({
-                            "island_titles": comp,
-                            "target_sibling": target_sib
-                        })
-                    elif decision == "LINK" and target_sib and target_sib.lower().strip() in title_map:
-                        link_actions.append({
-                            "island_titles": comp,
-                            "target_sibling": target_sib,
-                            "rel_ab": rel_ab,
-                            "rel_ba": rel_ba
-                        })
-            else:
-                async with lock:
-                    failed_components.append(comp)
-
-            pbar.update(1)
-            queue.task_done()
-
-    tasks, http_clients = [], []
-    for url in args.servers:
-        hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=httpx.Timeout(60.0))
-        http_clients.append(hc)
-        client = AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0)
-        for _ in range(effective_concurrency):
-            tasks.append(asyncio.create_task(worker(client)))
-
-    await asyncio.gather(*tasks)
-    pbar.close()
-    log_f.close()
-    for hc in http_clients:
-        await hc.aclose()
+    print("Requests served per server:")
+    for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+        print(f"  {url:<40} {count}")
 
     if failed_components:
         raise RuntimeError(
@@ -359,12 +358,9 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: str, args):
     print(f"Updated Graph: {len(new_components)} islands total. Giant component: {new_giant}/{len(surviving_concepts)} ({new_giant/len(surviving_concepts)*100:.2f}%)")
 
 def main():
-    parser = argparse.ArgumentParser(description="Audit, connect, and prune small islands using sibling document context")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
+    parser = build_parser(
+        stage=STAGE,
+        description="Audit, connect, and prune small islands using sibling document context")
     parser.add_argument("--max_island_size", type=int, default=5, help="Maximum component size to evaluate")
 
     args = parser.parse_args()

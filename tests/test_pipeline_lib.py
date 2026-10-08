@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pipeline_lib.atomic_io import atomic_write_json, read_json
 from pipeline_lib.checkpoint import CheckpointLog, load_bool_log
+from pipeline_lib.cli import STAGE_PROFILES
 from pipeline_lib.errors import (PERMANENT, RECOVERABLE, TRANSIENT,
                                  PermanentFailure, StageBudget,
                                  StageBudgetExceeded, TransientFailureExhausted,
@@ -425,3 +426,52 @@ class VerificationReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StageProfileParityTests(unittest.TestCase):
+    """max_tokens must match what each stage historically requested.
+
+    Lowering a stage's max_tokens silently truncates its output and changes
+    graph quality, so the historical value is pinned here. Concurrency is a
+    recommendation and may be tuned; max_tokens is behaviour.
+    """
+
+    HISTORICAL_MAX_TOKENS = {
+        "pass1-extraction": 8192,      # concept_extraction_pass_1 --max_tokens
+        "pass2-refinement": 8192,      # concept_refinement_pass_2 --max_tokens
+        "document-consolidation": 8192,
+        "stub-resolution": 8192,
+        "verification": 4096,          # hardcoded in the original verifier
+        "verification-pass2": 4096,
+        "global-consolidation": 4096,
+        "final-macro-scan": 4096,      # hardcoded macro pass
+        "final-deep-verify": 1000,     # hardcoded deep-verify pass
+        "thin-concept-folding": 4096,
+        "brief-generation": 256,
+        "island-audit": 400,           # hardcoded
+        "reverse-relations": 256,      # hardcoded
+    }
+
+    def test_every_profile_matches_its_historical_max_tokens(self):
+        self.assertEqual(set(STAGE_PROFILES), set(self.HISTORICAL_MAX_TOKENS),
+                         "a stage profile was added or renamed without pinning "
+                         "its historical max_tokens")
+        for stage, expected in self.HISTORICAL_MAX_TOKENS.items():
+            self.assertEqual(STAGE_PROFILES[stage].max_tokens, expected,
+                             f"{stage}: max_tokens drifted from the historical value")
+
+    def test_every_profile_is_bounded_so_no_stage_can_idle_forever(self):
+        for stage, profile in STAGE_PROFILES.items():
+            self.assertGreater(profile.attempts, 0, stage)
+            self.assertLessEqual(profile.attempts, 8, f"{stage}: retry ladder too long")
+            self.assertGreater(profile.budget_minutes, 0, stage)
+            self.assertIsNotNone(profile.request_timeout, stage)
+            self.assertGreater(profile.attempt_timeout, profile.request_timeout,
+                               f"{stage}: attempt timeout must exceed request timeout")
+
+    def test_concurrency_scales_inversely_with_max_tokens(self):
+        """Big generations need fewer concurrent requests: KV is the constraint."""
+        heavy = [p for p in STAGE_PROFILES.values() if p.max_tokens >= 4096]
+        light = [p for p in STAGE_PROFILES.values() if p.max_tokens <= 1024]
+        self.assertLess(max(p.concurrency_per_server for p in heavy),
+                        min(p.concurrency_per_server for p in light))
