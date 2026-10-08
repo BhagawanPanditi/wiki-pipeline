@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
+import asyncio
+import hashlib
+import json
 import os
 import re
-import json
 import time
-import hashlib
-import asyncio
-import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
 from pydantic import BaseModel, Field, ValidationError
-from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer
 
-from pipeline_lib import atomic_write_json
+from pipeline_lib import (DebugLogger, PermanentFailure, ServerPool, StageBudget,
+                          atomic_write_json, build_parser, clean_json_string,
+                          load_bool_log, resolve_settings, save_log_async,
+                          save_log_sync)
 
-# ── Server & Concurrency Configuration ───────────────────────────────────────
-
-from pipeline_config import load_global_config
-from pipeline_lib import clean_json_string, load_bool_log, save_log_async, save_log_sync
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+STAGE = "pass1-extraction"
 
 # ── Pydantic Data Schemas for Extraction ──────────────────────────────────────
 
@@ -154,8 +150,6 @@ class WikiExtractorPipeline:
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        self.servers = args.servers
-        self.concurrency = args.concurrency_per_server
         self.extraction_log = load_bool_log(
             self.log_file,
             corrupt_message="Log file corrupted. Initializing fresh extraction log.")
@@ -288,11 +282,28 @@ class WikiExtractorPipeline:
         print(f"Cached {len(all_chunks)} chunks to disk.")
         return all_chunks
 
-    async def extract_chunk(
-            self, client: AsyncOpenAI, chunk_data: Dict[str, Any]
-        ) -> Tuple[Optional[ChunkExtractionSchema], List[Dict[str, Any]]]:
-            """Performs LLM call and validates response via Pydantic."""
-            user_prompt = f"""\
+    def _record_attempt(self, key: str, finish_reason, raw_text, error_type: str,
+                        error_message: str) -> None:
+        """Keep every attempt's full, untruncated evidence for debug.json."""
+        logs = self.attempt_errors.setdefault(key, [])
+        logs.append({
+            "attempt": len(logs) + 1,
+            "finish_reason": finish_reason,
+            "truncated": finish_reason == "length",
+            "error_type": error_type,
+            "error_message": error_message,
+            "raw_response": raw_text
+        })
+
+    async def extract_chunk(self, client, chunk_data: Dict[str, Any], server_index: int):
+        """Performs one LLM call and validates the response via Pydantic.
+
+        Raises on any unusable response so ServerPool can classify it and apply
+        the retry ladder. Token-limit truncation is still fail-fast: it is raised
+        as a permanent error and never retried.
+        """
+        key = f"{chunk_data['doc_id']}::{chunk_data['chunk_id']}"
+        user_prompt = f"""\
     CONTEXT BEFORE:
     {chunk_data['context_before']}
 
@@ -302,138 +313,107 @@ class WikiExtractorPipeline:
     CONTEXT AFTER:
     {chunk_data['context_after']}
     """
-            max_attempts = 4  # Reduced from 10
-            error_logs = []
+        raw_text = None
+        finish_reason = None
+        try:
+            response = await client.chat.completions.create(
+                model=self.settings.model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=self.settings.max_tokens,
+                response_format={"type": "json_object"}
+            )
 
-            for attempt in range(max_attempts):
-                raw_text = None
-                finish_reason = None
-                try:
-                    response = await client.chat.completions.create(
-                        model=self.args.model_name,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        temperature=0.1,
-                        max_tokens=self.args.max_tokens,
-                        response_format={"type": "json_object"}
-                    )
-                    
-                    choice = response.choices[0]
-                    finish_reason = choice.finish_reason
-                    raw_text = choice.message.content
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            raw_text = choice.message.content
 
-                    if finish_reason == "length":
-                        # FAIL FAST: Do not retry if we hit the token limit
-                        error_logs.append({
-                            "attempt": attempt + 1,
-                            "finish_reason": finish_reason,
-                            "truncated": True,
-                            "error_type": "TokenLimitExceeded",
-                            "error_message": "Response truncated: Hit max_tokens limit.",
-                            "raw_response": raw_text
-                        })
-                        return None, error_logs
+            if finish_reason == "length":
+                # FAIL FAST: Do not retry if we hit the token limit
+                self._record_attempt(key, finish_reason, raw_text, "TokenLimitExceeded",
+                                     "Response truncated: Hit max_tokens limit.")
+                raise PermanentFailure(
+                    f"{key}: response truncated, hit max_tokens limit",
+                    cause=ValueError("Response truncated: Hit max_tokens limit."))
 
-                    cleaned_json = clean_json_string(raw_text)
-                    parsed = ChunkExtractionSchema.model_validate_json(cleaned_json)
-                    return parsed, error_logs
+            cleaned_json = clean_json_string(raw_text)
+            return ChunkExtractionSchema.model_validate_json(cleaned_json)
 
-                except Exception as exc:
-                    error_info = {
-                        "attempt": attempt + 1,
-                        "finish_reason": finish_reason,
-                        "truncated": finish_reason == "length",
-                        "error_type": type(exc).__name__,
-                        "error_message": str(exc),
-                        "raw_response": raw_text
-                    }
-                    error_logs.append(error_info)
+        except PermanentFailure:
+            raise
+        except Exception as exc:
+            self._record_attempt(key, finish_reason, raw_text, type(exc).__name__, str(exc))
+            raise
 
-                    if attempt == max_attempts - 1:
-                        return None, error_logs
-                    
-                    # Cap the backoff sleep at 15 seconds max (1, 2, 4, 8)
-                    await asyncio.sleep(min(15, 2 ** attempt))
+    async def persist_extraction(self, chunk_data: Dict[str, Any],
+                                 extracted: ChunkExtractionSchema) -> None:
+        """SUCCESS: stream concepts.json to disk and advance the checkpoint."""
+        doc_id = chunk_data["doc_id"]
+        chunk_id = chunk_data["chunk_id"]
+        key = f"{doc_id}::{chunk_id}"
 
-            return None, error_logs
+        subfolder = self.staging_dir / doc_id / chunk_id
+        await asyncio.to_thread(subfolder.mkdir, parents=True, exist_ok=True)
 
-    async def worker_task(
-        self,
-        client: AsyncOpenAI,
-        queue: asyncio.Queue,
-        lock: asyncio.Lock,
-        pbar: tqdm,
-        flush_counter: dict
-    ):
-        """Worker task executing in parallel with batched atomic log updates."""
-        while True:
-            item = await queue.get()
-            if item is None:
-                queue.task_done()
-                break
+        concepts_file = subfolder / "concepts.json"
+        json_payload = extracted.model_dump_json(indent=2)
+        await asyncio.to_thread(concepts_file.write_text, json_payload, encoding="utf-8")
 
-            doc_id = item["doc_id"]
-            chunk_id = item["chunk_id"]
-            key = f"{doc_id}::{chunk_id}"
+        # Clean up any stale debug.json if it existed
+        debug_file = subfolder / "debug.json"
+        if debug_file.exists():
+            try:
+                debug_file.unlink()
+            except Exception:
+                pass
 
-            # Check execution state atomically
-            async with lock:
-                if self.extraction_log.get(key, False):
-                    queue.task_done()
-                    pbar.update(1)
-                    continue
-                self.extraction_log[key] = False
+        self.extraction_log[key] = True
+        self.flush_count += 1
+        if self.flush_count >= 50:
+            await save_log_async(self.log_file, self.extraction_log)
+            self.flush_count = 0
 
-            extracted, error_logs = await self.extract_chunk(client, item)
+    async def write_failure_debug(self, chunk_data: Dict[str, Any],
+                                  failure: Dict[str, Any]) -> None:
+        """FAILURE: save debug.json with every attempt, untruncated."""
+        doc_id = chunk_data["doc_id"]
+        chunk_id = chunk_data["chunk_id"]
+        key = f"{doc_id}::{chunk_id}"
 
-            subfolder = self.staging_dir / doc_id / chunk_id
-            subfolder.mkdir(parents=True, exist_ok=True)
+        subfolder = self.staging_dir / doc_id / chunk_id
+        await asyncio.to_thread(subfolder.mkdir, parents=True, exist_ok=True)
 
-            if extracted is not None:
-                # SUCCESS: Save concepts.json
-                concepts_file = subfolder / "concepts.json"
-                json_payload = extracted.model_dump_json(indent=2)
-                await asyncio.to_thread(concepts_file.write_text, json_payload, encoding="utf-8")
-
-                # Clean up any stale debug.json if it existed
-                debug_file = subfolder / "debug.json"
-                if debug_file.exists():
-                    try:
-                        debug_file.unlink()
-                    except Exception:
-                        pass
-
-                async with lock:
-                    self.extraction_log[key] = True
-                    flush_counter["count"] += 1
-
-                    if flush_counter["count"] >= 50:
-                        await save_log_async(self.log_file, self.extraction_log)
-                        flush_counter["count"] = 0
-            else:
-                # FAILURE: Save debug.json detailing truncation / errors
-                debug_file = subfolder / "debug.json"
-                debug_data = {
-                    "doc_id": doc_id,
-                    "chunk_id": chunk_id,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "total_attempts": len(error_logs),
-                    "chunk_metadata": {
-                        "context_before_chars": len(item.get("context_before", "")),
-                        "current_chunk_chars": len(item.get("current_chunk", "")),
-                        "context_after_chars": len(item.get("context_after", "")),
-                    },
-                    "attempts": error_logs
-                }
-                debug_payload = json.dumps(debug_data, indent=2)
-                await asyncio.to_thread(debug_file.write_text, debug_payload, encoding="utf-8")
-
-            pbar.update(1)
-            queue.task_done()
+        error_logs = self.attempt_errors.get(key, [])
+        debug_data = {
+            "doc_id": doc_id,
+            "chunk_id": chunk_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "total_attempts": len(error_logs),
+            "chunk_metadata": {
+                "context_before_chars": len(chunk_data.get("context_before", "")),
+                "current_chunk_chars": len(chunk_data.get("current_chunk", "")),
+                "context_after_chars": len(chunk_data.get("context_after", "")),
+            },
+            "attempts": error_logs,
+            "final_error": failure.get("error"),
+            "final_classification": failure.get("classification"),
+            "last_server": failure.get("server"),
+        }
+        debug_payload = json.dumps(debug_data, indent=2)
+        await asyncio.to_thread((subfolder / "debug.json").write_text,
+                                debug_payload, encoding="utf-8")
 
     async def run(self):
+        self.settings = resolve_settings(self.args, STAGE)
+        self.debug = DebugLogger(self.base_wiki_dir / "pass1_extraction_debug.jsonl",
+                                 label=STAGE)
+        self.budget = StageBudget(self.settings.budget_minutes)
+        self.attempt_errors: Dict[str, List[Dict[str, Any]]] = {}
+        self.flush_count = 0
+
         if self.args.resume:
             self.cleanup_incomplete_states()
 
@@ -441,64 +421,58 @@ class WikiExtractorPipeline:
         pending_chunks = [c for c in all_chunks if not self.chunk_is_complete(c)]
 
         total_pending = len(pending_chunks)
+        settings = self.settings
         print(f"Total chunks: {len(all_chunks)} | Pending chunks: {total_pending}")
-        print(f"Targeting {len(self.servers)} servers with {self.concurrency} concurrent workers each.")
-        print(f"Total Active Concurrency Limit: {len(self.servers) * self.concurrency} in flight.")
+        print(f"Spreading work across {len(settings.servers)} server(s) at "
+              f"{settings.concurrency_per_server} concurrent request(s) each "
+              f"(item i -> server i % N).")
+        print(f"Total Active Concurrency Limit: "
+              f"{len(settings.servers) * settings.concurrency_per_server} in flight.")
+        print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+              f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
 
         if not pending_chunks:
             print("All chunks are already processed!")
             return
 
-        queue = asyncio.Queue()
+        # Mark every pending chunk in-progress, as the old worker did under a lock,
+        # so --resume can purge anything left half-written.
         for chunk in pending_chunks:
-            await queue.put(chunk)
+            key = f"{chunk['doc_id']}::{chunk['chunk_id']}"
+            self.extraction_log.setdefault(key, False)
 
-        total_workers = len(self.servers) * self.concurrency
-        for _ in range(total_workers):
-            await queue.put(None)
-
-        lock = asyncio.Lock()
-        flush_counter = {"count": 0}
-        pbar = tqdm(total=total_pending, desc=f"Extracting [{self.domain}]")
-
-        tasks = []
-        http_clients = []
-        openai_clients = []
-
-        for server_url in self.servers:
-            http_client = httpx.AsyncClient(
-                limits=httpx.Limits(
-                    max_connections=self.concurrency + 20,
-                    max_keepalive_connections=self.concurrency
-                ),
-                timeout=httpx.Timeout(300.0, connect=30.0)
-            )
-            http_clients.append(http_client)
-
-            client = AsyncOpenAI(
-                base_url=server_url,
-                api_key="EMPTY",
-                http_client=http_client,
-                max_retries=0
-            )
-            openai_clients.append(client)
-
-        # Interleave worker creation round-robin so requests are uniformly distributed across all servers
-        for worker_idx in range(self.concurrency):
-            for client in openai_clients:
-                task = asyncio.create_task(
-                    self.worker_task(client, queue, lock, pbar, flush_counter)
-                )
-                tasks.append(task)
-
+        pool = ServerPool(
+            settings.servers,
+            concurrency_per_server=settings.concurrency_per_server,
+            request_timeout=settings.profile.request_timeout,
+            connect_timeout=settings.profile.connect_timeout,
+            max_connections_slack=20,
+            label=STAGE,
+            failover=not getattr(self.args, "no_failover", False),
+        )
         try:
-            await asyncio.gather(*tasks)
+            async with pool:
+                result = await pool.map(
+                    pending_chunks,
+                    self.extract_chunk,
+                    attempts=settings.attempts,
+                    desc=f"Extracting [{self.domain}]",
+                    key_fn=lambda c: f"{c['doc_id']}::{c['chunk_id']}",
+                    budget=self.budget,
+                    debug=self.debug,
+                    attempt_timeout=settings.profile.attempt_timeout,
+                    on_result=self.persist_extraction,
+                )
         finally:
             await save_log_async(self.log_file, self.extraction_log)
-            pbar.close()
+            self.debug.close()
 
-            for http_client in http_clients:
-                await http_client.aclose()
+        for failure in result.failures:
+            await self.write_failure_debug(pending_chunks[failure["index"]], failure)
+
+        print("Requests served per server:")
+        for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+            print(f"  {url:<40} {count}")
 
         failed_chunks = [c for c in all_chunks if not self.chunk_is_complete(c)]
         if failed_chunks:
@@ -513,16 +487,11 @@ class WikiExtractorPipeline:
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="High-Throughput Concept Extractor for BRIGHT Wiki Benchmark")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology, earth_science)")
-    parser.add_argument("--data_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/data/long_documents")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model_name", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
-    parser.add_argument("--max_tokens", type=int, default=8192, help="Max generation length for LLM responses.")
-    parser.add_argument("--resume", action="store_true", help="Purge incomplete extractions and resume processing.")
-
+    parser = build_parser(
+        stage=STAGE,
+        description="High-Throughput Concept Extractor for BRIGHT Wiki Benchmark",
+        include_data_dir=True,
+        include_resume=True)
     args = parser.parse_args()
     pipeline = WikiExtractorPipeline(args)
     asyncio.run(pipeline.run())

@@ -1,139 +1,352 @@
 # Wiki Knowledge Graph Pipeline
 
-This repository builds an LLM-powered knowledge graph from technical and biological documents.
+Builds a canonical concept knowledge graph from long technical documents using a
+pool of local vLLM servers. **The pipeline is LLM-only** — the former embedding
+stage (`embed_and_bridge_islands.py`, `run_embedding.sbatch`) has been removed
+entirely, so there is no vector cache, no second GPU allocation and no
+`--skip-embed` flag. Islands are now bridged by the entity-overlap linker and the
+bidirectional relation synthesizer instead.
 
-The pipeline processes documents from raw chunks into canonical concepts, merges aliases and near-duplicates, resolves stubs, and builds a connected concept graph with bi-directional links and inline chunk citations.
+Every stage:
 
----
-
-## Staged Execution Workflow (Handling vLLM & GPU Slurm Allocations)
-
-Since you have 3 Slurm jobs (2x A40 GPUs each) for vLLM, and need to reallocate GPUs for Qwen Embedding, the pipeline is partitioned into **Two Stages**:
-
-```
-[3 vLLM Servers Active]
-      │
-      ▼
-STAGE 1: ./run_stage1_pre_embed.sh biology
-   1. global_concept_consolidation.py   (Exact lemmatization, boilerplate scrub, LLM fuzzy merge)
-   2. stub_resolution.py                (Synthesize major stubs, repoint minor stubs)
-   3. thin_concept_handler.py           (Fold thin sub-concepts < 30 words)
-   4. add_concept_briefs.py             (Generate 2-3 sentence factual briefs)
-   5. link_entity_overlap.py            (Connect islands sharing named entities)
-      │
-      ▼
-[Pause: Kill 1 vLLM job -> Submit run_embedding.sbatch]
-   6. embed_and_bridge_islands.py       (QwenEmbedding-8B dense cosine similarity bridging)
-      │
-      ▼
-[Resume: Restart vLLM server -> 3 vLLM Servers Active]
-      │
-      ▼
-STAGE 2: ./run_stage2_post_embed.sh biology
-   7. synthesize_bidirectional_relations.py (Extract back-link descriptions B -> A)
-   8. export_markdown_wiki.py           (Export concepts/*.md with frontmatter, [[slug|Title]], citations)
-   9. analyze_islands.py                (Final topological island & giant component audit)
-```
+- streams its results and progress as it goes,
+- writes untruncated debug/error evidence for every failed attempt,
+- can be resumed from its checkpoint,
+- spreads work **evenly** across however many servers you hand it,
+- and stops on a bounded retry ladder plus a wall-clock budget, so a stage can
+  never idle indefinitely in backoff.
 
 ---
 
-## Detailed Step-by-Step Breakdown
+## Serving the models
 
-### 1. `global_concept_consolidation.py`
-- Reuses all raw concepts already extracted in Pass 1 / Pass 2.
-- **Title Lemmatization & Normalization**: Strips plural suffixes (`hallucination` vs `hallucinations`) and hyphenation splits (`hand washing` vs `handwashing`).
-- **Scraping & Boilerplate Filter**: Automatically detects and drops paper meta-headers (`Study Participants`, `Statistical Methods`, cookie notices).
-- **Paragraph Citation Mapping**: Uses chunk provenance internally, while exported description paragraphs end with document-level citations such as `[canon_doc01]` (never a `::chunk_...` suffix).
+Canonical single-node configuration (2× A40, tensor parallel):
 
-### 2. `stub_resolution.py`
-- Major stubs (> 2 source chunks) are synthesized into full concepts.
-- Minor stubs ($\le 2$ chunks) are absorbed into parent descriptions, and **outbound relations are repointed** rather than deleted, preserving graph edges.
+```bash
+vllm serve Qwen/Qwen3.8-27B \
+  --tensor-parallel-size 2 \
+  --max-model-len 32768 \
+  --enable-prefix-caching \
+  --generation-config vllm \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml \
+  --language-model-only \
+  --host 0.0.0.0 --port 8000
+```
 
-### 3. `thin_concept_handler.py`
-- Folds thin concepts (< 30 words) into candidate host concepts via LLM validation.
+Slurm submission:
 
-### 4. `add_concept_briefs.py`
-- Generates a 2-3 sentence (40–60 word) factual `brief` for each concept.
-- Strips internal document/chunk IDs from briefs and flattens them to a single line.
+```bash
+sbatch -J vllm_qwen -p a40 --qos=a40 --nodes=1 -x cn22-a40 \
+  --gres=gpu:2 --ntasks-per-node=1 --cpus-per-task=16 \
+  --mem=128G --time=24:00:00 --output=logs/vllm_qwen_%j.log
+```
 
-### 5. `link_entity_overlap.py`
-- Discovers latent edges between concepts sharing common named entities (genes, tools, pathways, proteins).
+Environment for the serving job:
 
-### 6. `embed_and_bridge_islands.py`
-- Uses `qwen-embed` (`Alibaba-NLP/gte-Qwen2-7B-instruct` or `Qwen2-Embedding-8B`) to compute cosine similarity across low-degree nodes and bridge isolated islands into the mainland.
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+export TOKENIZERS_PARALLELISM=false
+export VLLM_USE_MODELSCOPE=false
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+```
 
-### 7. `synthesize_bidirectional_relations.py`
-- Turns all directed edges into **bidirectional relationships**.
-- Uses an LLM with Concept A's brief, Concept B's brief, and the forward relation to generate a 1-sentence description for the reverse relation.
+Check every endpoint before a run:
 
-### 8. `export_markdown_wiki.py`
-- Generates clean Markdown files in `concepts_md/<sluggified_title>.md`.
-- **Frontmatter**: `brief` is a single-line summary without internal provenance IDs; `sources` contains document-level IDs.
-  ```yaml
-  ---
-  title: "Closed-Eye Hallucination"
-  aliases:
-    - "Closed-eye hallucinations"
-  brief: "Closed-eye hallucination is an entoptic visual phenomenon..."
-  entities:
-    - "Phosphenes"
-    - "Visual cortex"
-  sources:
-    - "canon_doc01"
-  ---
-  ```
-- **Body**: Every paragraph carries document-level citations. Chunk suffixes are removed, and paragraphs missing an inline citation use the concept's known source documents:
-  ```markdown
-  Closed-eye hallucination is a visual perception phenomenon occurring when the eyes are closed... [canon_doc01]
-  ```
-- **# Related Section**:
-  ```markdown
-  # Related
-  - [[phosphene|Phosphene]] - Entoptic light patterns caused by mechanical stimulation or spontaneous retinal neuron firing.
-  ```
-
-### 9. `analyze_islands.py`
-- Analyzes weakly connected components, giant component percentage, and reports small isolated islands.
+```bash
+python3 check_servers.py
+```
 
 ---
 
-## Unattended Runs, Resume, and Skipping Embeddings
-
-For a single end-to-end run with embedding bridging disabled:
+## Running
 
 ```bash
-./run_entire_pipeline.sh biology --skip-embed --max-stage-attempts 5
+# whole pipeline
+./run_entire_pipeline.sh biology
+
+# the two halves, if you release the GPU allocation in between
+./run_stage1_graph_build.sh biology      # extraction -> entity overlap
+./run_stage2_graph_finalize.sh biology   # noise audit -> islands report
 ```
 
-The runner checkpoints each stage under `<wiki-base>/<domain>/.pipeline_state/` and writes a separate log for each stage under `pipeline_logs/`. If interrupted or if a stage exhausts its retries, restart with:
+Useful flags (all three scripts):
 
-```bash
-./run_entire_pipeline.sh biology --resume --skip-embed --max-stage-attempts 5
+| Flag | Meaning |
+| --- | --- |
+| `--resume` | Keep completed work, clear incomplete marks, continue. |
+| `--skip-extraction` | Start from existing `consolidated/canon_*/concepts.json`. Exits 2 if those inputs are missing or empty. |
+| `--servers URL [URL ...]` | Override the server list for this run. |
+| `--max-stage-attempts N` | Shell-level retries for a whole stage. |
+| `--max_attempts N` | Per-item LLM retries inside a stage. |
+| `--stage_budget_minutes M` | Wall-clock ceiling per stage. |
+| `--retry-forever` | Keep retrying a stage (ignores `--max-stage-attempts`). |
+
+### Stage order
+
+```
+preflight → pass1-extraction → verification → pass2-refinement
+          → verification-pass2 → document-consolidation → global-consolidation
+          → stub-resolution → thin-concept-folding → brief-generation
+          → entity-overlap → noise-audit → bidirectional-relations
+          → final-consolidation → final-analysis
 ```
 
-Completed stages with their expected outputs are skipped; the failed/incomplete stage is retried. Rerunning an upstream stage invalidates downstream completion markers, including those used by the separate stage wrappers and embedding job. Use `--retry-forever` only when you want the process to wait through outages indefinitely. It can also repeat permanent input/configuration failures, so the default bounded retries are safer for unattended jobs. Use `--fresh` to rerun the orchestration stages while preserving generated data, logs, and per-chunk extraction checkpoints; it resets only pipeline completion markers. `--skip-extraction` is accepted only when prior extraction and document consolidation produced valid, non-empty concept lists in `consolidated/canon_*/concepts.json`.
+Rerunning any stage invalidates the checkpoint markers of every stage after it,
+so a resumed run rebuilds downstream artifacts instead of trusting stale ones.
 
-`--skip-embed` skips only embedding-based semantic island bridging. The rest of the graph pipeline still runs, but the graph may have fewer semantic bridge links. Embedding is optional, not required for export.
+---
 
-Retries cannot guarantee completion if servers, GPUs, storage, or input data remain unavailable or invalid. After the configured attempts, the runner exits non-zero, preserves checkpoints/logs, and can be resumed after fixing the cause.
+## Two verification scores, and the improvement between them
 
-## How to Cache Previous Stages & Run Anew
+`verify_concept_extraction.py` runs **twice**:
 
-To preserve your previous run's output before running the updated pipeline:
+| Phase | Scores | Writes |
+| --- | --- | --- |
+| `--phase 1` | Pass 1's raw extraction | `staging/<doc>/<chunk>/verification.json`, `verification_log.json` |
+| `--phase 2` | Pass 2's refined output, same chunks | `verification_pass2.json`, `verification_pass2_log.json` |
+
+Phase 1 runs *before* Pass 2 because Pass 2 consumes its
+`audit_feedback.missing_concepts`. Phase 2 runs *after* Pass 2 has merged its
+repairs into `concepts.json` (Pass 1's output is preserved alongside as
+`concepts_pass1_backup.json`), so the two scores are directly comparable.
+
+Both runs plus the deltas are written to `<wiki>/<domain>/verification_summary.json`,
+and phase 2 prints:
+
+```
+============================================================
+VERIFICATION SUMMARY REPORT [ROBOTICS] - PASS 1 (raw extraction)
+============================================================
+Total Chunks Verified : 128
+Average Coverage Score: 0.812 / 1.000
+Pass Rate (Sufficient): 61.7% (79/128)
+Total Missed Concepts : 214
+Total Missed Facts    : 96
+
+============================================================
+VERIFICATION SUMMARY REPORT [ROBOTICS] - PASS 2 (after refinement)
+============================================================
+Total Chunks Verified : 128
+Average Coverage Score: 0.947 / 1.000
+Pass Rate (Sufficient): 92.2% (118/128)
+Total Missed Concepts : 41
+Total Missed Facts    : 12
+
+============================================================
+VERIFICATION IMPROVEMENT [ROBOTICS]  PASS 1 -> PASS 2
+============================================================
+Chunks Compared       : 128
+Metric                    Before     After         Delta
+------------------------------------------------------------
+Average Coverage           0.812     0.947        +0.135
+Pass Rate (%)               61.7      92.2        +30.5p
+Sufficient Chunks             79       118           +39
+Missed Concepts              214        41       -173 -80.8%
+Missed Facts                  96        12        -84 -87.5%
+============================================================
+```
+
+---
+
+## Concurrency per stage
+
+Sustainable fan-out is set by KV cache, not by CPU. On 2× A40 (96 GB) with
+tensor parallel 2, a 27B model in BF16 leaves roughly 32 GB for KV — about
+130k tokens. Each in-flight request reserves `prompt + max_tokens`, so **the
+larger a stage's `max_tokens`, the fewer concurrent requests it can sustain**.
+The old global `concurrency_per_server = 50` was roughly 6× too high for the
+8192-token extraction stages: vLLM queues rather than crashing, but KV
+preemption and recompute lower throughput and start tripping request timeouts.
+
+Defaults in `pipeline_lib/cli.py`:
+
+| Stage | Concurrency / server | `max_tokens` | Request timeout |
+| --- | --- | --- | --- |
+| `pass1-extraction` | 8 | 8192 | 300 s |
+| `pass2-refinement` | 8 | 8192 | 300 s |
+| `document-consolidation` | 6 | 8192 | 300 s |
+| `verification` / `verification-pass2` | 12 | 4096 | 450 s |
+| `global-consolidation` | 16 | 4096 | 300 s |
+| `final-macro-scan` | 12 | 4096 | 300 s |
+| `stub-resolution` | 10 | 8192 | 45 s |
+| `thin-concept-folding` | 24 | 1024 | 45 s |
+| `final-deep-verify` | 24 | 1000 | 60 s |
+| `island-audit` | 32 | 400 | 60 s |
+| `brief-generation` | 40 | 256 | 40 s |
+| `reverse-relations` | 48 | 256 | 60 s |
+
+Calibrate against your own allocation: vLLM prints
+`GPU KV cache size: N tokens` and
+`Maximum concurrency for 32,768 tokens per request: X.XXx` at startup. Divide
+that KV budget by your stage's `max_tokens` plus a typical prompt length.
+
+Override without editing code — `config.json`:
+
+```json
+{
+  "servers": ["http://cn27-a40:8000/v1", "http://cn30-a40:8001/v1"],
+  "concurrency_per_server": 50,
+  "model_name": "Qwen/Qwen3.8-27B",
+  "stage_concurrency": {
+    "pass1-extraction": 8,
+    "brief-generation": 40
+  }
+}
+```
+
+Precedence is **CLI flag → `config.json` → stage profile**. Pass
+`--concurrency_per_server 0` to fall back to the stage default. `config.json` is
+gitignored.
+
+### How work is spread
+
+Item *i* goes to server *i mod N*, each server has its own queue and
+`concurrency_per_server` workers, so 5 remaining items over 5 servers means one
+item each — never five on the first server. If a server stops answering, its
+queued items are re-dispatched to a healthy one (disable with `--no_failover`).
+Every stage prints the requests each server actually served:
+
+```
+Requests served per server:
+  http://cn27-a40:8000/v1                  43
+  http://cn30-a40:8001/v1                  43
+  http://cn31-a40:8002/v1                  42
+```
+
+You can change the server count between runs; nothing is pinned.
+
+---
+
+## Failure handling
+
+Errors are classified, and the classification decides the response:
+
+| Class | Examples | Behaviour |
+| --- | --- | --- |
+| **Transient** | connection reset, 429, 5xx, timeout | retry, backoff 2 s → 20 s |
+| **Recoverable** | empty completion, unparseable JSON, schema validation | retry, backoff 0.5 s → 4 s |
+| **Permanent** | 400/404, token-limit truncation, control errors | fail immediately, no retry |
+
+Backoff carries ±20 % jitter. By default each item gets **4 attempts** and each
+stage a **45-minute wall-clock budget**. When the budget expires the stage stops
+with `StageBudgetExceeded`, leaves its checkpoint intact, and you rerun with
+`--resume`. Backoff sleeps are capped by the remaining budget, so a stage can
+never sit idle waiting.
+
+Debug evidence is never truncated:
+
+- `<domain>/<stage>_debug.jsonl` — one line per failed attempt, with the full raw
+  response, prompt length, server, classification and attempt number.
+- `staging/<doc>/<chunk>/debug.json` — Pass 1's per-chunk record, including every
+  attempt's raw response and the final classification.
+
+---
+
+## Resume
+
+Every LLM stage keeps a completion log and can be resumed:
+
+| Stage | Checkpoint |
+| --- | --- |
+| Pass 1 | `extraction_log.json` |
+| Verification | `verification_log.json`, `verification_pass2_log.json` |
+| Pass 2 | `pass2_log.json` |
+| Document consolidation | `consolidation_log.json` |
+
+`--resume` clears *incomplete* marks (and their partial outputs) so they are
+retried, while completed items are skipped. A chunk is only trusted as complete
+when its log entry is set **and** its output file still parses — a marker whose
+artifact went missing is redone. The shell wrappers honour `--resume` too, and
+rerunning a stage invalidates the markers of every stage downstream of it.
+
+---
+
+## Repository layout
+
+```
+run_entire_pipeline.sh          full pipeline driver
+run_stage1_graph_build.sh       extraction -> entity overlap
+run_stage2_graph_finalize.sh    noise audit -> islands report
+pipeline_shell_utils.sh         shared shell retry/marker helpers
+run_push.sh                     rsync code to Prajna
+check_servers.py                endpoint preflight
+
+concept_extraction_pass_1.py    chunk + extract concepts
+verify_concept_extraction.py    audit extraction (runs twice, --phase 1|2)
+concept_refinement_pass_2.py    repair concepts using verification feedback
+doc_concept_consolidation.py    per-document merge
+global_concept_consolidation.py cross-document canonicalisation
+stub_resolution.py              resolve stub concepts
+thin_concept_handler.py         fold near-empty concepts
+add_concept_briefs.py           2-3 sentence briefs
+link_entity_overlap.py          bridge islands via shared entities
+audit_noise_islands.py          flag low-signal islands
+synthesize_bidirectional_relations.py  reverse-relation text
+final_consolidate_and_link.py   final merge + link
+export_markdown_wiki.py         concepts_md/ output
+analyze_islands.py              islands_report.json
+
+pipeline_lib/                   shared machinery (see below)
+pipeline_config.py              config.json loader + defaults
+tests/                          52 tests
+```
+
+### `pipeline_lib/`
+
+| Module | Provides |
+| --- | --- |
+| `errors.py` | error classification, `StageBudget`, control exceptions |
+| `json_repair.py` | `clean_json_string` — all five historical fence/bare-object/array variants behind two flags |
+| `atomic_io.py` | `atomic_write_json` / `atomic_write_text` / `read_json` (temp file + `os.replace` + dir fsync) |
+| `checkpoint.py` | `load_bool_log`, `load_json_log`, `save_log_sync/async`, `CheckpointLog` |
+| `chunks.py` | `load_cached_chunks` |
+| `debug_log.py` | `DebugLogger` — untruncated JSONL error evidence |
+| `retry.py` | `backoff_delay`, `retry_async` |
+| `llm_pool.py` | `ServerPool` — per-server queues, even spread, failover, streaming |
+| `cli.py` | `STAGE_PROFILES`, `build_parser`, `resolve_settings` |
+| `reporting.py` | verification metrics, both report blocks, improvement math |
+| `citation_utils.py` | citation stripping helpers |
+
+Stage scripts stay at the repository root with their original filenames and
+original command lines (plus the new shared flags), so `run_push.sh` and any
+existing `sbatch` invocations keep working unchanged.
+
+---
+
+## Tests
+
 ```bash
-# 1. On Prajna, backup your current domain directory
-cd /home/compiling-ganesh/24m0829/long_document/wiki
-cp -r biology biology_backup_run1
+python3 -m unittest discover -s tests -t .
+```
+
+52 tests, no GPU required. `tests/fake_vllm.py` serves a real OpenAI-compatible
+HTTP endpoint on localhost, so pooling, even spreading, retries, truncation
+fail-fast, resume and both verification phases are exercised end to end.
+`transformers` and `nltk` are cluster-only dependencies; the Pass 1 tests stub
+the tokenizer.
+
+---
+
+## Caching previous stages
+
+```bash
+# 1. On Prajna, back up the domain directory
+cp -r /home/compiling-ganesh/24m0829/long_document/wiki/biology \
+      /home/compiling-ganesh/24m0829/long_document/wiki/biology.bak
 
 # 2. Push updated pipeline code from your local machine
 ./run_push.sh
 
-# 3. Run Stage 1 (Pre-embedding)
-./run_stage1_pre_embed.sh biology
+# 3. Run Stage 1 (graph build)
+./run_stage1_graph_build.sh biology
 
-# 4. Submit embedding job (qwen-embed)
-sbatch run_embedding.sbatch
-
-# 5. After embedding completes, run Stage 2 (Bidirectional relations & Markdown export)
-./run_stage2_post_embed.sh biology
+# 4. Run Stage 2 (finalize) once Stage 1 has finished
+./run_stage2_graph_finalize.sh biology
 ```
+
+The Pass 1 chunk cache is bound to a manifest of
+`sha256(source) + tokenizer + chunk_size 4500 + overlap 400`. Changing the input
+document, the tokenizer or the chunking parameters invalidates the cache and
+forces re-chunking.

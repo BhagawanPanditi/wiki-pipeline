@@ -8,25 +8,19 @@ Concept Brief Generator Pass
 4. Updates `global_concepts_refined.json` and all individual concept files in `concepts/`.
 """
 
-import re
-import json
 import asyncio
-import argparse
+import json
+import re
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List
 
-import httpx
 from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
-from tqdm.asyncio import tqdm
 
+from pipeline_lib import (DebugLogger, ServerPool, StageBudget, atomic_write_json,
+                          build_parser, clean_json_string, resolve_settings)
 from pipeline_lib.citation_utils import clean_brief_text
-from pipeline_lib import atomic_write_json
 
-# ── Server Configuration ─────────────────────────────────────────────────────
-from pipeline_config import load_global_config
-from pipeline_lib import clean_json_string
-DEFAULT_SERVERS, DEFAULT_CONCURRENCY_PER_SERVER, GLOBAL_MODEL = load_global_config()
+STAGE = "brief-generation"
 
 # ── Data Schema ──────────────────────────────────────────────────────────────
 class ConceptBriefSchema(BaseModel):
@@ -65,53 +59,42 @@ def get_sentence_fallback(text: str, max_sentences: int = 2) -> str:
     return " ".join(sentences[:max_sentences])
 
 # ── LLM Async Worker ─────────────────────────────────────────────────────────
-async def generate_brief_llm(
-    client: AsyncOpenAI, 
-    title: str, 
-    description: str, 
-    model_name: str, 
-    max_tokens: int
-) -> str:
+async def generate_brief_llm(client, concept, settings) -> str:
+    """One brief. Raises on any unusable response so the pool can classify and
+    retry it; the caller falls back to a truncated description if retries run
+    out, which is why this stage never aborts a run."""
+    title = concept.get("title", "")
+    description = concept.get("description", "")
     user_prompt = f"CONCEPT TITLE: {title}\n\nFULL DESCRIPTION:\n{description}"
-    
-    for attempt in range(10):
-        try:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT_BRIEF},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.1,
-                    max_tokens=max_tokens,
-                    response_format={"type": "json_object"}
-                ),
-                timeout=45.0  # 45s timeout per call
-            )
-            raw = response.choices[0].message.content
-            parsed = ConceptBriefSchema.model_validate_json(clean_json_string(raw))
-            cleaned_brief = clean_brief_text(parsed.brief)
-            if len(cleaned_brief) > 10:
-                return cleaned_brief
-        except Exception:
-            if attempt == 9:
-                return clean_brief_text(get_sentence_fallback(description, max_sentences=2))
-            await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
 
-    return clean_brief_text(get_sentence_fallback(description, max_sentences=2))
+    response = await client.chat.completions.create(
+        model=settings.model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_BRIEF},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.1,
+        max_tokens=settings.max_tokens,
+        response_format={"type": "json_object"}
+    )
+    raw = response.choices[0].message.content
+    parsed = ConceptBriefSchema.model_validate_json(clean_json_string(raw))
+    cleaned_brief = clean_brief_text(parsed.brief)
+    if len(cleaned_brief) <= 10:
+        raise ValueError(f"brief too short ({len(cleaned_brief)} chars) for '{title}'")
+    return cleaned_brief
 
 # ── Main Pipeline ────────────────────────────────────────────────────────────
 class ConceptBriefPipeline:
     def __init__(self, args):
+        self.args = args
+        self.settings = resolve_settings(args, STAGE)
         self.domain_dir = Path(args.wiki_base_dir) / args.domain
         self.refined_file = self.domain_dir / "global_concepts_refined.json"
         self.concepts_dir = self.domain_dir / "concepts"
-        
-        self.model_name = args.model
-        self.max_tokens = args.max_tokens
-        self.servers = args.servers
-        self.concurrency = args.concurrency_per_server
+        self.debug = DebugLogger(self.domain_dir / "brief_generation_debug.jsonl",
+                                 label=STAGE)
+        self.budget = StageBudget(self.settings.budget_minutes)
 
         self.concepts: List[Dict[str, Any]] = []
 
@@ -146,50 +129,60 @@ class ConceptBriefPipeline:
         print(f"Directly set brief for {already_briefed} short descriptions.")
         print(f"Queued {len(tasks_to_generate)} long concept descriptions for LLM brief synthesis.")
 
-        if tasks_to_generate and self.servers:
-            queue = asyncio.Queue()
-            for c in tasks_to_generate:
-                await queue.put(c)
+        if tasks_to_generate and self.settings.servers:
+            settings = self.settings
+            print(f"Spreading {len(tasks_to_generate)} brief(s) across "
+                  f"{len(settings.servers)} server(s) at "
+                  f"{settings.concurrency_per_server} concurrent request(s) each "
+                  f"(item i -> server i % N).")
+            print(f"Per-item attempts: {settings.attempts} | Stage budget: "
+                  f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
 
-            effective_concurrency = min(self.concurrency, 20)
-            total_workers = len(self.servers) * effective_concurrency
-            for _ in range(total_workers):
-                await queue.put(None)
+            async def handler(client, concept, server_index):
+                return await generate_brief_llm(client, concept, settings)
 
-            pbar = tqdm(total=len(tasks_to_generate), desc="Synthesizing Concept Briefs")
+            async def apply_brief(concept, brief_text):
+                concept["brief"] = brief_text
 
-            async def worker(client: AsyncOpenAI):
-                while True:
-                    concept = await queue.get()
-                    if concept is None:
-                        queue.task_done()
-                        break
-
-                    title = concept.get("title", "")
-                    desc = concept.get("description", "")
-                    brief_text = await generate_brief_llm(client, title, desc, self.model_name, self.max_tokens)
-                    concept["brief"] = brief_text
-
-                    pbar.update(1)
-                    queue.task_done()
-
-            tasks, http_clients = [], []
-            for server_url in self.servers:
-                hc = httpx.AsyncClient(
-                    limits=httpx.Limits(max_connections=effective_concurrency + 10),
-                    timeout=httpx.Timeout(40.0)
-                )
-                http_clients.append(hc)
-                client = AsyncOpenAI(base_url=server_url, api_key="EMPTY", http_client=hc, max_retries=0)
-                for _ in range(effective_concurrency):
-                    tasks.append(asyncio.create_task(worker(client)))
-
+            pool = ServerPool(
+                settings.servers,
+                concurrency_per_server=settings.concurrency_per_server,
+                request_timeout=settings.profile.request_timeout,
+                connect_timeout=settings.profile.connect_timeout,
+                label=STAGE,
+                failover=not getattr(self.args, "no_failover", False),
+            )
             try:
-                await asyncio.gather(*tasks)
+                async with pool:
+                    result = await pool.map(
+                        tasks_to_generate,
+                        handler,
+                        attempts=settings.attempts,
+                        desc="Synthesizing Concept Briefs",
+                        key_fn=lambda c: c.get("title", ""),
+                        budget=self.budget,
+                        debug=self.debug,
+                        attempt_timeout=settings.profile.attempt_timeout,
+                        on_result=apply_brief,
+                    )
             finally:
-                pbar.close()
-                for hc in http_clients:
-                    await hc.aclose()
+                self.debug.close()
+
+            # This stage has never aborted a run over a missing brief: anything
+            # that exhausted its retries falls back to the first two sentences of
+            # the description, exactly as before.
+            fallbacks = 0
+            for failure in result.failures:
+                concept = tasks_to_generate[failure["index"]]
+                concept["brief"] = clean_brief_text(
+                    get_sentence_fallback(concept.get("description", ""), max_sentences=2))
+                fallbacks += 1
+            if fallbacks:
+                print(f"\u26a0\ufe0f  {fallbacks} brief(s) fell back to a truncated description.")
+
+            print("Requests served per server:")
+            for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+                print(f"  {url:<40} {count}")
 
         # Reorder JSON fields so "brief" appears right after "title" and "aliases"
         reordered_concepts = []
@@ -227,8 +220,7 @@ class ConceptBriefPipeline:
                 file_path = self.concepts_dir / f"{safe_name}_{counter}.json"
                 counter += 1
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(gc, f, indent=2)
+            atomic_write_json(file_path, gc)
 
         print(f"\n==================================================")
         print(f"CONCEPT BRIEF GENERATION COMPLETE")
@@ -240,14 +232,9 @@ class ConceptBriefPipeline:
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Generate 2-3 sentence briefs for knowledge graph concepts")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--model", type=str, default=GLOBAL_MODEL)
-    parser.add_argument("--max_tokens", type=int, default=256)
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS)
-    parser.add_argument("--concurrency_per_server", type=int, default=DEFAULT_CONCURRENCY_PER_SERVER)
-
+    parser = build_parser(
+        stage=STAGE,
+        description="Generate 2-3 sentence briefs for knowledge graph concepts")
     args = parser.parse_args()
     pipeline = ConceptBriefPipeline(args)
     asyncio.run(pipeline.run())

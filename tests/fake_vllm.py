@@ -75,7 +75,13 @@ class _Handler(BaseHTTPRequestHandler):
             state["prompts"].append(prompt)
 
         answer = state["responder"](prompt, count)
-        if isinstance(answer, str):
+        # A responder may return: a dict (serialised as JSON), a str (raw text),
+        # or a (content, finish_reason) tuple to simulate truncation.
+        if isinstance(answer, tuple):
+            content, finish = answer
+            if not isinstance(content, str):
+                content = json.dumps(content)
+        elif isinstance(answer, str):
             content, finish = answer, "stop"
         else:
             content, finish = json.dumps(answer), "stop"

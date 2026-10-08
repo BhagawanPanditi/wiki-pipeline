@@ -127,5 +127,79 @@ class ReverseRelationsTests(unittest.TestCase):
             self.assertNotIn("Traceback", out.stderr)
 
 
+class ConceptBriefTests(unittest.TestCase):
+    """add_concept_briefs.py"""
+
+    SCRIPT = "add_concept_briefs.py"
+    LONG_DESC = ("The mechanism operates across three distinct phases. "
+                 "Each phase contributes a measurable throughput gain of 12 percent. "
+                 "Observed latency dropped from 84 ms to 61 ms under load. "
+                 + "Padding words to push the description well past forty words. " * 3)
+
+    def _build(self, root: Path, count=7):
+        domain_dir = root / "wiki" / "biology"
+        (domain_dir / "concepts").mkdir(parents=True, exist_ok=True)
+        concepts = [{"title": f"Concept {i}", "aliases": [], "description": self.LONG_DESC,
+                     "entities": ["e1"], "source_chunks": ["c1"], "outbound_relations": []}
+                    for i in range(count)]
+        (domain_dir / "global_concepts_refined.json").write_text(
+            json.dumps({"concepts": concepts}), encoding="utf-8")
+        return domain_dir
+
+    def test_briefs_generated_and_spread_evenly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            domain_dir = self._build(root)
+            responder = lambda p, i: {"brief": "Dense two sentence brief with 42 mg metric."}
+            with FakeVLLMCluster(3, responder=responder) as cluster:
+                out = run_stage(self.SCRIPT, [
+                    "--domain", "biology", "--wiki_base_dir", str(root / "wiki"),
+                    "--servers", *cluster.urls, "--max_attempts", "2",
+                    "--stage_budget_minutes", "2"])
+                cluster.assert_balanced(self, expected_total=7)
+
+            data = json.loads((domain_dir / "global_concepts_refined.json").read_text())
+            self.assertEqual(len(data["concepts"]), 7)
+            for c in data["concepts"]:
+                self.assertTrue(c["brief"].startswith("Dense two sentence"))
+            # Field order is preserved: brief sits right after title/aliases.
+            self.assertEqual(list(data["concepts"][0])[:3], ["title", "aliases", "brief"])
+            self.assertEqual(len(list((domain_dir / "concepts").glob("*.json"))), 7)
+            self.assertIn("LLM Briefs Generated:       7", out.stdout)
+
+    def test_unparseable_responses_fall_back_without_aborting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            domain_dir = self._build(root, count=5)
+            with FakeVLLMCluster(2, responder=lambda p, i: "not json at all") as cluster:
+                out = run_stage(self.SCRIPT, [
+                    "--domain", "biology", "--wiki_base_dir", str(root / "wiki"),
+                    "--servers", *cluster.urls, "--max_attempts", "1",
+                    "--stage_budget_minutes", "2"], expect_rc=0)
+                self.assertGreater(cluster.total_requests, 0)
+
+            data = json.loads((domain_dir / "global_concepts_refined.json").read_text())
+            # Every concept still gets a brief: the first two sentences.
+            for c in data["concepts"]:
+                self.assertIn("The mechanism operates across three distinct phases.", c["brief"])
+            self.assertIn("fell back to a truncated description", out.stdout)
+
+    def test_short_descriptions_never_call_the_llm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            domain_dir = self._build(root, count=3)
+            (domain_dir / "global_concepts_refined.json").write_text(json.dumps({
+                "concepts": [{"title": "Short", "aliases": [], "description": "Tiny desc.",
+                              "entities": [], "source_chunks": [], "outbound_relations": []}]
+            }), encoding="utf-8")
+            with FakeVLLMCluster(1, responder=lambda p, i: {"brief": "unused"}) as cluster:
+                run_stage(self.SCRIPT, ["--domain", "biology",
+                                        "--wiki_base_dir", str(root / "wiki"),
+                                        "--servers", *cluster.urls])
+                self.assertEqual(cluster.total_requests, 0)
+            data = json.loads((domain_dir / "global_concepts_refined.json").read_text())
+            self.assertEqual(data["concepts"][0]["brief"], "Tiny desc.")
+
+
 if __name__ == "__main__":
     unittest.main()
