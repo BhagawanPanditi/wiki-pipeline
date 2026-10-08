@@ -25,9 +25,12 @@ from pathlib import Path
 from typing import List
 from tqdm import tqdm
 
+from pipeline_lib.atomic_io import atomic_write_json
 from pipeline_lib.cli import build_parser
 
 STAGE = "markdown-export"
+# Lists the pages the last export wrote, so the next export removes exactly those.
+EXPORT_MANIFEST = ".export_manifest.json"
 from pipeline_lib.citation_utils import (
     clean_brief_text,
     clean_chunk_citations as normalize_chunk_citations,
@@ -174,13 +177,15 @@ def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
     print(f"Total concepts to export: {len(concepts)}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clean existing .json and .md files in output_dir
-    for old_file in output_dir.glob("*.*"):
-        if old_file.suffix in {".json", ".md"}:
-            try:
-                old_file.unlink()
-            except Exception:
-                pass
+    # Remove only the pages the previous export wrote, as listed in its manifest.
+    # Other files in the folder are never touched, so a mistyped --output_dir
+    # cannot destroy unrelated notes.
+    manifest_path = output_dir / EXPORT_MANIFEST
+    if manifest_path.is_file():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", [])
+        for name in previous:
+            (output_dir / name).unlink(missing_ok=True)
+    written_files = []
 
     # Map of lowercased titles to canonical titles for wikilink normalization
     title_lookup = {c["title"].lower().strip(): c["title"].strip() for c in concepts}
@@ -280,11 +285,13 @@ def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
             md_file = output_dir / f"{slug}_{counter}.md"
             counter += 1
 
+        written_files.append(md_file.name)
         with open(md_file, "w", encoding="utf-8") as f:
             f.write(full_content)
 
         exported_count += 1
 
+    atomic_write_json(manifest_path, {"files": written_files})
     print(f"\nSuccessfully exported {exported_count} Markdown wiki files to: {output_dir}/")
 
 def main() -> None:

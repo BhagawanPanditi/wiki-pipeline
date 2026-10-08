@@ -1,10 +1,10 @@
-"""Tests for the per-stage LLM call log (<wiki>/<domain>/logs/<stage>.jsonl).
+"""Tests for the per-stage LLM call log (<wiki>/<domain>/log/<stage>.llm.jsonl).
 
 The requirement is that every LLM call and its output is recorded per stage,
 inside the wiki directory, with nothing silently truncated. These tests drive a
 real stage over real HTTP against a fake cluster and inspect the JSONL:
 
-  * the file lands at logs/<stage>.jsonl under the run directory
+  * the file lands at log/<stage>.llm.jsonl under the run directory
   * ``full`` (the default) keeps the complete prompt and the complete response
   * ``compact`` shortens both but says so, and records the true length
   * ``errors`` keeps failures and drops successes

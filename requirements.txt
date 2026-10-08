@@ -1,0 +1,11 @@
+# Core runtime. Python 3.10 or newer (tested with 3.11).
+httpx>=0.27
+openai>=1.40
+pydantic>=2.6
+tqdm>=4.66
+networkx>=3.2
+# Needed for the default chunked mode. Not needed with --no-chunking.
+transformers>=4.40
+# Optional: a better stopword list for fuzzy matching. The stage falls back to a
+# built-in list when nltk is absent.
+# nltk>=3.8

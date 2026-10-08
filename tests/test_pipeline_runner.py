@@ -59,6 +59,10 @@ def has(name):
     return name in argv
 
 
+# The preflight probe takes no run arguments and must not touch the file system.
+if script == "check_servers.py":
+    sys.exit(0)
+
 domain = flag("--domain", "default")
 base = flag("--wiki_base_dir", ".")
 run_dir = Path(base) / domain
