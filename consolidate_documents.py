@@ -3,31 +3,28 @@
 Document-Level Knowledge Graph Consolidation Pass
 """
 
-import os
 import re
 import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
-from tqdm.asyncio import tqdm
 
 # ── Server & Concurrency Configuration ───────────────────────────────────────
-from pipeline_lib.checkpoint import load_json_log, save_log_async, save_log_sync
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.corpus import chunking_enabled
-from pipeline_lib.attempts import AttemptHistory
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.text import snippet_description
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import StageBudget
-from pipeline_lib.json_repair import clean_json_string
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool, pool_for_stage
+from utils.checkpoint import load_json_log, save_log_async
+from utils.cli import build_parser, resolve_settings
+from utils.corpus import chunking_enabled
+from utils.attempts import AttemptHistory
+from utils.event_log import EventLog
+from utils.text import snippet_description
+from utils.layout import log_path
+from utils.errors import StageBudget
+from utils.json_repair import clean_json_string
+from utils.llm_pool import pool_for_stage
 
-STAGE = "document-consolidation"
+STAGE = "consolidate-documents"
 
 # ── Pydantic Data Schemas for LLM Consolidation ──────────────────────────────
 class MergeCluster(BaseModel):
@@ -380,7 +377,7 @@ class DocumentConsolidatorPipeline:
         """Consolidate concepts within each document, then report the totals.
 
         Chooses between the LLM merge pass and a no-op pass-through based on how
-        the corpus was ingested (see :func:`pipeline_lib.corpus.chunking_enabled`
+        the corpus was ingested (see :func:`utils.corpus.chunking_enabled`
         and ``run_config.json``). Resumes from ``doc_consolidation_log.json``,
         processing only documents not already marked complete.
 
@@ -478,7 +475,7 @@ class DocumentConsolidatorPipeline:
         await save_log_async(self.log_file, self.log_data)
         
         print(f"\nDocument consolidation successfully finished for domain: {self.domain}!")
-        print(f"Stat Summary:")
+        print("Stat Summary:")
         print(f"  - Concepts Before: {total_concepts_before}")
         print(f"  - Concepts After:  {total_concepts_after}")
 

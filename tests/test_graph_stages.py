@@ -1,14 +1,11 @@
 """End-to-end tests for the graph stages refactored onto ServerPool.
 
-Covers stub_resolution.py (nested concurrency: stubs across servers, each stub's
-chunks fanned out 5 at a time), thin_concept_handler.py (order-dependent folds)
-and audit_noise_islands.py (networkx islands, per-island verdicts).
+Covers resolve_stubs.py (nested concurrency: stubs across servers, each stub's
+chunks fanned out 5 at a time), fold_thin_concepts.py (order-dependent folds)
+and audit_islands.py (networkx islands, per-island verdicts).
 """
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,7 +43,7 @@ def base_args(base, servers, **extra):
 
 
 class StubResolutionTests(unittest.TestCase):
-    SCRIPT = "stub_resolution.py"
+    SCRIPT = "resolve_stubs.py"
 
     def _build(self, root: Path, stubs=3, chunks_each=3):
         """Write a fixture graph in which several stubs are each cited by several chunks.
@@ -112,7 +109,7 @@ class StubResolutionTests(unittest.TestCase):
             self.assertIn("unresolved_stubs", log)
             # The decision log answers "what were the stubs, and what did each become".
             records = [json.loads(line) for line in
-                       (base / "log" / "stub-resolution.decisions.jsonl").read_text().splitlines()]
+                       (base / "log" / "resolve-stubs.decisions.jsonl").read_text().splitlines()]
             detected = next(r for r in records if r["event"] == "stubs_detected")
             self.assertEqual(sorted(s["stub"] for s in detected["major"]),
                              ["Stub 0", "Stub 1", "Stub 2"])
@@ -134,7 +131,7 @@ class StubResolutionTests(unittest.TestCase):
 
 
 class ThinConceptTests(unittest.TestCase):
-    SCRIPT = "thin_concept_handler.py"
+    SCRIPT = "fold_thin_concepts.py"
 
     def _build(self, root: Path, pairs=6):
         """Write a fixture graph of thin concepts, each paired with a host.
@@ -207,7 +204,7 @@ class ThinConceptTests(unittest.TestCase):
 
 
 class IslandAuditTests(unittest.TestCase):
-    SCRIPT = "audit_noise_islands.py"
+    SCRIPT = "audit_islands.py"
 
     def _build(self, root: Path):
         """Write a fixture graph with a two-concept island and a single lone concept.
@@ -257,7 +254,7 @@ class IslandAuditTests(unittest.TestCase):
             # Every verdict is a decision record; the old island_audit_log.jsonl is gone.
             self.assertFalse((base / "island_audit_log.jsonl").exists())
             records = [json.loads(line) for line in
-                       (base / "log" / "island-audit.decisions.jsonl").read_text().splitlines()]
+                       (base / "log" / "audit-islands.decisions.jsonl").read_text().splitlines()]
             verdicts = [r for r in records if r["event"] == "island_verdict"]
             self.assertEqual(len(verdicts), 2)
             for rec in verdicts:

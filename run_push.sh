@@ -15,7 +15,6 @@ rsync -avz --progress \
     --exclude '.git' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
-    --exclude 'concepts.log' \
     "${LOCAL_DIR}" "${REMOTE_HOST}:${REMOTE_DIR}"
 
 echo ""

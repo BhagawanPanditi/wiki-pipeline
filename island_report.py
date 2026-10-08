@@ -10,10 +10,10 @@ from pathlib import Path
 from collections import Counter
 import networkx as nx
 
-from pipeline_lib.atomic_io import atomic_write_json
-from pipeline_lib.cli import build_parser
+from utils.atomic_io import atomic_write_json
+from utils.cli import build_parser
 
-STAGE = "final-analysis"
+STAGE = "island-report"
 
 def analyze_kg_islands(domain_dir: Path):
     """Measure how the concept graph splits into islands and write the report.
@@ -63,7 +63,7 @@ def analyze_kg_islands(domain_dir: Path):
                 edge_count += 1
 
     total_nodes = G.number_of_nodes()
-    print(f"\n--- GRAPH OVERVIEW ---")
+    print("\n--- GRAPH OVERVIEW ---")
     print(f"Total Concepts (Nodes):  {total_nodes}")
     print(f"Total Relations (Edges): {edge_count}")
 
@@ -77,7 +77,7 @@ def analyze_kg_islands(domain_dir: Path):
     giant_size = len(giant_component)
     giant_pct = (giant_size / total_nodes * 100) if total_nodes > 0 else 0
 
-    print(f"\n--- ISLAND ANALYSIS ---")
+    print("\n--- ISLAND ANALYSIS ---")
     print(f"Total Connected Components (Islands): {total_islands}")
     print(f"Giant Component ('Mainland') Size:  {giant_size} concepts ({giant_pct:.2f}% of graph)")
 

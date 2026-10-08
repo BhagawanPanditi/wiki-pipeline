@@ -1,35 +1,29 @@
-"""Append-only JSONL record of every LLM call a stage makes.
+"""Append-only record of every LLM call a stage makes.
 
-The debug log answers "what went wrong". This answers "what exactly did we ask
-the model, and what exactly did it say" -- for every call, successful or not.
-Each stage writes its own file at::
+The debug log answers "what went wrong". This answers "what did we ask the model,
+and what did it say", for every call, successful or not. Each stage writes its own
+file at::
 
     <wiki_base_dir>/<domain>/log/<stage>.llm.jsonl
 
-One JSON object per line, one line per HTTP request actually issued (so a
-retried item produces one line per attempt). Lines are flushed as they happen,
-which means a killed or preempted run still leaves a readable trail rather than
-a buffer that was never written.
+One JSON object per line, one line per HTTP request actually issued, so a retried
+item produces one line per attempt. Lines are flushed as they happen, so a killed
+or preempted run still leaves a readable trail.
 
-``--llm_log`` controls how much is kept:
+``--llm_log`` controls how much of each call is kept:
 
-* ``full`` (default) -- the complete, untruncated request and response. This is
-  what makes a bad extraction diagnosable after the fact.
-* ``compact``        -- both sides truncated to :data:`COMPACT_CHAR_LIMIT`
-  characters, with the true lengths recorded so the truncation is visible rather
-  than silent.
-* ``errors``         -- failed calls only. Successful traffic is not written.
+* ``compact`` (default) -- each prompt message and the reply are cut to
+  :data:`COMPACT_CHAR_LIMIT` characters, and the true lengths are recorded, so a
+  cut is always visible.
+* ``full`` -- every character of the prompt and of the reply.
+* ``errors`` -- failed calls only. Successful traffic is not written.
 
-Each line carries an ``event`` field. ``"call"`` is the HTTP exchange itself;
-``"rejection"`` is the stage deciding the response was unusable (bad JSON, a
-schema mismatch, a ``finish_reason`` of ``length``). The distinction matters
-because the most common failure in this pipeline is a *successful* HTTP response
-whose body the stage cannot parse -- counting only transport errors would report
-a clean run. ``ok`` is therefore ``False`` for both transport failures and
-rejections, which is what ``errors`` mode keeps.
-
-Nothing here is truncated by accident: ``compact`` is an explicit choice, and it
-always records ``truncated`` plus the original character counts.
+Each line has an ``event`` field. ``"call"`` is the HTTP exchange itself.
+``"rejection"`` is the stage deciding that a response was unusable: bad JSON, a
+schema mismatch, or a ``finish_reason`` of ``length``. The distinction matters
+because the most common failure is a *successful* HTTP response whose body the
+stage cannot parse. ``ok`` is false for both transport failures and rejections,
+which is what ``errors`` mode keeps.
 """
 
 import contextvars
@@ -92,18 +86,18 @@ class LLMCallLog:
         stage: Stage label stored on every line.
     """
 
-    def __init__(self, path: Path, *, mode: str = "full", stage: str = ""):
+    def __init__(self, path: Path, *, mode: str = "compact", stage: str = ""):
         """Open a call log for one stage.
 
         Args:
             path: JSONL file to append to. Created lazily on the first record so
                 a stage that makes no calls leaves no empty file behind.
             mode: ``"full"``, ``"compact"`` or ``"errors"``. An unrecognised
-                value falls back to ``"full"`` rather than losing data.
-            stage: Stage name recorded on every line, e.g. ``"pass1-extraction"``.
+                value falls back to ``"compact"`` rather than losing data.
+            stage: Stage name recorded on every line, e.g. ``"extract-concepts"``.
         """
         self.path = Path(path)
-        self.mode = mode if mode in MODES else "full"
+        self.mode = mode if mode in MODES else "compact"
         self.stage = stage
         self._events = EventLog(self.path, label=stage)
         self.calls = 0
@@ -124,7 +118,7 @@ class LLMCallLog:
             ``<wiki_base_dir>/<domain>/log/<stage>.llm.jsonl``.
         """
         return cls(log_path(run_dir_for(args), stage, "llm"),
-                   mode=getattr(args, "llm_log", "full") or "full",
+                   mode=getattr(args, "llm_log", "compact") or "compact",
                    stage=stage)
 
     @property

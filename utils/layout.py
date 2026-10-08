@@ -44,7 +44,7 @@ def log_path(run_dir: Path, stage: str, kind: str) -> Path:
 
     Args:
         run_dir: The run's output directory.
-        stage: Stage key, e.g. ``"pass1-extraction"`` or ``"stub-resolution"``.
+        stage: Stage key, e.g. ``"extract-concepts"`` or ``"resolve-stubs"``.
         kind: One of ``"llm"``, ``"decisions"``, ``"debug"``.
 
     Returns:

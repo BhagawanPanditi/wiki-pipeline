@@ -1,4 +1,4 @@
-"""End-to-end tests for final_consolidate_and_link.py.
+"""End-to-end tests for final_consolidation.py.
 
 This stage keeps its own per-server client construction (its two passes need
 different request timeouts) but now uses the shared deterministic partition,
@@ -7,9 +7,6 @@ behaviour that changed: even spreading and bounded retries.
 """
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,14 +15,14 @@ from tests.fake_vllm import FakeVLLMCluster
 from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = "final_consolidate_and_link.py"
+SCRIPT = "final_consolidation.py"
 LONG = ("A dense factual description with enough words to look like a real concept "
         "brief including measured throughput of 1240 requests per second at 61 ms.")
 NO_PAIRS = {"merge_pairs": [], "link_pairs": [], "noise": []}
 
 
 def run(args, *, expect_rc=0, timeout=300):
-    """Run final_consolidate_and_link.py as a subprocess and assert its exit code.
+    """Run final_consolidation.py as a subprocess and assert its exit code.
 
     Args:
         args: Command-line arguments after the script name.
@@ -132,6 +129,35 @@ class FinalConsolidateTests(unittest.TestCase):
             errors = [e for e in entries if e["event"] == "macro_scan_failed"]
             self.assertEqual(len(errors), 2, entries)
             self.assertTrue(all(e["error"] for e in errors))
+
+    def test_an_empty_deep_verification_reply_is_retried_not_a_name_error(self):
+        """A deep-verification reply with no actions is retried after a backoff.
+
+        Regression test: the retry branch used to reference an undefined name, so
+        the stage recorded a NameError where it should have waited and asked again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._build(Path(tmp), letters="AA")
+
+            def responder(prompt, index):
+                """Propose one merge for the macro scan; answer deep verification with nothing usable."""
+                if "Indexed Titles:" in prompt:
+                    return {"merge_pairs": [[1, 2]], "link_pairs": [], "noise": []}
+                return {"actions": []}
+
+            with FakeVLLMCluster(1, responder=responder) as cluster:
+                proc = run(self._args(base, cluster.urls, max_attempts=2), expect_rc=1)
+                deep_prompts = [q for srv in cluster.servers for q in srv.prompts if "Indexed Titles:" not in q]
+            # The stage still fails loudly once the retries are used up...
+            self.assertIn("Deep final verification failed for 1 group(s) after retries",
+                          proc.stdout + proc.stderr)
+            # ...but the one group got both of its attempts, not one.
+            self.assertEqual(len(deep_prompts), 2)
+            # Each attempt is recorded as a rejected reply, and none of them is a NameError.
+            calls = [json.loads(line) for line in
+                     (base / "log" / "final-deep-verify.llm.jsonl").read_text().splitlines()]
+            rejections = [c for c in calls if c["event"] == "rejection"]
+            self.assertEqual([r["error_type"] for r in rejections], ["ValueError", "ValueError"])
 
     def test_transient_faults_are_retried_not_fatal(self):
         """Transient faults are retried, and the stage completes."""

@@ -25,13 +25,13 @@ from pathlib import Path
 from typing import List
 from tqdm import tqdm
 
-from pipeline_lib.atomic_io import atomic_write_json
-from pipeline_lib.cli import build_parser
+from utils.atomic_io import atomic_write_json
+from utils.cli import build_parser
 
-STAGE = "markdown-export"
+STAGE = "export-markdown"
 # Lists the pages the last export wrote, so the next export removes exactly those.
 EXPORT_MANIFEST = ".export_manifest.json"
-from pipeline_lib.citation_utils import (
+from utils.citation_utils import (
     clean_brief_text,
     clean_chunk_citations as normalize_chunk_citations,
 )
@@ -106,7 +106,7 @@ def format_description_paragraphs(description: str, source_docs: List[str]) -> s
         if main_text:
             cleaned_paras.append(deduplicate_paragraph_citations(main_text))
 
-    # Keep stub-resolution text in a distinct final paragraph.
+    # Keep resolve-stubs text in a distinct final paragraph.
     if additionally_sentences:
         cleaned_add = [deduplicate_paragraph_citations(s) for s in additionally_sentences]
         cleaned_paras.append(" ".join(cleaned_add))

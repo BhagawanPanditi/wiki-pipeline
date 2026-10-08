@@ -29,17 +29,16 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from pipeline_lib.atomic_io import atomic_write_text
-from pipeline_lib.checkpoint import CheckpointLog
-from pipeline_lib.chunks import load_cached_chunks
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import StageBudget
-from pipeline_lib.json_repair import clean_json_string
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import pool_for_stage
-from pipeline_lib.reporting import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
+from utils.atomic_io import atomic_write_text
+from utils.checkpoint import CheckpointLog
+from utils.chunks import load_cached_chunks
+from utils.cli import build_parser, resolve_settings
+from utils.event_log import EventLog
+from utils.layout import log_path
+from utils.errors import StageBudget
+from utils.json_repair import clean_json_string
+from utils.llm_pool import pool_for_stage
+from utils.reporting import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
                                     build_improvement, collect_metrics,
                                     format_improvement, format_report, write_summary)
 
@@ -141,7 +140,7 @@ class WikiVerifierPipeline:
         if self.phase not in (1, 2):
             raise ValueError("--phase must be 1 or 2")
 
-        self.stage = "verification" if self.phase == 1 else "verification-pass2"
+        self.stage = "verify-pass1" if self.phase == 1 else "verify-pass2"
         self.settings = resolve_settings(args, self.stage)
 
         self.base_wiki_dir = Path(args.wiki_base_dir) / self.domain
@@ -454,7 +453,7 @@ def main():
     Returns:
         None."""
     parser = build_parser(
-        stage="verification",
+        stage="verify-pass1",
         description="Knowledge Graph extraction verifier & auditor (runs per phase)",
         include_max_tokens=True,
         include_resume=True,

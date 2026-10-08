@@ -10,7 +10,6 @@ Step 4B: LLM-Driven Thin Concept Folding & Pruning Pipeline
 
 import asyncio
 import json
-import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -19,16 +18,15 @@ from pydantic import BaseModel, Field
 from tqdm.asyncio import tqdm
 
 # ── Configuration ────────────────────────────────────────────────────────────
-from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import StageBudget
-from pipeline_lib.json_repair import clean_json_string
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool, pool_for_stage
+from utils.atomic_io import atomic_write_json, sanitize_filename
+from utils.cli import build_parser, resolve_settings
+from utils.event_log import EventLog
+from utils.layout import log_path
+from utils.errors import StageBudget
+from utils.json_repair import clean_json_string
+from utils.llm_pool import pool_for_stage
 
-STAGE = "thin-concept-folding"
+STAGE = "fold-thin-concepts"
 
 # ── Pydantic Schema for LLM Decision ─────────────────────────────────────────
 class FoldDecisionSchema(BaseModel):
@@ -97,9 +95,9 @@ class ThinConceptHandler:
             None. Fills ``concepts`` and ``title_map``.
 
         Raises:
-            FileNotFoundError: If the stub-resolution output is missing."""
+            FileNotFoundError: If the resolve-stubs output is missing."""
         if not self.input_file.exists():
-            raise FileNotFoundError(f"Missing input file {self.input_file}. Run stub_resolution.py first!")
+            raise FileNotFoundError(f"Missing input file {self.input_file}. Run resolve_stubs.py first!")
 
         print(f"Loading concepts from {self.input_file}...")
         with open(self.input_file, "r", encoding="utf-8") as f:
@@ -377,14 +375,14 @@ CANDIDATE HOST CONCEPTS:
 
         atomic_write_json(self.log_file, log_data)
 
-        print(f"\n==================================================")
-        print(f"LLM THIN CONCEPT HANDLING COMPLETE")
-        print(f"==================================================")
+        print("\n==================================================")
+        print("LLM THIN CONCEPT HANDLING COMPLETE")
+        print("==================================================")
         print(f"Initial Concepts:               {len(self.concepts)}")
         print(f"Thin Concepts Folded via LLM:  -{len(folded_titles)}")
         print(f"Isolated Ultra-Thin Pruned:    -{len(pruned_titles)}")
         print(f"Final Clean Concepts in Graph:  {len(final_concepts)}")
-        print(f"==================================================")
+        print("==================================================")
         print(f"Outputs written to:\n  - {self.output_file}\n  - {self.concepts_dir}/")
 
 def main():

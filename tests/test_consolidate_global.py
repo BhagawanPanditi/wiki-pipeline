@@ -1,4 +1,4 @@
-"""Regression tests for global_concept_consolidation.run_llm_fuzzy_pass.
+"""Regression tests for consolidate_global.run_llm_fuzzy_pass.
 
 These exist because the accumulator lists this function shares between its
 result callback and its post-map failure sweep (``approved_merges``,
@@ -22,7 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-import global_concept_consolidation as gcc  # noqa: E402
+import consolidate_global as gcc  # noqa: E402
 from tests.fake_vllm import FakeVLLMCluster  # noqa: E402
 
 LONG = ("A dense factual description with enough words to survive the similarity "
@@ -44,7 +44,7 @@ def cluster(*titles):
 
 class FuzzyPassTests(unittest.TestCase):
     def _args(self, root: Path, servers, **extra):
-        """Parse stage arguments for the global-consolidation profile.
+        """Parse stage arguments for the consolidate-global profile.
 
         Args:
             root: Wiki base directory; outputs go to ``root/<domain>/``.
@@ -112,7 +112,7 @@ class FuzzyPassTests(unittest.TestCase):
                 self.assertIn("LLM fuzzy review failed", str(caught.exception))
                 self.assertIn("1 cluster", str(caught.exception))
 
-            debug = Path(tmp) / "biology" / "log" / "global-consolidation.debug.jsonl"
+            debug = Path(tmp) / "biology" / "log" / "consolidate-global.debug.jsonl"
             self.assertTrue(debug.is_file(), "no debug log written on failure")
             errors = [json.loads(line) for line in debug.read_text().splitlines() if line.strip()]
             self.assertTrue(errors, "debug log is empty after a failed cluster")

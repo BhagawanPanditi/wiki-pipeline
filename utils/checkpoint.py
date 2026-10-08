@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from .atomic_io import atomic_write_json, read_json
+from .atomic_io import atomic_write_json
 
 
 def load_json_log(path: Path, *, corrupt_message: Optional[str] = None,

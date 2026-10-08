@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 import asyncio
 import json
-import os
-import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-from pydantic import BaseModel, Field, ValidationError
-from tqdm.asyncio import tqdm
+from pydantic import BaseModel, Field
 
-from pipeline_lib.atomic_io import atomic_write_json
-from pipeline_lib.checkpoint import load_bool_log, save_log_async, save_log_sync
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
+from utils.atomic_io import atomic_write_json
+from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
+from utils.cli import build_parser, resolve_settings
+from utils.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
                                  build_units, cache_manifest, deduplicate,
                                  load_corpus, resolve_corpus_path,
                                  save_run_config)
-from pipeline_lib.attempts import AttemptHistory
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import PermanentFailure, StageBudget
-from pipeline_lib.json_repair import clean_json_string
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool, pool_for_stage
+from utils.attempts import AttemptHistory
+from utils.event_log import EventLog
+from utils.layout import log_path
+from utils.errors import PermanentFailure, StageBudget
+from utils.json_repair import clean_json_string
+from utils.llm_pool import pool_for_stage
 
-STAGE = "pass1-extraction"
+STAGE = "extract-concepts"
 
 # ── Pydantic Data Schemas for Extraction ──────────────────────────────────────
 
@@ -45,7 +41,7 @@ class ChunkExtractionSchema(BaseModel):
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
 # short_hash, chunk_document and the rest of the corpus contract live in
-# pipeline_lib/corpus.py so that every stage agrees on document ids, chunk ids
+# utils/corpus.py so that every stage agrees on document ids, chunk ids
 # and citation keys.
 
 # ── System Prompt ────────────────────────────────────────────────────────────

@@ -20,18 +20,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import networkx as nx
-from tqdm import tqdm
 
-from pipeline_lib.atomic_io import atomic_write_json
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import StageBudget
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import pool_for_stage
-from pipeline_lib.prompts import domain_scope, out_of_domain_clause
+from utils.atomic_io import atomic_write_json
+from utils.cli import build_parser, resolve_settings
+from utils.event_log import EventLog
+from utils.layout import log_path
+from utils.errors import StageBudget
+from utils.llm_pool import pool_for_stage
+from utils.prompts import domain_scope, out_of_domain_clause
 
-STAGE = "island-audit"
+STAGE = "audit-islands"
 
 SYSTEM_PROMPT_ISLAND_AUDIT = """\
 You are an expert technical knowledge graph quality auditor.
@@ -96,7 +94,6 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
         concepts = data.get("concepts", [])
 
     title_map = {c["title"].lower().strip(): c for c in concepts}
-    canonical_lookup = {c["title"].lower().strip(): c["title"] for c in concepts}
 
     # Build doc_id -> list of concepts
     doc_to_concepts: Dict[str, List[Dict[str, Any]]] = {}
@@ -286,7 +283,7 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
             f"Examples: {failed_components[:5]}"
         )
 
-    print(f"\nAudit & Bridge Results:")
+    print("\nAudit & Bridge Results:")
     print(f"  - Confirmed Noise Islands Pruned:   {len(prune_titles_set)}")
     print(f"  - Sibling Document Merges:          {len(merge_actions)}")
     print(f"  - Sibling Document Links Added:     {len(link_actions)}")

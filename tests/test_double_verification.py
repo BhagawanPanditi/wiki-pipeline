@@ -11,7 +11,6 @@ higher and the improvement deltas are non-trivial.
 """
 
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +19,7 @@ from tests.fake_vllm import FakeVLLMServer as _FakeServer
 from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VERIFIER = REPO_ROOT / "verify_concept_extraction.py"
+VERIFIER = REPO_ROOT / "verify_extraction.py"
 
 
 class DoubleVerificationTests(unittest.TestCase):
@@ -77,7 +76,7 @@ class DoubleVerificationTests(unittest.TestCase):
 
         Returns:
             The completed process. The exit code is asserted before returning."""
-        return run_script("verify_concept_extraction.py",
+        return run_script("verify_extraction.py",
                           ["--domain", "robotics", "--wiki_base_dir", str(domain_dir.parent),
                            "--phase", str(phase), "--servers", *servers, "--max_attempts", "4",
                            "--stage_budget_minutes", "2", *extra],

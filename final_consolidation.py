@@ -40,10 +40,9 @@ Step 3 (Graph Update, Bidirectional Remapping & Markdown Export):
 import asyncio
 import functools
 import json
-import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
 import httpx
 from openai import AsyncOpenAI
@@ -53,15 +52,15 @@ from tqdm import tqdm
 # This stage keeps its own per-server client construction (its two passes need
 # different request timeouts) but uses the shared partitioning, retry ladder,
 # budget and debug log.
-from pipeline_lib.atomic_io import atomic_write_json
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path, run_dir_for
-from pipeline_lib.errors import StageBudget, classify_error
-from pipeline_lib.retry import backoff_delay
-from pipeline_lib.json_repair import clean_json_string as _extract_json
-from pipeline_lib.llm_log import CURRENT_CALL, LLMCallLog, wrap_client
-from pipeline_lib.prompts import domain_scope
+from utils.atomic_io import atomic_write_json
+from utils.cli import build_parser, resolve_settings
+from utils.event_log import EventLog
+from utils.layout import log_path, run_dir_for
+from utils.errors import RECOVERABLE, StageBudget, classify_error
+from utils.retry import backoff_delay
+from utils.json_repair import clean_json_string as _extract_json
+from utils.llm_log import CURRENT_CALL, LLMCallLog, wrap_client
+from utils.prompts import domain_scope
 
 # This stage's payloads are sometimes JSON arrays rather than objects.
 clean_json_string = functools.partial(_extract_json, allow_array=True)
@@ -628,8 +627,12 @@ async def run_deep_verification(
                             deep_decisions.record("deep_verification", **log_entry)
                         completed = True
                         break
+                    # The reply parsed but held nothing usable. Record it as a rejection, then
+                    # retry after the recoverable-class backoff, like any other unusable reply.
+                    unusable = ValueError("reply contained no usable actions")
+                    llm_log.rejection(server=server_url, error=unusable, classification=RECOVERABLE)
                     if attempt < settings.attempts - 1:
-                        await asyncio.sleep(budget.cap_sleep(backoff_delay(classify_error(e), attempt + 1)))
+                        await asyncio.sleep(budget.cap_sleep(backoff_delay(RECOVERABLE, attempt + 1)))
                 except Exception as e:
                     # The transport may have succeeded while this stage rejected
                     # the body; record that so --llm_log errors is not silent
@@ -859,15 +862,15 @@ def apply_all_resolutions(concepts: List[Dict[str, Any]], actions: List[Verified
 
         c["outbound_relations"] = list(merged_rels.values())
 
-    print(f"\n==================================================")
-    print(f"CONSOLIDATION SUMMARY")
-    print(f"==================================================")
+    print("\n==================================================")
+    print("CONSOLIDATION SUMMARY")
+    print("==================================================")
     print(f"Initial Concepts:        {len(concepts)}")
     print(f"Concepts Merged:         -{merged_count}")
     print(f"Noise Concepts Pruned:   -{len(pruned_titles)}")
     print(f"Final Clean Concepts:    {len(surviving_concepts)}")
     print(f"Reciprocal Links Added:  +{linked_count}")
-    print(f"==================================================")
+    print("==================================================")
 
     return surviving_concepts
 
@@ -934,7 +937,7 @@ async def main_pipeline(domain_dir: Path, domain_name: Optional[str], args):
                             if norm.action == "LINK" and not norm.absorbed_titles:
                                 norm.absorbed_titles = [t for t in candidates if t.lower().strip() != (norm.primary_title or "").lower().strip()]
                             actions.append(norm)
-                except Exception as e:
+                except Exception:
                     pass
         print(f"Loaded {len(actions)} verified actions from log!")
     else:
@@ -953,13 +956,13 @@ async def main_pipeline(domain_dir: Path, domain_name: Optional[str], args):
     atomic_write_json(save_file, {"concepts": final_concepts})
 
     # 5. Re-export clean Markdown wiki in concepts_md/
-    from export_markdown_wiki import export_wiki_markdown
+    from export_markdown import export_wiki_markdown
     concepts_md_dir = domain_dir / "concepts_md"
     print(f"\nExporting clean Markdown files to {concepts_md_dir}/...")
     export_wiki_markdown(domain_dir, concepts_md_dir)
 
     # 6. Analyze Final Islands
-    from analyze_islands import analyze_kg_islands
+    from island_report import analyze_kg_islands
     analyze_kg_islands(domain_dir)
 
 def main():

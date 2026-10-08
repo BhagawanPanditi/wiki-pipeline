@@ -7,33 +7,28 @@ Refinement Pass 2: Second-Pass Knowledge Graph Concept Extraction & Patching
 
 import asyncio
 import functools
-import hashlib
 import json
-import os
-import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-from pydantic import BaseModel, Field, ValidationError
-from tqdm.asyncio import tqdm
+from pydantic import BaseModel, Field
 
-from pipeline_lib.checkpoint import load_bool_log, save_log_async, save_log_sync
-from pipeline_lib.chunks import load_cached_chunks
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.attempts import AttemptHistory
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import StageBudget
-from pipeline_lib.json_repair import clean_json_string as _extract_json
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool, pool_for_stage
+from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
+from utils.chunks import load_cached_chunks
+from utils.cli import build_parser, resolve_settings
+from utils.attempts import AttemptHistory
+from utils.event_log import EventLog
+from utils.layout import log_path
+from utils.errors import StageBudget
+from utils.json_repair import clean_json_string as _extract_json
+from utils.llm_pool import pool_for_stage
 
 # Pass 2 historically also accepted an unfenced outermost JSON object.
 clean_json_string = functools.partial(_extract_json, allow_bare_object=True)
 
-STAGE = "pass2-refinement"
+STAGE = "refine-concepts"
 
 # ── Pydantic Data Schemas for Second Pass ─────────────────────────────────────
 

@@ -16,15 +16,14 @@ from typing import List, Set, Tuple
 
 from tqdm import tqdm
 
-from pipeline_lib.atomic_io import atomic_write_json
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import StageBudget
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import pool_for_stage
+from utils.atomic_io import atomic_write_json
+from utils.cli import build_parser, resolve_settings
+from utils.event_log import EventLog
+from utils.layout import log_path
+from utils.errors import StageBudget
+from utils.llm_pool import pool_for_stage
 
-STAGE = "reverse-relations"
+STAGE = "add-reverse-links"
 
 REVERSE_RELATION_PROMPT = """\
 You are an expert technical knowledge graph agent.
@@ -98,7 +97,7 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                     break
             missing_reverse.append((tgt, src, rel_text))
 
-    # Also rewrite template forward relations planted by the entity-overlap
+    # Also rewrite template forward relations planted by the link-entities
     # linker. "semantic affinity" is legacy wording from earlier graph files
     # and is kept so re-running over old inputs still upgrades those edges.
     for c in concepts:

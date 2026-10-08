@@ -4,7 +4,7 @@ The runner is exercised with a fake ``python3`` first on PATH. It forwards the
 runner's own inline validators (``python3 - <<PY``) to the real interpreter, and
 dispatches every stage script to a helper that writes structurally valid outputs
 -- including a chunk-cache manifest computed by the real
-``pipeline_lib.corpus.cache_manifest``, so the runner's staleness check is tested
+``utils.corpus.cache_manifest``, so the runner's staleness check is tested
 against the same code Pass 1 uses rather than a copy of it.
 
 Pinned behaviour:
@@ -21,7 +21,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +62,17 @@ def has(name):
 if script == "check_servers.py":
     sys.exit(0)
 
+# Only the scripts the runner invokes may touch the file system. Anything else is
+# refused before a run folder is created, so a stray call cannot leave one behind.
+KNOWN_SCRIPTS = {"check_servers.py", "extract_concepts.py", "verify_extraction.py",
+                 "refine_concepts.py", "consolidate_documents.py", "consolidate_global.py",
+                 "resolve_stubs.py", "fold_thin_concepts.py", "write_briefs.py",
+                 "link_entities.py", "audit_islands.py", "add_reverse_links.py",
+                 "final_consolidation.py", "island_report.py"}
+if script not in KNOWN_SCRIPTS:
+    sys.stderr.write("fake python: unhandled script %s\n" % script)
+    sys.exit(99)
+
 domain = flag("--domain", "default")
 base = flag("--wiki_base_dir", ".")
 run_dir = Path(base) / domain
@@ -84,8 +94,8 @@ def bump(key):
 if script == "check_servers.py":
     sys.exit(0)
 
-if script == "concept_extraction_pass_1.py":
-    from pipeline_lib.corpus import cache_manifest, deduplicate, load_corpus, build_units
+if script == "extract_concepts.py":
+    from utils.corpus import cache_manifest, deduplicate, load_corpus, build_units
 
     corpus = Path(flag("--corpus"))
     chunking = not has("--no-chunking")
@@ -100,8 +110,8 @@ if script == "concept_extraction_pass_1.py":
     # exercised rather than trivially satisfied.
     tokenizer_name = None
     if chunking:
-        from pipeline_config import load_global_config
-        tokenizer_name = load_global_config()[2]
+        from config import load_global_config
+        tokenizer_name = load_global_config()[1]
     units = build_units(canon, None, chunking=False)
     cache = run_dir / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -124,7 +134,7 @@ if script == "concept_extraction_pass_1.py":
                                       "entities": [], "outbound_relations": []}]}))
     sys.exit(0)
 
-if script == "verify_concept_extraction.py":
+if script == "verify_extraction.py":
     phase = flag("--phase", "1")
     chunks = json.loads((run_dir / "cache" / "chunks_cache.json").read_text())
     name = "verification.json" if phase == "1" else "verification_pass2.json"
@@ -144,11 +154,11 @@ if script == "verify_concept_extraction.py":
             json.dumps({"phase1": {}, "phase2": {}, "improvement": {}}))
     sys.exit(0)
 
-if script == "concept_refinement_pass_2.py":
+if script == "refine_concepts.py":
     (run_dir / "pass2_log.json").write_text(json.dumps({"done": True}))
     sys.exit(0)
 
-if script == "doc_concept_consolidation.py":
+if script == "consolidate_documents.py":
     consolidated = run_dir / "consolidated" / "canon_test"
     consolidated.mkdir(parents=True, exist_ok=True)
     (consolidated / "concepts.json").write_text(
@@ -159,7 +169,7 @@ if script == "doc_concept_consolidation.py":
                     "total_concepts_after": 1}))
     sys.exit(0)
 
-if script == "global_concept_consolidation.py":
+if script == "consolidate_global.py":
     # Fail exactly once so the runner's whole-stage retry is observable.
     if bump("global") == 1 and os.environ.get("FAKE_FAIL_GLOBAL") == "1":
         sys.exit(1)
@@ -167,17 +177,17 @@ if script == "global_concept_consolidation.py":
         json.dumps({"concepts": [{"title": "Mock Concept"}]}))
     sys.exit(0)
 
-if script == "stub_resolution.py":
+if script == "resolve_stubs.py":
     (run_dir / "global_concepts_stubs_resolved.json").write_text(
         json.dumps({"concepts": [{"title": "Mock Concept"}]}))
     sys.exit(0)
 
-if script == "analyze_islands.py":
+if script == "island_report.py":
     (run_dir / "islands_report.json").write_text(
         json.dumps({"summary": {}, "islands": []}))
     sys.exit(0)
 
-if script == "final_consolidate_and_link.py":
+if script == "final_consolidation.py":
     (run_dir / "global_concepts_refined.json").write_text(
         json.dumps({"concepts": [{"title": "Mock Concept"}]}))
     md = run_dir / "concepts_md"
@@ -185,9 +195,9 @@ if script == "final_consolidate_and_link.py":
     (md / "Mock Concept.md").write_text("# Mock Concept\n")
     sys.exit(0)
 
-if script in ("thin_concept_handler.py", "add_concept_briefs.py",
-              "link_entity_overlap.py", "audit_noise_islands.py",
-              "synthesize_bidirectional_relations.py"):
+if script in ("fold_thin_concepts.py", "write_briefs.py",
+              "link_entities.py", "audit_islands.py",
+              "add_reverse_links.py"):
     (run_dir / "global_concepts_refined.json").write_text(
         json.dumps({"concepts": [{"title": "Mock Concept"}]}))
     sys.exit(0)
@@ -314,16 +324,16 @@ class RunPipelineTests(unittest.TestCase):
 
             calls = self._calls(call_log)
             self.assertEqual(calls[0], "check_servers.py")
-            for stage in ("concept_extraction_pass_1.py", "verify_concept_extraction.py",
-                          "concept_refinement_pass_2.py", "doc_concept_consolidation.py",
-                          "global_concept_consolidation.py", "stub_resolution.py",
-                          "thin_concept_handler.py", "add_concept_briefs.py",
-                          "link_entity_overlap.py", "audit_noise_islands.py",
-                          "synthesize_bidirectional_relations.py",
-                          "final_consolidate_and_link.py", "analyze_islands.py"):
+            for stage in ("extract_concepts.py", "verify_extraction.py",
+                          "refine_concepts.py", "consolidate_documents.py",
+                          "consolidate_global.py", "resolve_stubs.py",
+                          "fold_thin_concepts.py", "write_briefs.py",
+                          "link_entities.py", "audit_islands.py",
+                          "add_reverse_links.py",
+                          "final_consolidation.py", "island_report.py"):
                 self.assertIn(stage, calls, f"{stage} never ran")
             # Verification runs twice: once per phase.
-            self.assertEqual(calls.count("verify_concept_extraction.py"), 2)
+            self.assertEqual(calls.count("verify_extraction.py"), 2)
 
             run_dir = wiki / "biology"
             self.assertTrue((run_dir / "concepts_md" / "Mock Concept.md").is_file())
@@ -348,6 +358,32 @@ class RunPipelineTests(unittest.TestCase):
             self.assertEqual(new, ["check_servers.py"],
                              "a completed pipeline should only re-probe the servers")
 
+    def test_markers_from_before_the_renames_still_resume(self):
+        """A run stopped under the old step names resumes without redoing finished stages."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, call_log, _ = self._env(root)
+            corpus = self._corpus(root)
+            args = ["--corpus", str(corpus), "--domain", "biology",
+                    "--wiki-base-dir", str(root / "wiki"), "--max-stage-attempts", "2"]
+            self._run(env, args)
+            state = root / "wiki" / "biology" / ".pipeline_state"
+            # Rewrite the markers the way the previous version named them.
+            previous = {"extract-concepts": "pass1-extraction", "verify-pass1": "verification",
+                        "refine-concepts": "pass2-refinement", "verify-pass2": "verification-pass2",
+                        "consolidate-documents": "document-consolidation",
+                        "consolidate-global": "global-consolidation", "resolve-stubs": "stub-resolution",
+                        "fold-thin-concepts": "thin-concept-folding", "write-briefs": "brief-generation",
+                        "link-entities": "entity-overlap", "audit-islands": "island-audit",
+                        "add-reverse-links": "reverse-relations", "island-report": "final-analysis"}
+            for new, old in previous.items():
+                (state / f"{new}.done").rename(state / f"{old}.done")
+            before = len(self._calls(call_log))
+            self._run(env, args)
+            new = self._calls(call_log)[before:]
+            self.assertEqual(new, ["check_servers.py"],
+                             "markers from the previous names should count as completed")
+
     def test_missing_upstream_artifact_reruns_that_stage_and_downstream(self):
         """Deleting one output invalidates it and everything derived from it."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -365,12 +401,12 @@ class RunPipelineTests(unittest.TestCase):
             self._run(env, args)
             rebuilt = self._calls(call_log)[before:]
             self.assertEqual(rebuilt[0], "check_servers.py")
-            self.assertEqual(rebuilt[1], "global_concept_consolidation.py")
+            self.assertEqual(rebuilt[1], "consolidate_global.py")
             # Extraction is untouched, but everything downstream is redone.
-            self.assertNotIn("concept_extraction_pass_1.py", rebuilt)
-            self.assertIn("stub_resolution.py", rebuilt)
-            self.assertIn("final_consolidate_and_link.py", rebuilt)
-            self.assertIn("analyze_islands.py", rebuilt)
+            self.assertNotIn("extract_concepts.py", rebuilt)
+            self.assertIn("resolve_stubs.py", rebuilt)
+            self.assertIn("final_consolidation.py", rebuilt)
+            self.assertIn("island_report.py", rebuilt)
 
     def test_failing_stage_is_retried_then_succeeds(self):
         """The runner restarts a whole stage, independently of per-call retries."""
@@ -383,11 +419,11 @@ class RunPipelineTests(unittest.TestCase):
                                   "--wiki-base-dir", str(root / "wiki"),
                                   "--max-stage-attempts", "3"])
             calls = self._calls(call_log)
-            self.assertEqual(calls.count("global_concept_consolidation.py"), 2,
+            self.assertEqual(calls.count("consolidate_global.py"), 2,
                              "the failing stage should have been restarted once")
             # The runner reports stage failures on stderr, progress on stdout.
             self.assertIn("failed with exit code 1", out.stderr)
-            self.assertIn("Completed: global-consolidation (attempt 2)", out.stdout)
+            self.assertIn("Completed: consolidate-global (attempt 2)", out.stdout)
             self.assertIn("PIPELINE RUN COMPLETE", out.stdout)
 
     def test_fresh_clears_markers_and_reruns_everything(self):
@@ -406,8 +442,8 @@ class RunPipelineTests(unittest.TestCase):
 
             self.assertIn("--fresh: cleared", out.stdout)
             fresh = self._calls(call_log)[before:]
-            self.assertIn("concept_extraction_pass_1.py", fresh)
-            self.assertIn("analyze_islands.py", fresh)
+            self.assertIn("extract_concepts.py", fresh)
+            self.assertIn("island_report.py", fresh)
             # Markers only: the wiki data itself survives.
             self.assertTrue((wiki / "biology" / "concepts_md").is_dir())
 
@@ -471,6 +507,28 @@ class RunPipelineTests(unittest.TestCase):
             out = self._run(env, ["--corpus", str(corpus), "--llm-log", "verbose",
                                   "--wiki-base-dir", str(root / "wiki")], expect_rc=2)
             self.assertIn("--llm-log must be one of", out.stderr)
+
+
+    def test_rejects_a_non_positive_stage_budget(self):
+        """--stage-budget-minutes must be a positive number, checked before any stage runs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _, _ = self._env(root)
+            corpus = self._corpus(root)
+            out = self._run(env, ["--corpus", str(corpus), "--stage-budget-minutes", "0",
+                                  "--wiki-base-dir", str(root / "wiki")], expect_rc=2)
+            self.assertIn("--stage-budget-minutes must be a positive number", out.stderr)
+
+    def test_help_states_the_compact_default_and_the_paths(self):
+        """--help names the compact default and prints the cluster paths read from config.py."""
+        import config
+
+        proc = subprocess.run([str(RUNNER), "--help"], cwd=REPO_ROOT, capture_output=True,
+                              text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("compact (default", proc.stdout)
+        self.assertIn(config.DEFAULT_WIKI_BASE_DIR, proc.stdout)
+        self.assertIn(config.DEFAULT_DATA_DIR, proc.stdout)
 
 
 if __name__ == "__main__":

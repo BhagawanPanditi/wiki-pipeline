@@ -13,23 +13,22 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Dict, List
 
 from pydantic import BaseModel, Field
 from tqdm.asyncio import tqdm
 
 # ── Configuration ────────────────────────────────────────────────────────────
-from pipeline_lib.atomic_io import atomic_write_json
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import PermanentFailure, StageBudget, TransientFailureExhausted
-from pipeline_lib.json_repair import clean_json_string
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import pool_for_stage
-from pipeline_lib.retry import retry_async
+from utils.atomic_io import atomic_write_json
+from utils.cli import build_parser, resolve_settings
+from utils.event_log import EventLog
+from utils.layout import log_path
+from utils.errors import PermanentFailure, StageBudget, TransientFailureExhausted
+from utils.json_repair import clean_json_string
+from utils.llm_pool import pool_for_stage
+from utils.retry import retry_async
 
-STAGE = "stub-resolution"
+STAGE = "resolve-stubs"
 
 class StubRelation(BaseModel):
     target_concept: str
@@ -118,7 +117,7 @@ class StubResolver:
             FileNotFoundError: If the global graph or the chunk cache is missing."""
         print("Loading global concepts & log data...")
         if not self.global_file.exists():
-            raise FileNotFoundError(f"Missing {self.global_file}. Run global_concept_consolidation.py first.")
+            raise FileNotFoundError(f"Missing {self.global_file}. Run consolidate_global.py first.")
 
         with open(self.global_file, "r", encoding="utf-8") as f:
             self.global_concepts = json.load(f).get("concepts", [])
@@ -449,9 +448,9 @@ class StubResolver:
         }
         atomic_write_json(self.log_file, self.log_data)
 
-        print(f"\n==================================================")
-        print(f"STUB RESOLUTION COMPLETE")
-        print(f"==================================================")
+        print("\n==================================================")
+        print("STUB RESOLUTION COMPLETE")
+        print("==================================================")
         print(f"Major Stubs Synthesized via LLM: +{len(new_concepts)}")
         print(f"Minor Stubs Absorbed into Parents: {len(minor_stubs_set)}")
         print(f"Total Concepts in Graph:         {len(self.global_concepts)}")

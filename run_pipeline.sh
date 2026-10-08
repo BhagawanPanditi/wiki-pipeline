@@ -34,8 +34,19 @@
 
 set -Eeuo pipefail
 
-DEFAULT_WIKI_BASE_DIR="/home/compiling-ganesh/24m0829/long_document/wiki"
-DEFAULT_DATA_DIR="/home/compiling-ganesh/24m0829/long_document/data/long_documents"
+# The cluster defaults are defined once, in config.py, and read here.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! DEFAULTS="$(python3 - "$SCRIPT_DIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import config
+print(config.DEFAULT_WIKI_BASE_DIR + "\t" + config.DEFAULT_DATA_DIR)
+PY
+)"; then
+    echo "ERROR: could not read the default paths from config.py." >&2
+    exit 2
+fi
+IFS=$'\t' read -r DEFAULT_WIKI_BASE_DIR DEFAULT_DATA_DIR <<< "$DEFAULTS"
 DEFAULT_RUN_NAME="default"
 DEFAULT_CHUNK_SIZE=4500
 DEFAULT_CHUNK_OVERLAP=400
@@ -52,7 +63,7 @@ STAGE_BUDGET_MINUTES=""
 CHUNKING=true
 CHUNK_SIZE="$DEFAULT_CHUNK_SIZE"
 CHUNK_OVERLAP="$DEFAULT_CHUNK_OVERLAP"
-LLM_LOG="full"
+LLM_LOG="compact"
 SERVERS=()
 
 usage() {
@@ -66,10 +77,10 @@ Usage:
       [--item-attempts N] [--stage-budget-minutes MIN]
 
 Runs every stage in order:
-  preflight, pass1-extraction, verification, pass2-refinement,
-  verification-pass2, document-consolidation, global-consolidation,
-  stub-resolution, thin-concept-folding, brief-generation, entity-overlap,
-  noise-audit, bidirectional-relations, final-consolidation, final-analysis
+  preflight, extract-concepts, verify-pass1, refine-concepts,
+  verify-pass2, consolidate-documents, consolidate-global,
+  resolve-stubs, fold-thin-concepts, write-briefs, link-entities,
+  audit-islands, add-reverse-links, final-consolidation, island-report
 
 Resuming is the default. Completed stages are skipped, half-finished stages
 continue from their own checkpoint, and the run proceeds to the end. Use
@@ -78,19 +89,23 @@ continue from their own checkpoint, and the run proceeds to the end. Use
 Input:
   --corpus PATH        Corpus of {id, contents} records: one JSON array (.json)
                        or one object per line (.jsonl).
-  --data-dir PATH      Legacy layout; with --domain NAME reads
-                       <data-dir>/<NAME>.jsonl.
+  --data-dir PATH      Folder that holds <NAME>.jsonl corpus files for the legacy
+                       layout (--domain without --corpus). Default: the cluster path
+                       in config.py. The DATA_DIR environment variable overrides it.
   --domain NAME        Optional hint. Names the output folder and focuses the
                        LLM prompts. Without it, outputs go to 'default/' and the
                        prompts omit the domain clause entirely.
   --no-chunking        Treat each document as one unit. No tokenizer is loaded,
                        and document consolidation becomes a pass-through.
 
-Output goes to <wiki-base-dir>/<domain or 'default'>/.
+Output goes to <wiki-base-dir>/<domain or 'default'>/. --wiki-base-dir is the folder
+that holds every run. Its default is the cluster path in config.py. The
+WIKI_BASE_DIR environment variable overrides it.
 
 Tuning:
-  --llm-log MODE       full (default, complete prompt and response), compact,
-                       or errors. Written to log/<stage>.llm.jsonl in the run dir.
+  --llm-log MODE       compact (default: prompts and replies cut to 2000 characters,
+                       with their true lengths), full (every character), or errors
+                       (failed calls only). Written to log/<stage>.llm.jsonl.
   --servers URL ...    Override config.json; work is spread evenly across them.
   --item-attempts N    Retries per LLM call inside a stage.
   --stage-budget-minutes MIN
@@ -100,6 +115,9 @@ Tuning:
   --retry-forever      Keep waiting through failures. Can also loop on permanent
                        errors, so the bounded default is safer unattended.
 EOF
+    printf '\nDefaults, from config.py (change them with --wiki-base-dir and --data-dir,\n'
+    printf 'or with the WIKI_BASE_DIR and DATA_DIR environment variables):\n'
+    printf '  wiki base dir: %s\n  data dir:      %s\n' "$DEFAULT_WIKI_BASE_DIR" "$DEFAULT_DATA_DIR"
 }
 
 # A bare first argument is still accepted as the domain, for convenience.
@@ -178,7 +196,11 @@ if [[ -n "$ITEM_ATTEMPTS" && ! "$ITEM_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 if [[ -n "$STAGE_BUDGET_MINUTES" ]] &&
-    ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$STAGE_BUDGET_MINUTES" 2>/dev/null; then
+    ! python3 - "$STAGE_BUDGET_MINUTES" 2>/dev/null <<'PY'
+import sys
+sys.exit(0 if float(sys.argv[1]) > 0 else 1)
+PY
+then
     echo "--stage-budget-minutes must be a positive number." >&2
     exit 2
 fi
@@ -222,7 +244,6 @@ else
     exit 2
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The folder name is always usable; the domain hint stays optional and is only
 # forwarded to stages when the caller actually declared one, so an undeclared
 # corpus never produces prompts about the domain "default".
@@ -232,9 +253,43 @@ STATE_DIR="${DOMAIN_DIR}/.pipeline_state"
 LOG_DIR="${DOMAIN_DIR}/log"
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
+# Completion markers are named after their step. Runs started before the stage
+# renames used the old names, so carry those markers over. Without this, a
+# resumed run would redo every renamed stage, including its LLM calls.
+migrate_step_markers() {
+    local pairs=(
+        "pass1-extraction extract-concepts"
+        "verification verify-pass1"
+        "pass2-refinement refine-concepts"
+        "verification-pass2 verify-pass2"
+        "document-consolidation consolidate-documents"
+        "global-consolidation consolidate-global"
+        "stub-resolution resolve-stubs"
+        "thin-concept-folding fold-thin-concepts"
+        "brief-generation write-briefs"
+        "entity-overlap link-entities"
+        "island-audit audit-islands"
+        "noise-audit audit-islands"
+        "reverse-relations add-reverse-links"
+        "bidirectional-relations add-reverse-links"
+        "final-analysis island-report"
+    )
+    local pair old new ext
+    for pair in "${pairs[@]}"; do
+        old="${pair%% *}"
+        new="${pair##* }"
+        for ext in done failed; do
+            if [[ -e "$STATE_DIR/$old.$ext" && ! -e "$STATE_DIR/$new.$ext" ]]; then
+                mv -- "$STATE_DIR/$old.$ext" "$STATE_DIR/$new.$ext"
+            fi
+        done
+    done
+}
+migrate_step_markers
+
 # Arguments forwarded to every stage script so one command line controls the
 # whole run. Per-stage concurrency is deliberately NOT set here: each stage
-# resolves its own default from pipeline_lib.cli.STAGE_PROFILES, because the
+# resolves its own default from utils.cli.STAGE_PROFILES, because the
 # sustainable fan-out depends on that stage's max_tokens.
 STAGE_ARGS=(--wiki_base_dir "$WIKI_BASE_DIR" --llm_log "$LLM_LOG")
 if [[ -n "$DOMAIN" ]]; then
@@ -294,9 +349,9 @@ except Exception:
 PY
 }
 
-pass1_outputs_current() {
+extraction_outputs_current() {
     # The chunk cache is reusable only if it was built from today's corpus with
-    # today's tokenizer and chunking parameters. This asks pipeline_lib.corpus
+    # today's tokenizer and chunking parameters. This asks utils.corpus
     # for the expected manifest rather than restating the recipe here, so the
     # runner and Pass 1 cannot drift apart.
     python3 - "$SCRIPT_DIR" "$DOMAIN_DIR" "$CORPUS" "$CHUNKING" "$CHUNK_SIZE" "$CHUNK_OVERLAP" <<'PY'
@@ -308,8 +363,8 @@ script_dir, domain_dir, corpus, chunking, chunk_size, overlap = sys.argv[1:]
 sys.dont_write_bytecode = True
 sys.path.insert(0, script_dir)
 try:
-    from pipeline_config import load_global_config
-    from pipeline_lib.corpus import cache_manifest
+    from config import load_global_config
+    from utils.corpus import cache_manifest
 
     cache_dir = Path(domain_dir) / "cache"
     chunks_path = cache_dir / "chunks_cache.json"
@@ -321,7 +376,7 @@ try:
         raise ValueError("missing extraction log")
 
     chunking_on = chunking == "true"
-    model = load_global_config()[2]
+    model = load_global_config()[1]
     expected = cache_manifest(
         Path(corpus),
         tokenizer_name=model if chunking_on else None,
@@ -377,10 +432,10 @@ PY
 # Ordered stage list. Rerunning any stage invalidates every marker after it,
 # because downstream output was derived from the older upstream output.
 PIPELINE_STEPS=(
-    preflight pass1-extraction verification pass2-refinement verification-pass2
-    document-consolidation global-consolidation stub-resolution thin-concept-folding
-    brief-generation entity-overlap noise-audit bidirectional-relations
-    final-consolidation final-analysis
+    preflight extract-concepts verify-pass1 refine-concepts verify-pass2
+    consolidate-documents consolidate-global resolve-stubs fold-thin-concepts
+    write-briefs link-entities audit-islands add-reverse-links
+    final-consolidation island-report
 )
 
 step_outputs_ready() {
@@ -391,25 +446,25 @@ step_outputs_ready() {
         preflight)
             return 1 # Always recheck live servers for each invocation.
             ;;
-        pass1-extraction)
+        extract-concepts)
             [[ -s "$DOMAIN_DIR/cache/chunks_cache.json" && \
               -s "$DOMAIN_DIR/cache/chunks_cache_manifest.json" && \
               -s "$DOMAIN_DIR/doc_mapping.json" && \
-              -s "$DOMAIN_DIR/extraction_log.json" ]] && pass1_outputs_current
+              -s "$DOMAIN_DIR/extraction_log.json" ]] && extraction_outputs_current
             ;;
-        verification)
+        verify-pass1)
             [[ -s "$DOMAIN_DIR/verification_log.json" ]] && \
                 verification_complete "verification.json"
             ;;
-        pass2-refinement)
+        refine-concepts)
             [[ -s "$DOMAIN_DIR/pass2_log.json" ]]
             ;;
-        verification-pass2)
+        verify-pass2)
             [[ -s "$DOMAIN_DIR/verification_pass2_log.json" && \
               -s "$DOMAIN_DIR/verification_summary.json" ]] && \
                 verification_complete "verification_pass2.json"
             ;;
-        document-consolidation)
+        consolidate-documents)
             [[ -s "$DOMAIN_DIR/doc_consolidation_log.json" && -d "$DOMAIN_DIR/consolidated" ]] || return 1
             shopt -s nullglob
             local consolidated_outputs=("$DOMAIN_DIR"/consolidated/canon_*/concepts.json)
@@ -419,13 +474,13 @@ step_outputs_ready() {
             done
             return 1
             ;;
-        global-consolidation)
+        consolidate-global)
             json_has_concepts "$DOMAIN_DIR/global_concepts.json"
             ;;
-        stub-resolution)
+        resolve-stubs)
             json_has_concepts "$DOMAIN_DIR/global_concepts_stubs_resolved.json"
             ;;
-        thin-concept-folding|brief-generation|entity-overlap|noise-audit|bidirectional-relations)
+        fold-thin-concepts|write-briefs|link-entities|audit-islands|add-reverse-links)
             json_has_concepts "$DOMAIN_DIR/global_concepts_refined.json"
             ;;
         final-consolidation)
@@ -433,7 +488,7 @@ step_outputs_ready() {
                 [[ -d "$DOMAIN_DIR/concepts_md" ]] && \
                 find "$DOMAIN_DIR/concepts_md" -maxdepth 1 -type f -name '*.md' -print -quit | grep -q .
             ;;
-        final-analysis)
+        island-report)
             [[ -s "$DOMAIN_DIR/islands_report.json" ]]
             ;;
         *)
@@ -564,36 +619,36 @@ run_step preflight python3 "$SCRIPT_DIR/check_servers.py"
 # Extraction and both verification passes. Verification runs twice: once over
 # raw Pass 1 output, and again after Pass 2 has merged its repairs, so the
 # improvement is measurable.
-run_step pass1-extraction python3 "$SCRIPT_DIR/concept_extraction_pass_1.py" \
+run_step extract-concepts python3 "$SCRIPT_DIR/extract_concepts.py" \
     "${PASS1_ARGS[@]}" --resume
-run_step verification python3 "$SCRIPT_DIR/verify_concept_extraction.py" \
+run_step verify-pass1 python3 "$SCRIPT_DIR/verify_extraction.py" \
     "${STAGE_ARGS[@]}" --phase 1 --resume
-run_step pass2-refinement python3 "$SCRIPT_DIR/concept_refinement_pass_2.py" \
+run_step refine-concepts python3 "$SCRIPT_DIR/refine_concepts.py" \
     "${STAGE_ARGS[@]}" --resume
-run_step verification-pass2 python3 "$SCRIPT_DIR/verify_concept_extraction.py" \
+run_step verify-pass2 python3 "$SCRIPT_DIR/verify_extraction.py" \
     "${STAGE_ARGS[@]}" --phase 2 --resume
 # With --no-chunking this stage passes every document through without an LLM
 # call; it still runs, because later stages read consolidated/.
-run_step document-consolidation python3 "$SCRIPT_DIR/doc_concept_consolidation.py" \
+run_step consolidate-documents python3 "$SCRIPT_DIR/consolidate_documents.py" \
     "${STAGE_ARGS[@]}"
 
-run_step global-consolidation python3 "$SCRIPT_DIR/global_concept_consolidation.py" \
+run_step consolidate-global python3 "$SCRIPT_DIR/consolidate_global.py" \
     "${STAGE_ARGS[@]}"
-run_step stub-resolution python3 "$SCRIPT_DIR/stub_resolution.py" \
+run_step resolve-stubs python3 "$SCRIPT_DIR/resolve_stubs.py" \
     "${STAGE_ARGS[@]}"
-run_step thin-concept-folding python3 "$SCRIPT_DIR/thin_concept_handler.py" \
+run_step fold-thin-concepts python3 "$SCRIPT_DIR/fold_thin_concepts.py" \
     "${STAGE_ARGS[@]}"
-run_step brief-generation python3 "$SCRIPT_DIR/add_concept_briefs.py" \
+run_step write-briefs python3 "$SCRIPT_DIR/write_briefs.py" \
     "${STAGE_ARGS[@]}"
-run_step entity-overlap python3 "$SCRIPT_DIR/link_entity_overlap.py" \
+run_step link-entities python3 "$SCRIPT_DIR/link_entities.py" \
     "${STAGE_ARGS[@]}" --min_shared_entities 2
-run_step noise-audit python3 "$SCRIPT_DIR/audit_noise_islands.py" \
+run_step audit-islands python3 "$SCRIPT_DIR/audit_islands.py" \
     "${STAGE_ARGS[@]}" --max_island_size 5
-run_step bidirectional-relations python3 "$SCRIPT_DIR/synthesize_bidirectional_relations.py" \
+run_step add-reverse-links python3 "$SCRIPT_DIR/add_reverse_links.py" \
     "${STAGE_ARGS[@]}"
-run_step final-consolidation python3 "$SCRIPT_DIR/final_consolidate_and_link.py" \
+run_step final-consolidation python3 "$SCRIPT_DIR/final_consolidation.py" \
     "${STAGE_ARGS[@]}"
-run_step final-analysis python3 "$SCRIPT_DIR/analyze_islands.py" \
+run_step island-report python3 "$SCRIPT_DIR/island_report.py" \
     "${STAGE_ARGS[@]}"
 
 cat <<EOF

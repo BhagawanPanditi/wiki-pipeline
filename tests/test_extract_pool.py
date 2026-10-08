@@ -1,4 +1,4 @@
-"""Integration tests for concept_extraction_pass_1.py's ServerPool refactor.
+"""Integration tests for extract_concepts.py's ServerPool refactor.
 
 Pass 1 needs `transformers` for its tokenizer, which is a cluster-only
 dependency, so the tokenizer is stubbed. Everything under test - the LLM call,
@@ -53,8 +53,8 @@ if "transformers" not in sys.modules:
     stub.AutoTokenizer = _Tok
     sys.modules["transformers"] = stub
 
-import concept_extraction_pass_1 as pass1  # noqa: E402
-from pipeline_lib.llm_pool import ServerPool
+import extract_concepts as extract  # noqa: E402
+from utils.llm_pool import ServerPool
 from tests.fake_vllm import FakeVLLMCluster, FakeVLLMServer  # noqa: E402
 
 GOOD = {"concepts": [{"title": "Real Concept", "description": "A description.",
@@ -70,17 +70,17 @@ def make_pipeline(root: Path, servers):
 
     Returns:
         A configured ``WikiExtractorPipeline``."""
-    parser = pass1.build_parser(stage=pass1.STAGE, description="t",
+    parser = extract.build_parser(stage=extract.STAGE, description="t",
                                 include_data_dir=True, include_resume=True)
     args = parser.parse_args(["--domain", "biology", "--wiki_base_dir", str(root),
                               "--servers", *servers, "--max_attempts", "2",
                               "--stage_budget_minutes", "2"])
-    pipe = pass1.WikiExtractorPipeline(args)
-    pipe.settings = pass1.resolve_settings(args, pass1.STAGE)
-    pipe.debug = pass1.EventLog(pass1.log_path(pipe.base_wiki_dir, pass1.STAGE, "debug"),
-                                   label=pass1.STAGE)
-    pipe.budget = pass1.StageBudget(pipe.settings.budget_minutes)
-    pipe.attempts = pass1.AttemptHistory()
+    pipe = extract.WikiExtractorPipeline(args)
+    pipe.settings = extract.resolve_settings(args, extract.STAGE)
+    pipe.debug = extract.EventLog(extract.log_path(pipe.base_wiki_dir, extract.STAGE, "debug"),
+                                   label=extract.STAGE)
+    pipe.budget = extract.StageBudget(pipe.settings.budget_minutes)
+    pipe.attempts = extract.AttemptHistory()
     pipe.flush_count = 0
     return pipe
 
@@ -113,7 +113,7 @@ class Pass1PoolTests(unittest.TestCase):
                           concurrency_per_server=pipe.settings.concurrency_per_server,
                           request_timeout=pipe.settings.profile.request_timeout,
                           connect_timeout=pipe.settings.profile.connect_timeout,
-                          label=pass1.STAGE)
+                          label=extract.STAGE)
 
         async def go():
             """Drive one pool map to completion and return its result."""

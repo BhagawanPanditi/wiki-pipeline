@@ -1,6 +1,6 @@
 """End-to-end tests for the generic corpus contract.
 
-These run ``concept_extraction_pass_1.py`` as a real subprocess against a fake
+These run ``extract_concepts.py`` as a real subprocess against a fake
 vLLM cluster, with **no ``transformers`` stub on the path**. That is the point:
 a corpus processed with ``--no-chunking`` must not need a tokenizer, an offline
 HuggingFace model, or the BRIGHT directory layout.
@@ -16,9 +16,6 @@ Pinned behaviour:
 """
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,7 +24,7 @@ from tests.fake_vllm import FakeVLLMCluster
 from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = "concept_extraction_pass_1.py"
+SCRIPT = "extract_concepts.py"
 
 DESCRIPTION = ("A dense factual description of photosynthetic electron transport including "
                "measured quantum yield of 0.84 and a turnover of 1240 electrons per second "
@@ -38,7 +35,7 @@ GOOD = {"concepts": [{"title": "Photosynthetic Electron Transport", "aliases": [
 
 
 def run_pass1(args, *, expect_rc=0, timeout=300):
-    """Run concept_extraction_pass_1.py as a subprocess and assert its exit code.
+    """Run extract_concepts.py as a subprocess and assert its exit code.
 
     Args:
         args: Command-line arguments after the script name.
@@ -178,8 +175,6 @@ class CorpusIngestTests(unittest.TestCase):
             corpus.write_text(json.dumps(
                 {"id": "d1", "contents": " ".join(f"word{i}" for i in range(60))}) + "\n",
                 encoding="utf-8")
-            base_args = self._base_args(root / "wiki", ["http://127.0.0.1:1/v1"],
-                                        corpus=str(corpus))
 
             cache = root / "wiki" / "default" / "cache"
             # Simulate a cached unchunked run.
@@ -189,7 +184,7 @@ class CorpusIngestTests(unittest.TestCase):
                   "context_before": "", "context_after": ""}]))
             (cache.parent / "doc_mapping.json").write_text(json.dumps({"d1": "canon_x"}))
 
-            from pipeline_lib.corpus import cache_manifest
+            from utils.corpus import cache_manifest
             (cache / "chunks_cache_manifest.json").write_text(json.dumps(cache_manifest(
                 corpus, tokenizer_name=None, chunking=False, chunk_size=4500, overlap=400)))
 

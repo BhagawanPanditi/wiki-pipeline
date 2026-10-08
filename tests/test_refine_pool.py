@@ -1,4 +1,4 @@
-"""End-to-end tests for concept_refinement_pass_2.py on ServerPool.
+"""End-to-end tests for refine_concepts.py on ServerPool.
 
 Pass 2 needs no cluster-only dependencies, so these run the real script as a
 subprocess against real HTTP: the merge logic, the Pass 1 backup, checkpointing,
@@ -7,18 +7,15 @@ feedback into the Pass 2 prompt.
 """
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from tests.fake_vllm import FakeVLLMCluster, FakeVLLMServer
+from tests.fake_vllm import FakeVLLMCluster
 from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = "concept_refinement_pass_2.py"
+SCRIPT = "refine_concepts.py"
 
 DELTA = {
     "new_concepts": [
@@ -34,8 +31,8 @@ DELTA = {
 }
 
 
-def run_pass2(args, *, expect_rc=0, timeout=300):
-    """Run concept_refinement_pass_2.py as a subprocess and assert its exit code.
+def run_refine(args, *, expect_rc=0, timeout=300):
+    """Run refine_concepts.py as a subprocess and assert its exit code.
 
     Args:
         args: Command-line arguments after the script name.
@@ -110,7 +107,7 @@ class Pass2Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=7)
             with FakeVLLMCluster(3, responder=lambda p, i: DELTA) as cluster:
-                out = run_pass2(self._args(base, cluster.urls, max_attempts=2))
+                out = run_refine(self._args(base, cluster.urls, max_attempts=2))
                 cluster.assert_balanced(self, expected_total=7)
             self.assertIn("Requests served per server", out.stdout)
 
@@ -155,7 +152,7 @@ class Pass2Tests(unittest.TestCase):
                 return DELTA
 
             with FakeVLLMCluster(1, responder=responder) as cluster:
-                run_pass2(self._args(base, cluster.urls))
+                run_refine(self._args(base, cluster.urls))
 
             self.assertEqual(len(seen), 1)
             prompt = seen[0]
@@ -171,7 +168,7 @@ class Pass2Tests(unittest.TestCase):
             base = self._build(Path(tmp), chunks=1, insufficient=False)
             seen = []
             with FakeVLLMCluster(1, responder=lambda p, i: (seen.append(p), DELTA)[1]) as cluster:
-                run_pass2(self._args(base, cluster.urls))
+                run_refine(self._args(base, cluster.urls))
             self.assertNotIn("AUDIT FEEDBACK", seen[0])
 
     def test_resume_skips_completed_chunks(self):
@@ -179,9 +176,9 @@ class Pass2Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=3)
             with FakeVLLMCluster(1, responder=lambda p, i: DELTA) as cluster:
-                run_pass2(self._args(base, cluster.urls))
+                run_refine(self._args(base, cluster.urls))
                 first = cluster.total_requests
-                out = run_pass2(self._args(base, cluster.urls, resume=""))
+                out = run_refine(self._args(base, cluster.urls, resume=""))
                 self.assertEqual(cluster.total_requests, first)
             self.assertIn("All chunks are already refined in Pass 2!", out.stdout)
 
@@ -190,7 +187,7 @@ class Pass2Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=3)
             with FakeVLLMCluster(3, responder=lambda p, i: ("cut off", "length")) as cluster:
-                proc = run_pass2(self._args(base, cluster.urls, max_attempts=2),
+                proc = run_refine(self._args(base, cluster.urls, max_attempts=2),
                                  expect_rc=1)
                 # 3 chunks x 2 attempts, spread one chunk per server.
                 self.assertEqual(cluster.total_requests, 6)
@@ -213,7 +210,7 @@ class Pass2Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = self._build(Path(tmp), chunks=1)
             with FakeVLLMCluster(1, responder=lambda p, i: DELTA, fail_first=1) as cluster:
-                run_pass2(self._args(base, cluster.urls, max_attempts=3))
+                run_refine(self._args(base, cluster.urls, max_attempts=3))
                 self.assertEqual(cluster.total_requests, 2)
             self.assertIn("Brand New Concept",
                           json.loads((base / "staging" / "canon_doc" / "chunk_000"
@@ -225,7 +222,7 @@ class Pass2Tests(unittest.TestCase):
             base = self._build(Path(tmp), chunks=2)
             (base / "staging" / "canon_doc" / "chunk_001" / "concepts.json").unlink()
             with FakeVLLMCluster(1, responder=lambda p, i: DELTA) as cluster:
-                proc = run_pass2(self._args(base, cluster.urls), expect_rc=1)
+                proc = run_refine(self._args(base, cluster.urls), expect_rc=1)
                 self.assertEqual(cluster.total_requests, 0)
             self.assertIn("missing valid Pass 1 concepts", proc.stdout + proc.stderr)
 

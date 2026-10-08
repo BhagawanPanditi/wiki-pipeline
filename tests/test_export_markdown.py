@@ -1,4 +1,4 @@
-"""Tests for export_markdown_wiki.py's output folder handling.
+"""Tests for export_markdown.py's output folder handling.
 
 The exporter regenerates a folder of Markdown pages. It must replace only the
 pages it wrote itself: a mistyped --output_dir must never delete unrelated notes.
@@ -42,7 +42,7 @@ class ExportFolderTests(unittest.TestCase):
             (out / "config.json").write_text("{}")
 
             for _ in range(2):
-                run_script("export_markdown_wiki.py",
+                run_script("export_markdown.py",
                            ["--domain", "biology", "--wiki_base_dir", str(root),
                             "--output_dir", str(out)])
 

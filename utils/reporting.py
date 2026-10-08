@@ -10,7 +10,6 @@ Pass 2 must not read the second run's results - it consumes the first run's
 two runs write to separate filenames and are summarised together at the end.
 """
 
-import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional

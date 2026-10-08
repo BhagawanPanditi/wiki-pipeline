@@ -18,7 +18,7 @@ def run_script(script, args, *, expect_rc=0, timeout=300):
 
     Args:
         script: File name of the script at the repository root, for example
-            ``"verify_concept_extraction.py"``.
+            ``"verify_extraction.py"``.
         args: Command-line arguments that follow the script name.
         expect_rc: The exit code the run should produce.
         timeout: Seconds to wait before the run is abandoned.

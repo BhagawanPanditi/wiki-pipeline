@@ -14,9 +14,6 @@ real stage over real HTTP against a fake cluster and inspect the JSONL:
 """
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,12 +21,12 @@ from pathlib import Path
 from tests.fake_vllm import FakeVLLMCluster
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DOC_STAGE = "doc_concept_consolidation.py"
-FINAL_STAGE = "final_consolidate_and_link.py"
+DOC_STAGE = "consolidate_documents.py"
+FINAL_STAGE = "final_consolidation.py"
 
 LONG = ("A dense factual description with enough words to look like a real concept "
         "brief including measured throughput of 1240 requests per second at 61 ms.")
-# A response longer than pipeline_lib.llm_log.COMPACT_CHAR_LIMIT, so compact mode
+# A response longer than utils.llm_log.COMPACT_CHAR_LIMIT, so compact mode
 # has something to cut and full mode has something to preserve.
 WIDE = "W" * 6000
 
@@ -78,7 +75,7 @@ class LLMCallLogTests(unittest.TestCase):
         return run_dir
 
     def _args(self, base, servers, **extra):
-        """Build document-consolidation arguments.
+        """Build consolidate-documents arguments.
 
         Args:
             base: Wiki base directory.
@@ -102,15 +99,15 @@ class LLMCallLogTests(unittest.TestCase):
             run_dir = self._stage_doc(base)
             verdict = {"merge_clusters": [{"primary_title": WIDE, "merged_titles": []}]}
             with FakeVLLMCluster(1, responder=lambda p, i: verdict) as servers:
-                run(DOC_STAGE, self._args(base, servers.urls))
+                run(DOC_STAGE, self._args(base, servers.urls, llm_log="full"))
 
-            log = run_dir / "log" / "document-consolidation.llm.jsonl"
+            log = run_dir / "log" / "consolidate-documents.llm.jsonl"
             records = read_jsonl(log)
             self.assertEqual(len(records), 1)
             rec = records[0]
 
             self.assertTrue(rec["ok"])
-            self.assertEqual(rec["stage"], "document-consolidation")
+            self.assertEqual(rec["stage"], "consolidate-documents")
             self.assertFalse(rec["response"]["truncated"])
             self.assertEqual(rec["response"]["chars"], len(json.dumps(verdict)))
             self.assertIn(WIDE, rec["response"]["text"])
@@ -136,7 +133,7 @@ class LLMCallLogTests(unittest.TestCase):
             with FakeVLLMCluster(1, responder=lambda p, i: verdict) as servers:
                 run(DOC_STAGE, self._args(base, servers.urls, llm_log="compact"))
 
-            rec = read_jsonl(run_dir / "log" / "document-consolidation.llm.jsonl")[0]
+            rec = read_jsonl(run_dir / "log" / "consolidate-documents.llm.jsonl")[0]
             self.assertTrue(rec["response"]["truncated"])
             self.assertLess(len(rec["response"]["text"]), 2400)
             # The original size is still known, so truncation is never silent.
@@ -152,7 +149,7 @@ class LLMCallLogTests(unittest.TestCase):
                 run(DOC_STAGE, self._args(base, servers.urls, llm_log="errors"))
                 self.assertEqual(servers.total_requests, 1)
 
-            log = run_dir / "log" / "document-consolidation.llm.jsonl"
+            log = run_dir / "log" / "consolidate-documents.llm.jsonl"
             self.assertFalse(log.exists(),
                              "errors mode must not write a file for a clean run")
 
@@ -167,7 +164,7 @@ class LLMCallLogTests(unittest.TestCase):
                         expect_rc=1)
                     attempts = servers.total_requests
 
-                records = read_jsonl(run_dir / "log" / "document-consolidation.llm.jsonl")
+                records = read_jsonl(run_dir / "log" / "consolidate-documents.llm.jsonl")
                 self.assertTrue(records, f"{mode}: nothing logged for a failed run")
 
                 # The HTTP exchange succeeded (200 with a garbage body), so the
@@ -240,8 +237,8 @@ class LLMCallLogTests(unittest.TestCase):
                 run(DOC_STAGE, self._args(base, servers.urls))
             self.assertTrue((run_dir / "log").is_dir())
             self.assertEqual(sorted(p.name for p in (run_dir / "log").iterdir()),
-                             ["document-consolidation.decisions.jsonl",
-                              "document-consolidation.llm.jsonl"])
+                             ["consolidate-documents.decisions.jsonl",
+                              "consolidate-documents.llm.jsonl"])
             # Nothing leaked into the repository working tree.
             self.assertFalse(list(REPO_ROOT.glob("log")))
 

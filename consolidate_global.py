@@ -14,11 +14,10 @@ Global Knowledge Graph Consolidation Pipeline
 
 import asyncio
 import json
-import os
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import networkx as nx
 # nltk only supplies a stopword list for the fuzzy-similarity heuristics. It is
@@ -43,17 +42,16 @@ except Exception:
     STOP_WORDS = {"a", "an", "the", "and", "or", "in", "of", "on", "at", "to", "for", "with", "by", "is", "it", "as", "that", "this", "are", "was"}
 
 # ── Server Configuration ─────────────────────────────────────────────────────
-from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.text import snippet_description
-from pipeline_lib.layout import log_path, run_dir_for
-from pipeline_lib.errors import StageBudget
-from pipeline_lib.json_repair import clean_json_string
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import ServerPool, pool_for_stage
+from utils.atomic_io import atomic_write_json, sanitize_filename
+from utils.cli import build_parser, resolve_settings
+from utils.event_log import EventLog
+from utils.text import snippet_description
+from utils.layout import log_path, run_dir_for
+from utils.errors import StageBudget
+from utils.json_repair import clean_json_string
+from utils.llm_pool import pool_for_stage
 
-STAGE = "global-consolidation"
+STAGE = "consolidate-global"
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
 class MergeCluster(BaseModel):
@@ -772,9 +770,9 @@ def global_consolidate(domain_dir: Path, args):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(gc, f, indent=2)
 
-    print(f"\n==================================================")
-    print(f"GLOBAL CONSOLIDATION COMPLETE")
-    print(f"==================================================")
+    print("\n==================================================")
+    print("GLOBAL CONSOLIDATION COMPLETE")
+    print("==================================================")
     print(f"Total Canonical Docs Merged:  {len(doc_files)}")
     print(f"Raw Input Concepts Loaded:    {raw_concepts_count}")
     print(f"After Exact-Match UnionFind:  {exact_count}")
@@ -782,7 +780,7 @@ def global_consolidate(domain_dir: Path, args):
     print(f"Final Global Concepts:        {len(global_concepts)}")
     print(f"Final Global Relations:       {total_global_relations}")
     print(f"Unresolved Stub Targets:      {len(sorted_unresolved_stubs)}")
-    print(f"==================================================")
+    print("==================================================")
     print(f"Outputs written to:\n  - {domain_dir / 'global_concepts.json'}\n  - {concepts_dir}/\n  - {log_file}")
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────

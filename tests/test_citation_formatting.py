@@ -5,7 +5,7 @@ import types
 import unittest
 from pathlib import Path
 
-from pipeline_lib.citation_utils import clean_brief_text, clean_chunk_citations
+from utils.citation_utils import clean_brief_text, clean_chunk_citations
 
 # tqdm is only used for export progress; keep the formatter tests runnable in
 # minimal environments where optional CLI dependencies have not been installed.
@@ -16,7 +16,7 @@ except ModuleNotFoundError:
     tqdm_stub.tqdm = lambda iterable, **kwargs: iterable
     sys.modules["tqdm"] = tqdm_stub
 
-from export_markdown_wiki import export_wiki_markdown, format_description_paragraphs
+from export_markdown import export_wiki_markdown, format_description_paragraphs
 
 
 class CitationFormattingTests(unittest.TestCase):

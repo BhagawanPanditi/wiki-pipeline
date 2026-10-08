@@ -1,4 +1,4 @@
-"""Unit tests for the shared pipeline_lib infrastructure.
+"""Unit tests for the shared utils infrastructure.
 
 These exercise the parts that replaced copy-pasted logic: error classification,
 bounded retry, deterministic server spreading with failover, checkpointing,
@@ -7,29 +7,33 @@ Pass 2 improvement arithmetic. No network access is required - the pool is
 built normally but handlers never use the client.
 """
 
+import argparse
 import asyncio
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pipeline_lib.atomic_io import atomic_write_json, read_json
-from pipeline_lib.checkpoint import CheckpointLog, load_bool_log
-from pipeline_lib.cli import STAGE_PROFILES
-from pipeline_lib.errors import (PERMANENT, RECOVERABLE, TRANSIENT,
+from utils.atomic_io import atomic_write_json, read_json
+from utils.checkpoint import CheckpointLog, load_bool_log
+from utils.cli import STAGE_PROFILES
+from utils.errors import (PERMANENT, RECOVERABLE, TRANSIENT,
                                  PermanentFailure, StageBudget,
                                  StageBudgetExceeded, TransientFailureExhausted,
                                  classify_error)
-from pipeline_lib.json_repair import clean_json_string
-from pipeline_lib.llm_pool import AllServersUnhealthy, ServerPool
-from pipeline_lib.reporting import (PASS1_RESULT, PASS2_RESULT,
+from utils.json_repair import clean_json_string
+from utils.llm_pool import AllServersUnhealthy, ServerPool
+from utils.reporting import (PASS1_RESULT, PASS2_RESULT,
                                     build_improvement, collect_metrics,
                                     format_improvement, format_report,
                                     write_summary)
-from pipeline_lib.retry import backoff_delay, retry_async
+from utils.retry import backoff_delay, retry_async
 
 SERVERS = ["http://s0/v1", "http://s1/v1", "http://s2/v1", "http://s3/v1", "http://s4/v1"]
 
@@ -538,19 +542,19 @@ class StageProfileParityTests(unittest.TestCase):
     """
 
     HISTORICAL_MAX_TOKENS = {
-        "pass1-extraction": 8192,      # concept_extraction_pass_1 --max_tokens
-        "pass2-refinement": 8192,      # concept_refinement_pass_2 --max_tokens
-        "document-consolidation": 8192,
-        "stub-resolution": 8192,
-        "verification": 4096,          # hardcoded in the original verifier
-        "verification-pass2": 4096,
-        "global-consolidation": 4096,
+        "extract-concepts": 8192,      # extract_concepts --max_tokens
+        "refine-concepts": 8192,      # refine_concepts --max_tokens
+        "consolidate-documents": 8192,
+        "resolve-stubs": 8192,
+        "verify-pass1": 4096,          # hardcoded in the original verifier
+        "verify-pass2": 4096,
+        "consolidate-global": 4096,
         "final-macro-scan": 4096,      # hardcoded macro pass
         "final-deep-verify": 1000,     # hardcoded deep-verify pass
-        "thin-concept-folding": 4096,
-        "brief-generation": 256,
-        "island-audit": 400,           # hardcoded
-        "reverse-relations": 256,      # hardcoded
+        "fold-thin-concepts": 4096,
+        "write-briefs": 256,
+        "audit-islands": 400,           # hardcoded
+        "add-reverse-links": 256,      # hardcoded
     }
 
     def test_every_profile_matches_its_historical_max_tokens(self):
@@ -585,7 +589,7 @@ class AttemptHistoryTests(unittest.TestCase):
 
     def test_attempts_are_numbered_and_flag_truncation(self):
         """Each attempt is numbered in order, and a length stop is flagged as truncated."""
-        from pipeline_lib.attempts import AttemptHistory
+        from utils.attempts import AttemptHistory
 
         history = AttemptHistory()
         history.record("doc::chunk", finish_reason="length", raw_text="cut off",
@@ -601,10 +605,129 @@ class AttemptHistoryTests(unittest.TestCase):
 
     def test_unknown_items_have_no_history_and_reads_are_copies(self):
         """An item with no attempts yields an empty list, and a returned list is a copy."""
-        from pipeline_lib.attempts import AttemptHistory
+        from utils.attempts import AttemptHistory
 
         history = AttemptHistory()
         self.assertEqual(history.get("nothing"), [])
         history.record("x", error_type="E", error_message="m")
         history.get("x").clear()
         self.assertEqual(len(history.get("x")), 1)
+
+
+class StageOverrideTests(unittest.TestCase):
+    """config.json's stage_concurrency: both accepted forms, and what a bad entry does."""
+
+    def _settings(self, overrides, stage="extract-concepts"):
+        """Resolve one stage's settings as if config.json held the given overrides.
+
+        Args:
+            overrides: The ``stage_concurrency`` mapping config.json would contain.
+            stage: Stage key to resolve.
+
+        Returns:
+            The resolved StageSettings.
+        """
+        from utils import cli
+
+        cli._warned_stage_names.clear()
+        args = argparse.Namespace(servers=["http://s0/v1"])
+        with mock.patch.object(cli, "load_stage_overrides", return_value=overrides):
+            return cli.resolve_settings(args, stage)
+
+    def test_a_plain_number_sets_the_concurrency(self):
+        """A number in stage_concurrency is that stage's concurrency_per_server."""
+        self.assertEqual(self._settings({"extract-concepts": 3}).concurrency_per_server, 3)
+
+    def test_an_object_can_set_several_values(self):
+        """The object form sets concurrency and attempts together."""
+        settings = self._settings({"add-reverse-links": {"concurrency_per_server": 9, "attempts": 6}},
+                                  stage="add-reverse-links")
+        self.assertEqual((settings.concurrency_per_server, settings.attempts), (9, 6))
+
+    def test_a_malformed_entry_is_an_error_not_a_silent_default(self):
+        """A string where a number belongs stops the stage with a clear message."""
+        with self.assertRaises(ValueError) as caught:
+            self._settings({"extract-concepts": "eight"})
+        self.assertIn("must be a number or an object", str(caught.exception))
+
+    def test_a_retired_stage_name_is_reported_and_not_applied(self):
+        """An override named after a retired stage is reported and has no effect."""
+        from utils.cli import STAGE_PROFILES
+
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            settings = self._settings({"island-audit": 5}, stage="audit-islands")
+        self.assertIn("island-audit", buffer.getvalue())
+        self.assertIn("ignored", buffer.getvalue())
+        self.assertEqual(settings.concurrency_per_server,
+                         STAGE_PROFILES["audit-islands"].concurrency_per_server)
+
+    def test_the_llm_call_log_defaults_to_compact(self):
+        """Without --llm_log the call log keeps compact records."""
+        from utils.cli import build_parser
+
+        args = build_parser(stage="extract-concepts", description="t").parse_args([])
+        self.assertEqual(args.llm_log, "compact")
+
+
+class ConfigJsonTests(unittest.TestCase):
+    """config.json's servers and model_name reach every stage; a broken file is an error."""
+
+    def _with_config(self, text):
+        """Point config.CONFIG_FILE at a temporary file holding ``text``.
+
+        Args:
+            text: Contents to write to the temporary config.json.
+
+        Returns:
+            A context manager under which ``config`` reads the temporary file.
+        """
+        import config
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "config.json"
+        path.write_text(text, encoding="utf-8")
+        return mock.patch.object(config, "CONFIG_FILE", path)
+
+    def test_servers_and_model_from_config_json_reach_the_parser_and_settings(self):
+        """A stage gets the servers and model listed in config.json unless the command line overrides them."""
+        from utils import cli
+
+        text = json.dumps({"servers": ["http://a:1/v1", "http://b:2/v1"], "model_name": "m/x"})
+        with self._with_config(text):
+            args = cli.build_parser(stage="extract-concepts", description="t").parse_args([])
+            settings = cli.resolve_settings(argparse.Namespace(), "extract-concepts")
+        self.assertEqual(args.servers, ["http://a:1/v1", "http://b:2/v1"])
+        self.assertEqual(args.model_name, "m/x")
+        self.assertEqual(settings.servers, ["http://a:1/v1", "http://b:2/v1"])
+        self.assertEqual(settings.model_name, "m/x")
+
+    def test_a_malformed_config_json_is_an_error_not_a_silent_default(self):
+        """A config.json that is not valid JSON raises instead of using the cluster defaults."""
+        import config
+
+        with self._with_config("{servers: ["):
+            with self.assertRaises(ValueError) as caught:
+                config.load_global_config()
+        self.assertIn("not readable JSON", str(caught.exception))
+
+    def test_a_stage_concurrency_that_is_not_an_object_is_an_error(self):
+        """A list where stage_concurrency belongs is reported, not silently ignored."""
+        import config
+
+        with self._with_config(json.dumps({"stage_concurrency": [8]})):
+            with self.assertRaises(ValueError) as caught:
+                config.load_stage_overrides()
+        self.assertIn("must be an object keyed by stage name", str(caught.exception))
+
+    def test_a_top_level_concurrency_key_is_flagged_once(self):
+        """The unused top-level concurrency_per_server is reported, once per process."""
+        import config
+
+        config._warned_config_keys.clear()
+        buffer = io.StringIO()
+        with self._with_config(json.dumps({"concurrency_per_server": 50})), redirect_stderr(buffer):
+            config.load_global_config()
+            config.load_global_config()
+        self.assertEqual(buffer.getvalue().count("'concurrency_per_server' is no longer used"), 1)

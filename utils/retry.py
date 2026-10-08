@@ -17,9 +17,7 @@ import asyncio
 import random
 from typing import Any, Awaitable, Callable, Optional
 
-from .errors import (PERMANENT, RECOVERABLE, TRANSIENT, PermanentFailure,
-                     StageBudget, TransientFailureExhausted, classify_error,
-                     describe_error)
+from .errors import PERMANENT, TRANSIENT, PermanentFailure, StageBudget, TransientFailureExhausted, classify_error, describe_error
 
 TRANSIENT_BASE_DELAY = 2.0
 TRANSIENT_MAX_DELAY = 20.0

@@ -19,18 +19,17 @@ config.json under "stage_concurrency" to match your real numbers.
 """
 
 import argparse
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from pipeline_config import (DEFAULT_CONCURRENCY, DEFAULT_MODEL, DEFAULT_SERVERS,
-                             load_stage_overrides)
+from config import (DEFAULT_CONCURRENCY, DEFAULT_DATA_DIR, DEFAULT_WIKI_BASE_DIR,
+                    load_global_config, load_stage_overrides)
 
 from .corpus import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, DEFAULT_RUN_NAME
 
 DEFAULT_MAX_ATTEMPTS = 4
 DEFAULT_STAGE_BUDGET_MINUTES = 45.0
-DEFAULT_DATA_DIR = "/home/compiling-ganesh/24m0829/long_document/data/long_documents"
-DEFAULT_WIKI_BASE_DIR = "/home/compiling-ganesh/24m0829/long_document/wiki"
 
 
 @dataclass(frozen=True)
@@ -53,31 +52,31 @@ class StageProfile:
 
 STAGE_PROFILES: Dict[str, StageProfile] = {
     # ── extraction: 8192-token outputs dominate KV, keep fan-out low ────────
-    "pass1-extraction":       StageProfile("pass1-extraction", 8, 300.0, 30.0, 8192),
-    "pass2-refinement":       StageProfile("pass2-refinement", 8, 300.0, 10.0, 8192),
-    "document-consolidation": StageProfile("document-consolidation", 6, 300.0, None, 8192),
+    "extract-concepts":       StageProfile("extract-concepts", 8, 300.0, 30.0, 8192),
+    "refine-concepts":       StageProfile("refine-concepts", 8, 300.0, 10.0, 8192),
+    "consolidate-documents": StageProfile("consolidate-documents", 6, 300.0, None, 8192),
     # Each stub fans out over its own source chunks 5 at a time, so 2 stubs in
     # flight is ~10 concurrent 8192-token requests per server - the KV-correct
     # figure. The old code ran 15 stubs x 5 chunks = 75 in flight, which
     # oversubscribed KV cache ~7x and caused preemption and recompute.
-    "stub-resolution":        StageProfile("stub-resolution", 2, 45.0, None, 8192),
+    "resolve-stubs":        StageProfile("resolve-stubs", 2, 45.0, None, 8192),
 
     # ── verification: long prompt, structured JSON out ─────────────────────
-    "verification":           StageProfile("verification", 12, 450.0, 10.0, 4096),
-    "verification-pass2":     StageProfile("verification-pass2", 12, 450.0, 10.0, 4096),
+    "verify-pass1":           StageProfile("verify-pass1", 12, 450.0, 10.0, 4096),
+    "verify-pass2":     StageProfile("verify-pass2", 12, 450.0, 10.0, 4096),
 
     # ── consolidation: medium outputs ──────────────────────────────────────
-    "global-consolidation":   StageProfile("global-consolidation", 16, 300.0, None, 4096),
+    "consolidate-global":   StageProfile("consolidate-global", 16, 300.0, None, 4096),
     "final-macro-scan":       StageProfile("final-macro-scan", 12, 300.0, None, 4096),
     "final-deep-verify":      StageProfile("final-deep-verify", 24, 60.0, None, 1000),
 
     # ── graph enrichment: small outputs, high fan-out ──────────────────────
     # max_tokens is 4096 because that is what this stage has always requested;
     # a smaller budget would truncate fold decisions and change output quality.
-    "thin-concept-folding":   StageProfile("thin-concept-folding", 16, 45.0, None, 4096),
-    "brief-generation":       StageProfile("brief-generation", 40, 40.0, None, 256),
-    "island-audit":           StageProfile("island-audit", 32, 60.0, None, 400),
-    "reverse-relations":      StageProfile("reverse-relations", 48, 60.0, None, 256),
+    "fold-thin-concepts":   StageProfile("fold-thin-concepts", 16, 45.0, None, 4096),
+    "write-briefs":       StageProfile("write-briefs", 40, 40.0, None, 256),
+    "audit-islands":           StageProfile("audit-islands", 32, 60.0, None, 400),
+    "add-reverse-links":      StageProfile("add-reverse-links", 48, 60.0, None, 256),
 }
 
 
@@ -132,6 +131,54 @@ class StageSettings:
     budget_minutes: Optional[float]
 
 
+_warned_stage_names: set = set()
+
+
+def _stage_override(stage: str) -> Dict[str, Any]:
+    """Return one stage's ``stage_concurrency`` entry from config.json as a dict.
+
+    A plain number is shorthand for ``{"concurrency_per_server": number}``. An
+    object is used as it is. Anything else is an error, so a typo in config.json
+    stops the run rather than being ignored.
+
+    Args:
+        stage: Stage key, for example ``"extract-concepts"``.
+
+    Returns:
+        A dict of overrides, which may be empty.
+
+    Raises:
+        ValueError: If the entry is neither a number nor an object.
+    """
+    raw = load_stage_overrides().get(stage)
+    if raw is None:
+        return {}
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, dict)):
+        raise ValueError(
+            f"config.json stage_concurrency['{stage}'] must be a number or an object, "
+            f"not {type(raw).__name__}.")
+    if isinstance(raw, dict):
+        return raw
+    return {"concurrency_per_server": int(raw)}
+
+
+def _warn_unknown_stage_overrides() -> None:
+    """Report config.json entries that name no LLM stage, once per name.
+
+    Such an entry would otherwise be ignored without a word, and the stage would
+    quietly run with its built-in limits.
+
+    Returns:
+        None. Prints one warning to stderr for each unknown name.
+    """
+    for name in load_stage_overrides():
+        if name not in STAGE_PROFILES and name not in _warned_stage_names:
+            _warned_stage_names.add(name)
+            print(f"WARNING: config.json stage_concurrency names '{name}', which is not a "
+                  f"stage that calls the LLM, so it is ignored. Valid names: "
+                  f"{', '.join(sorted(STAGE_PROFILES))}.", file=sys.stderr)
+
+
 def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
     """Merge the stage profile with config.json overrides and CLI flags.
 
@@ -140,8 +187,9 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
     which keeps the flag meaningful now that defaults differ per stage.
     """
     profile = get_profile(stage)
-    overrides = load_stage_overrides()
-    stage_override = overrides.get(stage, {}) if isinstance(overrides, dict) else {}
+    _warn_unknown_stage_overrides()
+    stage_override = _stage_override(stage)
+    servers_default, model_default = load_global_config()
 
     def pick(cli_value: Any, override_key: str, default: Any) -> Any:
         """Resolve one tunable by precedence.
@@ -175,9 +223,9 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
 
     return StageSettings(
         profile=profile,
-        servers=getattr(args, "servers", None) or DEFAULT_SERVERS,
+        servers=getattr(args, "servers", None) or servers_default,
         concurrency_per_server=max(1, concurrency),
-        model_name=getattr(args, "model_name", None) or DEFAULT_MODEL,
+        model_name=getattr(args, "model_name", None) or model_default,
         max_tokens=max_tokens,
         attempts=max(1, attempts),
         budget_minutes=float(budget) if budget else None,
@@ -220,14 +268,17 @@ def add_common_args(
                              f"Omit it for an undeclared corpus: outputs go to "
                              f"'{DEFAULT_RUN_NAME}/' and prompts skip the domain clause.")
     parser.add_argument("--wiki_base_dir", type=str, default=DEFAULT_WIKI_BASE_DIR,
-                        help="Root for all outputs; the run writes to "
-                             "<wiki_base_dir>/<domain or 'default'>/.")
+                        help="Folder that holds every run. This run writes to "
+                             "<wiki_base_dir>/<domain or 'default'>/. Default: "
+                             f"{DEFAULT_WIKI_BASE_DIR} (the cluster location; on another "
+                             "machine pass your own path).")
     parser.add_argument("--llm_log", type=str, choices=("full", "compact", "errors"),
-                        default="full",
-                        help="What to record in log/<stage>.llm.jsonl for this stage: "
-                             "'full' (default) keeps the complete untruncated prompt and "
-                             "response, 'compact' truncates both, 'errors' keeps failures "
-                             "only.")
+                        default="compact",
+                        help="How much of each LLM call to keep in log/<stage>.llm.jsonl. "
+                             "'compact' (default) cuts each prompt message and each reply "
+                             "to 2000 characters and records the true length. 'full' keeps "
+                             "every character. 'errors' keeps failed calls only. Failure "
+                             "details in the debug log are always complete.")
     if include_corpus:
         parser.add_argument("--corpus", type=str, default=None,
                             help="Corpus of {id, contents} records: one JSON array (.json) "
@@ -249,12 +300,15 @@ def add_common_args(
                             help=f"Overlap/context in tokens (default "
                                  f"{DEFAULT_CHUNK_OVERLAP}); ignored with --no-chunking.")
     if include_data_dir:
-        parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR)
+        parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR,
+                            help="Folder that holds <domain>.jsonl corpus files for the "
+                                 "legacy layout. Used only when --corpus is not given. "
+                                 f"Default: {DEFAULT_DATA_DIR} (the cluster location).")
     if include_model:
         parser.add_argument("--model_name", "--model", dest="model_name", type=str,
-                            default=DEFAULT_MODEL,
+                            default=load_global_config()[1],
                             help="Model name served by the vLLM endpoints.")
-    parser.add_argument("--servers", nargs="+", default=DEFAULT_SERVERS,
+    parser.add_argument("--servers", nargs="+", default=load_global_config()[0],
                         help="vLLM OpenAI-compatible base URLs; work is spread evenly across them.")
     parser.add_argument("--concurrency_per_server", type=int, default=0,
                         help=f"In-flight requests per server. 0 = stage default "

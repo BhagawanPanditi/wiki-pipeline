@@ -10,15 +10,12 @@ the graph-changing decisions are recorded.
 """
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from pipeline_lib.layout import LOG_DIR_NAME, log_path, run_dir_for
+from utils.layout import LOG_DIR_NAME, log_path, run_dir_for
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LONG = ("A dense factual description with enough words to look like a real concept "
@@ -66,8 +63,8 @@ class LayoutTests(unittest.TestCase):
         """Every log path is <run>/log/<stage>.<kind>.jsonl."""
         run_dir = Path("/wiki/biology")
         self.assertEqual(LOG_DIR_NAME, "log")
-        self.assertEqual(log_path(run_dir, "stub-resolution", "decisions"),
-                         Path("/wiki/biology/log/stub-resolution.decisions.jsonl"))
+        self.assertEqual(log_path(run_dir, "resolve-stubs", "decisions"),
+                         Path("/wiki/biology/log/resolve-stubs.decisions.jsonl"))
 
     def test_run_dir_uses_the_domain_or_default(self):
         """The run folder is <wiki_base_dir>/<domain>, with 'default' for no domain."""
@@ -89,13 +86,13 @@ class DecisionLogTests(unittest.TestCase):
                 concept("Gamma Unrelated", entities=["Other"]),
             ]}), encoding="utf-8")
 
-            run("link_entity_overlap.py", ["--domain", "biology", "--wiki_base_dir", str(root),
+            run("link_entities.py", ["--domain", "biology", "--wiki_base_dir", str(root),
                                            "--dry_run"])
-            self.assertFalse(log_path(domain, "entity-overlap", "decisions").exists(),
+            self.assertFalse(log_path(domain, "link-entities", "decisions").exists(),
                              "a dry run must not record decisions")
 
-            run("link_entity_overlap.py", ["--domain", "biology", "--wiki_base_dir", str(root)])
-            events = read_events(log_path(domain, "entity-overlap", "decisions"))
+            run("link_entities.py", ["--domain", "biology", "--wiki_base_dir", str(root)])
+            events = read_events(log_path(domain, "link-entities", "decisions"))
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["event"], "entity_link_added")
             self.assertEqual({events[0]["a"], events[0]["b"]}, {"Alpha Process", "Beta Process"})
@@ -117,14 +114,14 @@ class DecisionLogTests(unittest.TestCase):
                 concept("Beta Process"),
             ]}), encoding="utf-8")
 
-            run("synthesize_bidirectional_relations.py",
+            run("add_reverse_links.py",
                 ["--domain", "biology", "--wiki_base_dir", str(root), "--fast"])
 
             refined = json.loads((domain / "global_concepts_refined.json").read_text())
             beta = next(c for c in refined["concepts"] if c["title"] == "Beta Process")
             self.assertEqual([r["target_concept"] for r in beta["outbound_relations"]],
                              ["Alpha Process"])
-            events = read_events(log_path(domain, "reverse-relations", "decisions"))
+            events = read_events(log_path(domain, "add-reverse-links", "decisions"))
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["method"], "template")
             self.assertEqual((events[0]["source"], events[0]["target"]),
@@ -147,11 +144,11 @@ class DecisionLogTests(unittest.TestCase):
                                          source_chunks=[f"{doc}::chunk_000"])]}),
                     encoding="utf-8")
 
-            run("global_concept_consolidation.py",
+            run("consolidate_global.py",
                 ["--domain", "biology", "--wiki_base_dir", str(root),
                  "--servers", "http://127.0.0.1:9/v1"])
 
-            events = read_events(log_path(root / "biology", "global-consolidation",
+            events = read_events(log_path(root / "biology", "consolidate-global",
                                           "decisions"))
             merges = [e for e in events if e["event"] == "exact_merge"]
             self.assertEqual(len(merges), 1, events)

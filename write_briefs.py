@@ -16,18 +16,17 @@ from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
 
-from pipeline_lib.atomic_io import atomic_write_json, sanitize_filename
-from pipeline_lib.cli import build_parser, resolve_settings
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.text import first_sentences
-from pipeline_lib.layout import log_path
-from pipeline_lib.errors import StageBudget
-from pipeline_lib.json_repair import clean_json_string
-from pipeline_lib.llm_log import LLMCallLog
-from pipeline_lib.llm_pool import pool_for_stage
-from pipeline_lib.citation_utils import clean_brief_text
+from utils.atomic_io import atomic_write_json, sanitize_filename
+from utils.cli import build_parser, resolve_settings
+from utils.event_log import EventLog
+from utils.text import first_sentences
+from utils.layout import log_path
+from utils.errors import StageBudget
+from utils.json_repair import clean_json_string
+from utils.llm_pool import pool_for_stage
+from utils.citation_utils import clean_brief_text
 
-STAGE = "brief-generation"
+STAGE = "write-briefs"
 
 # ── Data Schema ──────────────────────────────────────────────────────────────
 class ConceptBriefSchema(BaseModel):
@@ -83,7 +82,7 @@ async def generate_brief_llm(client, concept, settings) -> str:
 # ── Main Pipeline ────────────────────────────────────────────────────────────
 class ConceptBriefPipeline:
     def __init__(self, args):
-        """Prepare a brief-generation run. Nothing is read or written yet.
+        """Prepare a write-briefs run. Nothing is read or written yet.
 
         Args:
             args: Parsed CLI namespace with ``domain``, ``wiki_base_dir`` and the shared
@@ -252,9 +251,9 @@ class ConceptBriefPipeline:
 
             atomic_write_json(file_path, gc)
 
-        print(f"\n==================================================")
-        print(f"CONCEPT BRIEF GENERATION COMPLETE")
-        print(f"==================================================")
+        print("\n==================================================")
+        print("CONCEPT BRIEF GENERATION COMPLETE")
+        print("==================================================")
         print(f"Total Concepts Processed:  {len(reordered_concepts)}")
         print(f"Short Descriptions Reused: {already_briefed}")
         print(f"LLM Briefs Generated:       {len(tasks_to_generate)}")

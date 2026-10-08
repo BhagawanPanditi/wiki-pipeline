@@ -6,9 +6,9 @@ behaviours instead of collapsing them into one and silently changing output:
 
 * default                 fenced ```json {...}``` block only
 * ``allow_bare_object``   also accept an unfenced outermost ``{...}``
-                          (concept_refinement_pass_2 behaviour)
+                          (refine_concepts behaviour)
 * ``allow_array``         also accept a fenced ``[...]`` payload
-                          (final_consolidate_and_link behaviour)
+                          (final_consolidation behaviour)
 """
 
 import re

@@ -1,4 +1,4 @@
-"""Integration tests for stages refactored onto pipeline_lib.ServerPool.
+"""Integration tests for stages refactored onto utils.ServerPool.
 
 These run the real stage scripts as subprocesses against real HTTP servers, so
 they cover the parts a unit test cannot: argument resolution, even spreading of
@@ -7,9 +7,6 @@ failure contract.
 """
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,9 +20,9 @@ from tests.helpers import run_script as run_stage
 
 
 class ReverseRelationsTests(unittest.TestCase):
-    """synthesize_bidirectional_relations.py"""
+    """add_reverse_links.py"""
 
-    SCRIPT = "synthesize_bidirectional_relations.py"
+    SCRIPT = "add_reverse_links.py"
 
     def _build_graph(self, root: Path, chain=("A", "B", "C", "D", "E", "F")) -> Path:
         """A one-directional chain, so every link needs a synthesized back-link."""
@@ -129,9 +126,9 @@ class ReverseRelationsTests(unittest.TestCase):
 
 
 class ConceptBriefTests(unittest.TestCase):
-    """add_concept_briefs.py"""
+    """write_briefs.py"""
 
-    SCRIPT = "add_concept_briefs.py"
+    SCRIPT = "write_briefs.py"
     LONG_DESC = ("The mechanism operates across three distinct phases. "
                  "Each phase contributes a measurable throughput gain of 12 percent. "
                  "Observed latency dropped from 84 ms to 61 ms under load. "

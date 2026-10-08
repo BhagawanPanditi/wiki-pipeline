@@ -77,7 +77,6 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 self._send_json(fail_with, {"error": {"message": "injected fault"}})
                 return
-            recorded = list(state["prompts"])
 
         try:
             payload = json.loads(raw)

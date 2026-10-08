@@ -1,6 +1,6 @@
 """Tests for document consolidation when the corpus was not chunked.
 
-``doc_concept_consolidation.py`` exists to merge duplicate concepts found in
+``consolidate_documents.py`` exists to merge duplicate concepts found in
 *different chunks of the same document*. With ``--no-chunking`` there is exactly
 one unit per document, so there is nothing to merge -- and the stage must not
 spend LLM calls discovering that.
@@ -11,9 +11,6 @@ assertion that no request was made.
 """
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,7 +19,7 @@ from tests.fake_vllm import FakeVLLMCluster
 from tests.helpers import run_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = "doc_concept_consolidation.py"
+SCRIPT = "consolidate_documents.py"
 DEAD_SERVER = "http://127.0.0.1:9/v1"
 
 LONG = ("A dense factual description with enough words to look like a real concept "
@@ -44,7 +41,7 @@ def concept(title, chunk):
 
 
 def run_stage(args, *, expect_rc=0, timeout=300):
-    """Run doc_concept_consolidation.py as a subprocess and assert its exit code.
+    """Run consolidate_documents.py as a subprocess and assert its exit code.
 
     Args:
         args: Command-line arguments after the script name.

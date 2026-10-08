@@ -82,7 +82,7 @@ class ServerPool:
         failover: Whether to move work off a server that stops responding.
         unhealthy_threshold: Consecutive failures before a server is marked
             unhealthy.
-        llm_log: Optional :class:`~pipeline_lib.llm_log.LLMCallLog`. When given,
+        llm_log: Optional :class:`~utils.llm_log.LLMCallLog`. When given,
             every request issued through this pool is appended to it, and the
             log is closed when the pool closes.
     """

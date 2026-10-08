@@ -17,12 +17,12 @@ from typing import Dict, List, Set, Any, Tuple
 import networkx as nx
 from tqdm import tqdm
 
-from pipeline_lib.atomic_io import atomic_write_json
-from pipeline_lib.cli import build_parser
-from pipeline_lib.event_log import EventLog
-from pipeline_lib.layout import log_path
+from utils.atomic_io import atomic_write_json
+from utils.cli import build_parser
+from utils.event_log import EventLog
+from utils.layout import log_path
 
-STAGE = "entity-overlap"
+STAGE = "link-entities"
 
 def normalize_entity(ent: str) -> str:
     """Normalise an entity name so that equal names match.
@@ -197,7 +197,7 @@ def enrich_graph_via_entity_overlap(
     print("Successfully enriched graph with entity overlap links!")
 
 def main() -> None:
-    """Add entity-overlap links to the refined graph and report what changed.
+    """Add link-entities links to the refined graph and report what changed.
 
     Reads ``global_concepts_refined.json`` from the run directory, links concepts
     that share enough entities, and writes the enriched graph back in place.
