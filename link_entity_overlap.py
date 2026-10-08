@@ -11,7 +11,6 @@ Connects isolated nodes to the giant component while keeping edges informative.
 """
 
 import json
-import argparse
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Set, Any, Tuple
@@ -19,6 +18,9 @@ import networkx as nx
 from tqdm import tqdm
 
 from pipeline_lib.atomic_io import atomic_write_json
+from pipeline_lib.cli import build_parser
+
+STAGE = "entity-overlap"
 
 def normalize_entity(ent: str) -> str:
     return ent.strip().lower()
@@ -163,13 +165,31 @@ def enrich_graph_via_entity_overlap(
 
     print("Successfully enriched graph with entity overlap links!")
 
-def main():
-    parser = argparse.ArgumentParser(description="Enrich KG connections using entity overlap")
-    parser.add_argument("--domain", type=str, required=True, help="Domain name (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--min_shared_entities", type=int, default=2, help="Minimum shared entities to establish link")
-    parser.add_argument("--max_links_per_node", type=int, default=4, help="Max new edges per node to avoid star graph pollution")
-    parser.add_argument("--dry_run", action="store_true", help="Simulate without modifying files")
+def main() -> None:
+    """Add entity-overlap links to the refined graph and report what changed.
+
+    Reads ``global_concepts_refined.json`` from the run directory, links concepts
+    that share enough entities, and writes the enriched graph back in place.
+
+    Returns:
+        None. With ``--dry_run`` nothing is written and the intended changes are
+        only printed.
+    """
+    # This stage makes no LLM calls. It uses the shared parser anyway so that one
+    # uniform command line works for every stage in run_pipeline.sh; the server
+    # and retry flags are accepted and ignored.
+    parser = build_parser(
+        stage=STAGE,
+        description="Enrich knowledge graph connections using entity overlap "
+                    "(no LLM calls)",
+        include_max_tokens=False,
+        include_model=False)
+    parser.add_argument("--min_shared_entities", type=int, default=2,
+                        help="Minimum shared entities to establish a link.")
+    parser.add_argument("--max_links_per_node", type=int, default=4,
+                        help="Max new edges per node, to avoid star-graph pollution.")
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Simulate without modifying files.")
 
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain

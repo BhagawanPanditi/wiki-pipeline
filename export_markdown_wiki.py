@@ -21,11 +21,13 @@ Generates clean Markdown concept files in `concepts_md/` directory:
 
 import re
 import json
-import argparse
 from pathlib import Path
 from typing import List
 from tqdm import tqdm
 
+from pipeline_lib.cli import build_parser
+
+STAGE = "markdown-export"
 from pipeline_lib.citation_utils import (
     clean_brief_text,
     clean_chunk_citations as normalize_chunk_citations,
@@ -272,11 +274,28 @@ def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
 
     print(f"\nSuccessfully exported {exported_count} Markdown wiki files to: {output_dir}/")
 
-def main():
-    parser = argparse.ArgumentParser(description="Export concepts to Obsidian Markdown format")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
-    parser.add_argument("--output_dir", type=str, default=None, help="Custom output directory for Markdown files")
+def main() -> None:
+    """Render the refined concept graph as one Markdown file per concept.
+
+    Reads ``global_concepts_refined.json`` from the run directory and writes an
+    Obsidian-style Markdown page per concept, with citations resolved through
+    ``cache/doc_mapping.json``.
+
+    Returns:
+        None. Writes to ``--output_dir`` if given, otherwise
+        ``<wiki_base_dir>/<domain>/concepts_md/``.
+    """
+    # This stage makes no LLM calls. It uses the shared parser anyway so one
+    # uniform command line works for every stage; the server and retry flags are
+    # accepted and ignored.
+    parser = build_parser(
+        stage=STAGE,
+        description="Export concepts to Obsidian Markdown format (no LLM calls)",
+        include_max_tokens=False,
+        include_model=False)
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Custom output directory for Markdown files. "
+                             "Defaults to <wiki_base_dir>/<domain>/concepts_md/.")
 
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain

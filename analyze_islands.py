@@ -6,12 +6,14 @@ Finds all disconnected subgraphs (islands/components) in the knowledge graph.
 """
 
 import json
-import argparse
 from pathlib import Path
 from collections import Counter
 import networkx as nx
 
 from pipeline_lib.atomic_io import atomic_write_json
+from pipeline_lib.cli import build_parser
+
+STAGE = "final-analysis"
 
 def analyze_kg_islands(domain_dir: Path):
     refined_file = domain_dir / "global_concepts_refined.json"
@@ -115,10 +117,25 @@ def analyze_kg_islands(domain_dir: Path):
 
     print(f"\nSaved full island report to: {report_file}")
 
-def main():
-    parser = argparse.ArgumentParser(description="Knowledge Graph Island Analyzer")
-    parser.add_argument("--domain", type=str, required=True, help="Target domain (e.g. biology)")
-    parser.add_argument("--wiki_base_dir", type=str, default="/home/compiling-ganesh/24m0829/long_document/wiki")
+def main() -> None:
+    """Measure how disconnected the finished graph is and write a report.
+
+    Reads ``global_concepts_refined.json`` from the run directory, finds
+    connected components and isolated concepts, and writes
+    ``islands_report.json``. This is the last stage of the pipeline, so its
+    report is the run's final quality signal.
+
+    Returns:
+        None.
+    """
+    # This stage makes no LLM calls. It uses the shared parser anyway so that one
+    # uniform command line works for every stage in run_pipeline.sh; the server
+    # and retry flags are accepted and ignored.
+    parser = build_parser(
+        stage=STAGE,
+        description="Knowledge graph island analyzer (no LLM calls)",
+        include_max_tokens=False,
+        include_model=False)
 
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain
