@@ -25,6 +25,8 @@ from typing import Any, Dict, Optional
 from pipeline_config import (DEFAULT_CONCURRENCY, DEFAULT_MODEL, DEFAULT_SERVERS,
                              load_stage_overrides)
 
+from .corpus import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, DEFAULT_RUN_NAME
+
 DEFAULT_MAX_ATTEMPTS = 4
 DEFAULT_STAGE_BUDGET_MINUTES = 45.0
 DEFAULT_DATA_DIR = "/home/compiling-ganesh/24m0829/long_document/data/long_documents"
@@ -77,6 +79,37 @@ STAGE_PROFILES: Dict[str, StageProfile] = {
     "island-audit":           StageProfile("island-audit", 32, 60.0, None, 400),
     "reverse-relations":      StageProfile("reverse-relations", 48, 60.0, None, 256),
 }
+
+
+class StageArgumentParser(argparse.ArgumentParser):
+    """Argument parser that normalises the optional ``--domain`` flag.
+
+    ``--domain`` serves two different jobs, so it is split on the way in:
+
+    * ``args.domain`` -- always a usable directory/label name. When the caller
+      omits ``--domain`` this becomes ``"default"``, so every existing
+      ``<wiki_base_dir>/<domain>/`` path expression keeps working unchanged.
+    * ``args.domain_label`` -- the *optional* hint itself, ``None`` when it was
+      not supplied. LLM prompts use this, so a corpus with no declared domain
+      does not get a meaningless "in the field of None" instruction.
+    """
+
+    def parse_args(self, args=None, namespace=None):
+        """Parse arguments and apply the domain normalisation described above.
+
+        Args:
+            args: Argument list, defaulting to ``sys.argv[1:]``.
+            namespace: Optional pre-populated namespace.
+
+        Returns:
+            The parsed ``argparse.Namespace`` with ``domain`` and
+            ``domain_label`` populated.
+        """
+        parsed = super().parse_args(args, namespace)
+        if hasattr(parsed, "domain"):
+            parsed.domain_label = parsed.domain or None
+            parsed.domain = parsed.domain or DEFAULT_RUN_NAME
+        return parsed
 
 
 def get_profile(stage: str) -> StageProfile:
@@ -148,13 +181,61 @@ def add_common_args(
     include_max_tokens: bool = True,
     include_resume: bool = False,
     include_model: bool = True,
+    include_corpus: bool = False,
 ) -> argparse.ArgumentParser:
-    """Attach the argument block shared by every stage script."""
+    """Attach the argument block shared by every stage script.
+
+    Args:
+        parser: Parser to extend; mutated in place and returned.
+        stage: Stage profile key, used to look up concurrency defaults.
+        description: Shown in ``--help``.
+        include_data_dir: Add the legacy ``--data_dir`` flag.
+        include_max_tokens: Add ``--max_tokens`` (off for stages whose output
+            length is fixed by the prompt).
+        include_resume: Add ``--resume``.
+        include_model: Add ``--model_name`` with a ``--model`` alias.
+        include_corpus: Add ``--corpus`` plus the chunking flags, for the stage
+            that reads the source documents.
+
+    Returns:
+        The same parser, with all requested arguments attached.
+    """
     profile = get_profile(stage)
 
-    parser.add_argument("--domain", type=str, required=True,
-                        help="Target domain (e.g. biology, robotics)")
-    parser.add_argument("--wiki_base_dir", type=str, default=DEFAULT_WIKI_BASE_DIR)
+    parser.add_argument("--domain", type=str, default=None,
+                        help="Optional domain hint (e.g. biology, robotics). Names the "
+                             "output folder and, when given, focuses the LLM prompts. "
+                             f"Omit it for an undeclared corpus: outputs go to "
+                             f"'{DEFAULT_RUN_NAME}/' and prompts skip the domain clause.")
+    parser.add_argument("--wiki_base_dir", type=str, default=DEFAULT_WIKI_BASE_DIR,
+                        help="Root for all outputs; the run writes to "
+                             "<wiki_base_dir>/<domain or 'default'>/.")
+    parser.add_argument("--llm_log", type=str, choices=("full", "compact", "errors"),
+                        default="full",
+                        help="What to record in logs/llm_calls.jsonl for this stage: "
+                             "'full' (default) keeps the complete untruncated prompt and "
+                             "response, 'compact' truncates both, 'errors' keeps failures "
+                             "only.")
+    if include_corpus:
+        parser.add_argument("--corpus", type=str, default=None,
+                            help="Corpus of {id, contents} records: one JSON array (.json) "
+                                 "or one object per line (.jsonl). Replaces the legacy "
+                                 "--data_dir/--domain lookup.")
+        chunk_group = parser.add_mutually_exclusive_group()
+        chunk_group.add_argument("--chunking", dest="chunking", action="store_true",
+                                 default=True,
+                                 help="Split long documents into overlapping token windows "
+                                      "(default). Needs a tokenizer.")
+        chunk_group.add_argument("--no-chunking", dest="chunking", action="store_false",
+                                 help="Treat each document as one unit. No tokenizer is "
+                                      "loaded and per-document chunk consolidation becomes "
+                                      "a pass-through.")
+        parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE,
+                            help=f"Chunk window in tokens (default {DEFAULT_CHUNK_SIZE}); "
+                                 "ignored with --no-chunking.")
+        parser.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP,
+                            help=f"Overlap/context in tokens (default "
+                                 f"{DEFAULT_CHUNK_OVERLAP}); ignored with --no-chunking.")
     if include_data_dir:
         parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR)
     if include_model:
@@ -187,5 +268,5 @@ def add_common_args(
 
 def build_parser(*, stage: str, description: str, **kwargs: Any) -> argparse.ArgumentParser:
     """Create a parser preloaded with the shared stage arguments."""
-    return add_common_args(argparse.ArgumentParser(description=description),
+    return add_common_args(StageArgumentParser(description=description),
                            stage=stage, description=description, **kwargs)

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -10,11 +9,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, ValidationError
 from tqdm.asyncio import tqdm
-from transformers import AutoTokenizer
 
 from pipeline_lib.atomic_io import atomic_write_json
 from pipeline_lib.checkpoint import load_bool_log, save_log_async, save_log_sync
 from pipeline_lib.cli import build_parser, resolve_settings
+from pipeline_lib.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
+                                 build_units, cache_manifest, deduplicate,
+                                 load_corpus, resolve_corpus_path,
+                                 save_run_config)
 from pipeline_lib.debug_log import DebugLogger
 from pipeline_lib.errors import PermanentFailure, StageBudget
 from pipeline_lib.json_repair import clean_json_string
@@ -39,50 +41,9 @@ class ChunkExtractionSchema(BaseModel):
     concepts: List[Concept] = Field(default_factory=list)
 
 # ── Helper Utilities ─────────────────────────────────────────────────────────
-
-def short_hash(text: str) -> str:
-    """Computes MD5 hash for string deduplication."""
-    return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
-
-# ── Pre-Deduplication & Chunking ─────────────────────────────────────────────
-
-def chunk_document(
-    doc_id: str,
-    content: str,
-    tokenizer,
-    chunk_size: int = 4500,
-    overlap: int = 400
-) -> List[Dict[str, Any]]:
-    """Splits document into token chunks with context before/after."""
-    tokens = tokenizer.encode(content)
-    total_tokens = len(tokens)
-    
-    if total_tokens == 0:
-        return []
-
-    chunks = []
-    step = chunk_size - overlap
-    chunk_idx = 0
-
-    for start in range(0, total_tokens, step):
-        end = min(start + chunk_size, total_tokens)
-        
-        chunk_tokens = tokens[start:end]
-        before_tokens = tokens[max(0, start - overlap):start]
-        after_tokens = tokens[end:min(total_tokens, end + overlap)]
-
-        chunks.append({
-            "doc_id": doc_id,
-            "chunk_id": f"chunk_{chunk_idx:03d}",
-            "current_chunk": tokenizer.decode(chunk_tokens, skip_special_tokens=True),
-            "context_before": tokenizer.decode(before_tokens, skip_special_tokens=True),
-            "context_after": tokenizer.decode(after_tokens, skip_special_tokens=True),
-        })
-        chunk_idx += 1
-        if end >= total_tokens:
-            break
-
-    return chunks
+# short_hash, chunk_document and the rest of the corpus contract live in
+# pipeline_lib/corpus.py so that every stage agrees on document ids, chunk ids
+# and citation keys.
 
 # ── System Prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
@@ -189,28 +150,50 @@ class WikiExtractorPipeline:
             return False
 
     def prepare_chunks(self) -> List[Dict[str, Any]]:
-        """Deduplicate documents and reuse chunks only when their inputs match."""
+        """Load the corpus, deduplicate it, and build this stage's work units.
+
+        The corpus may be a single JSON array or JSON Lines, and may be given
+        with ``--corpus`` or resolved from the legacy ``--data_dir``/``--domain``
+        layout. Documents with identical content are collapsed into one
+        canonical document; the original ids are written to
+        ``cache/doc_mapping.json`` so citations can be traced back to the source.
+
+        Chunking is optional. With ``--no-chunking`` each document becomes a
+        single unit and no tokenizer is loaded, so ``transformers`` and an
+        offline HuggingFace model are not required.
+
+        A previously built ``cache/chunks_cache.json`` is reused only when its
+        manifest matches today's corpus digest, tokenizer and chunking
+        parameters exactly; otherwise it is rebuilt.
+
+        Returns:
+            A list of unit dicts with keys ``doc_id``, ``chunk_id``,
+            ``current_chunk``, ``context_before`` and ``context_after``.
+
+        Raises:
+            CorpusError: If no corpus was specified, the file is missing, or a
+                record has no usable content.
+            ValueError: If ``--chunk_overlap`` is not smaller than
+                ``--chunk_size``.
+        """
         chunks_cache_file = self.cache_dir / "chunks_cache.json"
         cache_manifest_file = self.cache_dir / "chunks_cache_manifest.json"
         mapping_file = self.cache_dir / "doc_mapping.json"
-        doc_path = Path(self.args.data_dir) / f"{self.domain}.jsonl"
-        if not doc_path.exists():
-            raise FileNotFoundError(f"Missing domain file: {doc_path}")
+
+        corpus_path = resolve_corpus_path(self.args)
+        chunking = bool(getattr(self.args, "chunking", True))
+        chunk_size = int(getattr(self.args, "chunk_size", DEFAULT_CHUNK_SIZE))
+        overlap = int(getattr(self.args, "chunk_overlap", DEFAULT_CHUNK_OVERLAP))
 
         # A pre-existing chunks_cache.json is not sufficient evidence that its
         # chunks describe today's input. Hash the source and bind the cache to
         # the tokenizer name and chunking parameters before reusing it.
-        source_digest = hashlib.sha256()
-        with doc_path.open("rb") as source_file:
-            for block in iter(lambda: source_file.read(1024 * 1024), b""):
-                source_digest.update(block)
-        expected_manifest = {
-            "format_version": 1,
-            "source_sha256": source_digest.hexdigest(),
-            "tokenizer": self.args.model_name,
-            "chunk_size": 4500,
-            "overlap": 400,
-        }
+        expected_manifest = cache_manifest(
+            corpus_path,
+            tokenizer_name=self.args.model_name if chunking else None,
+            chunking=chunking,
+            chunk_size=chunk_size,
+            overlap=overlap)
 
         if chunks_cache_file.exists() and cache_manifest_file.exists() and mapping_file.exists():
             try:
@@ -234,55 +217,52 @@ class WikiExtractorPipeline:
         elif chunks_cache_file.exists():
             print("Cached chunks are missing required metadata; rebuilding them for safety.")
 
-        print(f"Loading documents from {doc_path}...")
-        raw_docs = []
-        with open(doc_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    raw_docs.append(json.loads(line))
+        print(f"Loading corpus from {corpus_path}...")
+        docs = load_corpus(corpus_path)
 
         print("Deduplicating documents based on content hash...")
-        by_hash = {}
-        for d in raw_docs:
-            h = short_hash(d["content"])
-            if h not in by_hash:
-                by_hash[h] = f"canon_{h}"
-
-        canon_docs = {}
-        for d in raw_docs:
-            h = short_hash(d["content"])
-            cid = by_hash[h]
-            if cid not in canon_docs:
-                canon_docs[cid] = d["content"]
-
+        canon_docs, doc_mapping = deduplicate(docs)
         # Refresh the mapping whenever the source signature changes, rather than
         # retaining mappings that may belong to an older version of the corpus.
-        def fix_mojibake(text: str) -> str:
-            try:
-                return text.encode("cp437").decode("utf-8")
-            except (UnicodeEncodeError, UnicodeDecodeError, AttributeError):
-                return text
-
-        doc_mapping = {}
-        for d in raw_docs:
-            raw_id = d.get("id", d.get("doc_id", "UNKNOWN_ID"))
-            clean_id = fix_mojibake(raw_id)
-            doc_mapping[clean_id] = f"canon_{short_hash(d['content'])}"
         atomic_write_json(mapping_file, doc_mapping)
+        print(f"Deduplicated {len(docs)} docs down to {len(canon_docs)} unique canonical docs.")
 
-        print(f"Deduplicated {len(raw_docs)} docs down to {len(canon_docs)} unique canonical docs.")
-        print("Tokenizing and creating chunks (4500 tokens window + overlap)...")
-        tokenizer = AutoTokenizer.from_pretrained(self.args.model_name, trust_remote_code=True, local_files_only=True)
-        
-        all_chunks = []
-        for canon_id, content in canon_docs.items():
-            doc_chunks = chunk_document(canon_id, content, tokenizer)
-            all_chunks.extend(doc_chunks)
+        # Record how this run was prepared so later stages (notably
+        # per-document consolidation) can tell whether chunking was on without
+        # being told again on their command line.
+        save_run_config(self.base_wiki_dir, {
+            "corpus": str(corpus_path),
+            "corpus_sha256": expected_manifest["source_sha256"],
+            "domain": self.args.domain_label,
+            "run_name": self.domain,
+            "model_name": self.args.model_name,
+            "chunking": chunking,
+            "chunk_size": chunk_size if chunking else None,
+            "chunk_overlap": overlap if chunking else None,
+            "documents": len(docs),
+            "unique_documents": len(canon_docs),
+        })
+
+        tokenizer = None
+        if chunking:
+            # Imported lazily: an unchunked corpus needs no tokenizer, so the
+            # pipeline runs without transformers installed.
+            from transformers import AutoTokenizer
+
+            print(f"Tokenizing and creating chunks "
+                  f"({chunk_size} token window, {overlap} overlap)...")
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.args.model_name, trust_remote_code=True, local_files_only=True)
+        else:
+            print("Chunking disabled: treating each document as a single unit.")
+
+        all_chunks = build_units(canon_docs, tokenizer, chunking=chunking,
+                                 chunk_size=chunk_size, overlap=overlap)
 
         atomic_write_json(chunks_cache_file, all_chunks)
         atomic_write_json(cache_manifest_file, expected_manifest)
 
-        print(f"Cached {len(all_chunks)} chunks to disk.")
+        print(f"Cached {len(all_chunks)} unit(s) to disk.")
         return all_chunks
 
     def _record_attempt(self, key: str, finish_reason, raw_text, error_type: str,
@@ -489,11 +469,24 @@ class WikiExtractorPipeline:
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
+    """Parse arguments and run Pass 1 concept extraction to completion.
+
+    Reads the corpus given by ``--corpus`` (or the legacy
+    ``--data_dir``/``--domain`` pair), extracts concepts from every unit through
+    the server pool, and writes per-chunk results under ``staging/`` plus the
+    citation mapping under ``cache/doc_mapping.json``. Resumes from
+    ``extraction_log.json`` unless ``--resume`` is omitted.
+
+    Returns:
+        None. Exits non-zero if a stage budget expires or the pool reports
+        unresolved failures.
+    """
     parser = build_parser(
         stage=STAGE,
-        description="High-Throughput Concept Extractor for BRIGHT Wiki Benchmark",
+        description="High-throughput concept extractor: corpus -> per-chunk concepts",
         include_data_dir=True,
+        include_corpus=True,
         include_resume=True)
     args = parser.parse_args()
     pipeline = WikiExtractorPipeline(args)
