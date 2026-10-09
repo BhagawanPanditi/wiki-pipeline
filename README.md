@@ -273,6 +273,7 @@ python3 verify_extraction.py --domain $D --wiki_base_dir $W --phase 1
 ```
 
 Needs: step 1. Writes: `staging/*/*/verification.json`, `verification_log.json`.
+Optional with `run_pipeline.sh --skip-verify-pass1`.
 
 **3. Refine (Pass 2)**
 
@@ -280,7 +281,9 @@ Needs: step 1. Writes: `staging/*/*/verification.json`, `verification_log.json`.
 python3 refine_concepts.py --domain $D --wiki_base_dir $W
 ```
 
-Needs: steps 1 and 2. It uses the missing concepts and facts that verification listed.
+Needs: step 1. It uses the missing concepts and facts from step 2 when available.
+The runner passes `--ignore_audit_feedback` if Pass 1 verification is skipped, so
+stale verification files do not influence new refinement work.
 Writes: updated `staging/*/*/concepts.json`, `concepts_pass1_backup.json`, `pass2_log.json`.
 
 **4. Verify Pass 2**
@@ -290,7 +293,7 @@ python3 verify_extraction.py --domain $D --wiki_base_dir $W --phase 2
 ```
 
 Needs: step 3. Writes: `verification_pass2.json`, `verification_summary.json`, and prints the
-improvement report (section 14).
+improvement report (section 14). Optional with `run_pipeline.sh --skip-verify-pass2`.
 
 **5. Consolidate within documents**
 
@@ -409,9 +412,27 @@ in `DIR/.export_manifest.json`. Other files in the folder are not touched.
 | `--stage-budget-minutes M` | stage default (45) | Wall-clock limit per stage (section 12). |
 | `--max-stage-attempts N` | 3 | How many times the runner restarts a failed stage. |
 | `--retry-forever` | off | Never give up on a stage. This also retries permanent errors, so use it with care. |
+| `--skip-verify-pass2` | off | Bypass Pass 2 verification and continue to document consolidation. No verification summary is updated. |
+| `--skip-verify-pass1` | off | Bypass Pass 1 verification; refinement runs without audit feedback unless also skipped. |
+| `--skip-refinement` | off | Bypass Pass 2 refinement and implicitly bypass Pass 2 verification; consolidate the currently available concepts. Can be combined with `--skip-verify-pass1`. |
+| `--skip-verification` | off | Bypass both extraction verification passes; refinement still runs unless `--skip-refinement` is also set. Does not skip final consolidation's candidate review. |
 | `--fresh` | off | Clear the completion markers so that every stage runs again. No output is deleted. |
 
 `./run_pipeline.sh --help` prints these, with the resolved default paths at the end.
+
+To continue a run stalled at Pass 2 verification, rerun the same pipeline command
+with `--skip-verify-pass2` (for example, `./run_pipeline.sh --domain biology
+--wiki-base-dir /path/to/wiki --skip-verify-pass2`). Skipping leaves existing
+audit files intact but does not mark an audit as done. A later run without the
+flag can resume it. An existing `verification_summary.json` may be stale; it is
+not refreshed when either audit is skipped. Skipping Pass 1 also suppresses
+reading old Pass 1 audit files during *new* refinement work; completed
+refinements are not undone. To go directly from extraction to document
+consolidation, use `--skip-verify-pass1 --skip-refinement` (the latter also
+skips Pass 2 verification). Skipping refinement preserves the staging concepts
+as they are: if an earlier run already refined them, the skip flag does not
+restore the Pass 1 backup. Skipped stages leave their output data and logs
+intact and can be resumed on a subsequent run without skip flags.
 
 ### 7.2 Stages
 

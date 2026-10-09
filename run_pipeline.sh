@@ -16,6 +16,8 @@
 #       [--wiki-base-dir PATH] [--data-dir PATH]
 #       [--chunking | --no-chunking] [--chunk-size N] [--chunk-overlap N]
 #       [--llm-log full|compact|errors] [--fresh]
+#       [--skip-verify-pass1] [--skip-refinement] [--skip-verify-pass2]
+#       [--skip-verification]
 #       [--servers URL [URL ...]] [--max-stage-attempts N | --retry-forever]
 #       [--item-attempts N] [--stage-budget-minutes MIN]
 #
@@ -56,6 +58,9 @@ CORPUS=""                      # explicit corpus file, if given
 WIKI_BASE_DIR="${WIKI_BASE_DIR:-$DEFAULT_WIKI_BASE_DIR}"
 DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
 FRESH=false
+SKIP_VERIFY_PASS1=false
+SKIP_REFINEMENT=false
+SKIP_VERIFY_PASS2=false
 RETRY_FOREVER=false
 MAX_STAGE_ATTEMPTS=3
 ITEM_ATTEMPTS=""
@@ -73,6 +78,8 @@ Usage:
       [--wiki-base-dir PATH] [--data-dir PATH]
       [--chunking | --no-chunking] [--chunk-size N] [--chunk-overlap N]
       [--llm-log full|compact|errors] [--fresh]
+      [--skip-verify-pass1] [--skip-refinement] [--skip-verify-pass2]
+      [--skip-verification]
       [--servers URL [URL ...]] [--max-stage-attempts N | --retry-forever]
       [--item-attempts N] [--stage-budget-minutes MIN]
 
@@ -85,6 +92,21 @@ Runs every stage in order:
 Resuming is the default. Completed stages are skipped, half-finished stages
 continue from their own checkpoint, and the run proceeds to the end. Use
 --fresh to clear the completion markers and run every stage again.
+
+Verification (no verification files are deleted):
+  --skip-verify-pass2  Skip the final audit and continue to consolidation. This
+                       is useful when Pass 2 verification is stuck or too slow.
+  --skip-verify-pass1  Skip the first audit. Refinement still runs unless
+                       --skip-refinement is also given; stale feedback is ignored.
+  --skip-refinement    Skip the Pass 2 refinement and its verification pass;
+                       consolidate the available staging concepts unchanged.
+                       Combine with --skip-verify-pass1 to skip both upstream
+                       audit and refinement. Existing refinements are not undone.
+  --skip-verification  Skip both extraction verification passes. Refinement
+                       still runs unless --skip-refinement is also given. This
+                       does not skip final consolidation's candidate review.
+  Skipped verification does not produce/update verification_summary.json.
+  A later run without skip flags can resume either verification pass.
 
 Input:
   --corpus PATH        Corpus of {id, contents} records: one JSON array (.json)
@@ -136,6 +158,14 @@ while [[ $# -gt 0 ]]; do
             DOMAIN="$2"; shift 2 ;;
         --fresh)
             FRESH=true; shift ;;
+        --skip-verify-pass1)
+            SKIP_VERIFY_PASS1=true; shift ;;
+        --skip-refinement)
+            SKIP_REFINEMENT=true; SKIP_VERIFY_PASS2=true; shift ;;
+        --skip-verify-pass2)
+            SKIP_VERIFY_PASS2=true; shift ;;
+        --skip-verification)
+            SKIP_VERIFY_PASS1=true; SKIP_VERIFY_PASS2=true; shift ;;
         --retry-forever)
             RETRY_FOREVER=true; shift ;;
         --no-chunking)
@@ -512,6 +542,14 @@ invalidate_downstream_markers() {
     done
 }
 
+skip_step() {
+    # Do not claim a skipped stage completed or failed. Leave its data and
+    # run log intact; a later run without this flag will resume/recheck it.
+    local step="$1"
+    rm -f -- "$STATE_DIR/${step}.done" "$STATE_DIR/${step}.failed"
+    echo ">>> [SKIP] $step: requested by skip flag; existing output files retained."
+}
+
 run_step() {
     # Run one stage to completion, retrying the whole stage on failure.
     #
@@ -604,6 +642,9 @@ cat <<EOF
  Chunking:         ${CHUNKING} (size ${CHUNK_SIZE}, overlap ${CHUNK_OVERLAP})
  LLM call log:     ${LLM_LOG} (per stage, under ${LOG_DIR}/)
  Fresh run:        ${FRESH}
+ Skip verify Pass 1: ${SKIP_VERIFY_PASS1}
+ Skip refinement:  ${SKIP_REFINEMENT}
+ Skip verify Pass 2: ${SKIP_VERIFY_PASS2}
  Retry forever:    ${RETRY_FOREVER}
  Max stage tries:  ${MAX_STAGE_ATTEMPTS}
  Item attempts:    ${ITEM_ATTEMPTS:-stage default}
@@ -616,17 +657,32 @@ EOF
 
 run_step preflight python3 "$SCRIPT_DIR/check_servers.py"
 
-# Extraction and both verification passes. Verification runs twice: once over
-# raw Pass 1 output, and again after Pass 2 has merged its repairs, so the
-# improvement is measurable.
+# Pass 1 verification supplies optional refinement hints. Pass 2 verification
+# measures improvement, but nothing downstream needs its report.
 run_step extract-concepts python3 "$SCRIPT_DIR/extract_concepts.py" \
     "${PASS1_ARGS[@]}" --resume
-run_step verify-pass1 python3 "$SCRIPT_DIR/verify_extraction.py" \
-    "${STAGE_ARGS[@]}" --phase 1 --resume
-run_step refine-concepts python3 "$SCRIPT_DIR/refine_concepts.py" \
-    "${STAGE_ARGS[@]}" --resume
-run_step verify-pass2 python3 "$SCRIPT_DIR/verify_extraction.py" \
-    "${STAGE_ARGS[@]}" --phase 2 --resume
+if [[ "$SKIP_VERIFY_PASS1" == true ]]; then
+    skip_step verify-pass1
+else
+    run_step verify-pass1 python3 "$SCRIPT_DIR/verify_extraction.py" \
+        "${STAGE_ARGS[@]}" --phase 1 --resume
+fi
+if [[ "$SKIP_REFINEMENT" == true ]]; then
+    skip_step refine-concepts
+else
+    REFINE_ARGS=("${STAGE_ARGS[@]}")
+    if [[ "$SKIP_VERIFY_PASS1" == true ]]; then
+        REFINE_ARGS+=(--ignore_audit_feedback)
+    fi
+    run_step refine-concepts python3 "$SCRIPT_DIR/refine_concepts.py" \
+        "${REFINE_ARGS[@]}" --resume
+fi
+if [[ "$SKIP_VERIFY_PASS2" == true ]]; then
+    skip_step verify-pass2
+else
+    run_step verify-pass2 python3 "$SCRIPT_DIR/verify_extraction.py" \
+        "${STAGE_ARGS[@]}" --phase 2 --resume
+fi
 # With --no-chunking this stage passes every document through without an LLM
 # call; it still runs, because later stages read consolidated/.
 run_step consolidate-documents python3 "$SCRIPT_DIR/consolidate_documents.py" \
@@ -651,13 +707,18 @@ run_step final-consolidation python3 "$SCRIPT_DIR/final_consolidation.py" \
 run_step island-report python3 "$SCRIPT_DIR/island_report.py" \
     "${STAGE_ARGS[@]}"
 
+VERIFICATION_STATUS="${DOMAIN_DIR}/verification_summary.json"
+if [[ "$SKIP_VERIFY_PASS1" == true || "$SKIP_VERIFY_PASS2" == true ]]; then
+    VERIFICATION_STATUS="not updated (verification skipped; old files may remain)"
+fi
+
 cat <<EOF
 ========================================================================
  PIPELINE RUN COMPLETE
  Output Markdown files: ${DOMAIN_DIR}/concepts_md/
  Output concept graph:  ${DOMAIN_DIR}/global_concepts_refined.json
  Citation doc mapping:  ${DOMAIN_DIR}/doc_mapping.json
- Verification scores:   ${DOMAIN_DIR}/verification_summary.json
+ Verification scores:   ${VERIFICATION_STATUS}
  Logs:                 ${LOG_DIR}/
 ========================================================================
 EOF
