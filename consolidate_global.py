@@ -4,8 +4,8 @@ Global Knowledge Graph Consolidation Pipeline
 ---------------------------------------------------
 1. Loads all concepts from `consolidated/canon_*/concepts.json`.
 2. Exact-match UnionFind pass on lowercased titles and aliases.
-3. Fuzzy Candidate Blocking (Word Containment + Char 3-Gram Jaccard) + Louvain Community Detection.
-4. Async LLM Verification of candidate merge clusters.
+3. Word-containment graph, balanced cuts of large components, LLM-reviewed merges.
+4. Rebuild a character-trigram graph after word merges, cut and LLM-review again.
 5. Complete Attribute Fusion: merges aliases, entities, descriptions, and preserves `source_chunks` provenances.
 6. Target Stub Case-Normalization & Relation Repointing.
 7. Generates detailed audit summary in `global_consolidation.json`.
@@ -53,7 +53,9 @@ from utils.json_repair import clean_json_string
 from utils.llm_pool import pool_for_stage
 
 STAGE = "consolidate-global"
-MAX_FUZZY_BATCH_CONCEPTS = 32
+FUZZY_REVIEW_STRATEGY = "word-then-character-balanced-cut-v1"
+MAX_FUZZY_CLUSTER_CONCEPTS = 29  # strictly fewer than 30
+MAX_FUZZY_BATCH_CONCEPTS = MAX_FUZZY_CLUSTER_CONCEPTS
 MAX_FUZZY_BATCH_CHARS = 20000
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
@@ -266,79 +268,100 @@ If no concepts should be merged, return: {"merge_clusters": []}.
 """
 
 # ── Fuzzy Candidate Graph Construction ───────────────────────────────────────
-def build_fuzzy_candidate_clusters(concepts: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-    """Builds a similarity graph via Word Containment & Char Trigrams, then extracts clusters."""
-    G = nx.Graph()
+def balanced_cut_clusters(graph: nx.Graph, nodes: Set[int],
+                          limit: int = MAX_FUZZY_CLUSTER_CONCEPTS,
+                          fits_prompt=None) -> List[Set[int]]:
+    """Recursively minimize cut-edge weight with balanced bisections.
+
+    An unconstrained global min-cut usually peels off a weak leaf (1 vs N-1),
+    which is not useful for bounding prompts. Kernighan–Lin is a deterministic
+    heuristic for the *balanced* min-cut; exact balanced min-cut is NP-hard.
+    Edge weights are within one metric, not a blend of incomparable scores.
+    Edges cut by partitioning are intentionally not offered for review here.
+    """
+    if len(nodes) <= limit and (fits_prompt is None or fits_prompt(nodes)):
+        return [nodes]
+    if len(nodes) == 1:
+        raise ValueError("One fuzzy concept cannot fit within the review prompt limit")
+    subgraph = graph.subgraph(nodes)
+    left, right = nx.community.kernighan_lin_bisection(subgraph, weight="weight", seed=0)
+    return (balanced_cut_clusters(graph, set(left), limit, fits_prompt) +
+            balanced_cut_clusters(graph, set(right), limit, fits_prompt))
+
+
+def build_fuzzy_candidate_clusters(concepts: List[Dict[str, Any]], method: str) -> List[List[Dict[str, Any]]]:
+    """Build ONE weighted similarity graph and cut its oversized components.
+
+    Word containment and character trigrams are deliberately separate passes;
+    each pass weights edges with only its own similarity score.
+    """
+    if method not in {"word", "character"}:
+        raise ValueError(f"Unknown fuzzy candidate method: {method}")
+    graph = nx.Graph()
     prepared = []
+    for idx, concept in enumerate(concepts):
+        graph.add_node(idx)
+        names = [concept["title"]] + concept.get("aliases", [])
+        features = ([get_clean_words(name) for name in names] if method == "word" else
+                    [get_char_trigrams(name) for name in names])
+        prepared.append(features)
 
-    for idx, c in enumerate(concepts):
-        G.add_node(idx)
-        all_names = [c["title"]] + c.get("aliases", [])
-        words_list = [get_clean_words(name) for name in all_names]
-        trigrams_list = [get_char_trigrams(name) for name in all_names]
-        
-        prepared.append({
-            "idx": idx,
-            "title": c["title"],
-            "words": words_list,
-            "trigrams": trigrams_list,
-            "concept_ref": c
-        })
-
-    n = len(prepared)
-    print(f"Performing pairwise fuzzy candidate blocking across {n} unique concepts...")
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            c1, c2 = prepared[i], prepared[j]
-            match_found = False
-
-            # Quick token match for compound variations (e.g. 'handwashing' containing 'hand' and 'washing')
-            w1_joined = "".join(c1["words"][0]) if c1["words"] else ""
-            w2_joined = "".join(c2["words"][0]) if c2["words"] else ""
-            if w1_joined and w2_joined and (w1_joined == w2_joined or (len(w1_joined) > 8 and w1_joined in w2_joined) or (len(w2_joined) > 8 and w2_joined in w1_joined)):
-                match_found = True
-
-            if not match_found:
-                for w1, t1 in zip(c1["words"], c1["trigrams"]):
-                    for w2, t2 in zip(c2["words"], c2["trigrams"]):
-                        # Rule 1: Word Containment >= 0.60
-                        if word_containment_similarity(w1, w2) >= 0.60:
-                            match_found = True
-                            break
-                        # Rule 2: Character Trigram Jaccard >= 0.50 (catches spelling variations, hyphens)
-                        if char_trigram_jaccard(t1, t2) >= 0.50:
-                            match_found = True
-                            break
-                    if match_found:
+    print(f"Building {method} similarity graph across {len(concepts)} concepts...")
+    for i in range(len(concepts)):
+        for j in range(i + 1, len(concepts)):
+            best = 0.0
+            for feature_a in prepared[i]:
+                for feature_b in prepared[j]:
+                    score = (word_containment_similarity(feature_a, feature_b) if method == "word"
+                             else char_trigram_jaccard(feature_a, feature_b))
+                    if score > best:
+                        best = score
+                    if best == 1.0:
                         break
+                if best == 1.0:
+                    break
+            threshold = 0.60 if method == "word" else 0.50
+            if best >= threshold:
+                graph.add_edge(i, j, weight=best)
 
-            if match_found:
-                G.add_edge(i, j)
+    clusters = []
+    for component in nx.connected_components(graph):
+        if len(component) < 2:
+            continue
+        def fits_prompt(nodes: Set[int]) -> bool:
+            # The length limit is a second constraint on the same graph cut,
+            # rather than an unrelated alphabetical partition afterwards.
+            return len(make_fuzzy_review_batches([concepts[i] for i in sorted(nodes)])) == 1
 
-    candidate_clusters = []
-    for component in nx.connected_components(G):
-        if len(component) <= 1:
-            continue  # No merge review needed for isolated concepts
+        for partition in balanced_cut_clusters(graph, component, fits_prompt=fits_prompt):
+            # A balanced cut can leave a partition with multiple disconnected
+            # groups; never ask the model to compare unrelated nodes in it.
+            for connected in nx.connected_components(graph.subgraph(partition)):
+                if len(connected) > 1:
+                    clusters.append([concepts[i] for i in sorted(connected)])
 
-        subgraph = G.subgraph(component)
-        if len(component) <= 15:
-            cluster_concepts = [prepared[i]["concept_ref"] for i in component]
-            candidate_clusters.append(cluster_concepts)
-        else:
-            # Hairball detected! Break down using Louvain or Greedy Modularity Community Detection
-            try:
-                communities = nx.community.louvain_communities(subgraph)
-            except Exception:
-                communities = nx.community.greedy_modularity_communities(subgraph)
+    print(f"Identified {len(clusters)} {method} candidate clusters (each < 30 concepts).")
+    return clusters
 
-            for comm in communities:
-                if len(comm) > 1:
-                    cluster_concepts = [prepared[i]["concept_ref"] for i in comm]
-                    candidate_clusters.append(cluster_concepts)
 
-    print(f"Identified {len(candidate_clusters)} fuzzy candidate clusters for LLM review.")
-    return candidate_clusters
+def merged_fuzzy_views(concepts: List[Dict[str, Any]], uf: UnionFind) -> List[Dict[str, Any]]:
+    """Rebuild stage-two nodes from stage-one LLM-approved unions."""
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for concept in concepts:
+        groups.setdefault(uf.find(concept["title"]), []).append(concept)
+    merged = []
+    for root, members in groups.items():
+        # UnionFind keeps the approved primary as the root when possible.
+        title = next((c["title"] for c in members
+                      if canonical_lemma_key(c["title"]) == root), members[0]["title"])
+        aliases = sorted({name for c in members
+                          for name in [c["title"]] + c.get("aliases", [])
+                          if name.strip() and name.lower() != title.lower()})
+        descriptions = [c["description"] for c in members if c.get("description")]
+        merged.append({"title": title, "aliases": aliases,
+                       "description": " ".join(descriptions)})
+    return merged
+
 
 # ── Async LLM Verification Runner ────────────────────────────────────────────
 def format_fuzzy_review_batch(batch: List[Dict[str, Any]]) -> str:
@@ -364,8 +387,8 @@ def format_fuzzy_review_batch(batch: List[Dict[str, Any]]) -> str:
 def make_fuzzy_review_batches(cluster: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     """Bound both the concept count and the *rendered* prompt length.
 
-    Exact-match fusion can accumulate many aliases, and Louvain communities have
-    no size limit. Count characters on the actual text we send, rather than an
+    Exact-match fusion can accumulate many aliases, and graph components have
+    no inherent size limit. Count characters on the actual text we send, rather than an
     approximate serialized representation. This is a character budget, not a
     substitute for the server's token budget (context errors are also split).
     """
@@ -415,6 +438,11 @@ async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) ->
                     raise ValueError("Fuzzy review truncated at max_tokens")
                 result = GlobalFuzzyMergeSchema.model_validate_json(
                     clean_json_string(choice.message.content))
+                titles = {view["title"] for view in batch}
+                for merge in result.merge_clusters:
+                    if (merge.primary_title not in titles or
+                            any(title not in titles for title in merge.merged_titles)):
+                        raise ValueError("Fuzzy review returned a title outside its candidate batch")
                 return result.merge_clusters
             except Exception as exc:
                 too_long = (finish_reason == "length" or
@@ -643,22 +671,33 @@ def global_consolidate(domain_dir: Path, args):
     # 3. Optional fuzzy blocking & LLM review. Exact-match merging and all
     # downstream citation/relation fusion still run when fuzzy review is skipped.
     skip_fuzzy = getattr(args, "skip_fuzzy_review", False)
+    candidate_clusters = []
+    approved_fuzzy_merges = []
+    llm_evaluations = []
+    fuzzy_counts = {}
     if skip_fuzzy:
         print("Skipping global fuzzy LLM review; continuing with exact/alias matches only.")
-        candidate_clusters = []
-        approved_fuzzy_merges, llm_evaluations = [], []
     else:
-        candidate_clusters = build_fuzzy_candidate_clusters(exact_concepts)
-        approved_fuzzy_merges, llm_evaluations = asyncio.run(run_llm_fuzzy_pass(candidate_clusters, args))
+        current_concepts = exact_concepts
+        for method in ("word", "character"):
+            clusters = build_fuzzy_candidate_clusters(current_concepts, method)
+            approved, evaluations = asyncio.run(run_llm_fuzzy_pass(clusters, args))
+            fuzzy_counts[method] = {"clusters": len(clusters), "merges": len(approved)}
+            candidate_clusters.extend(clusters)
+            approved_fuzzy_merges.extend(approved)
+            llm_evaluations.extend({"method": method, **record} for record in evaluations)
 
-    # Apply LLM Approved Fuzzy Merges to UnionFind
-    for cluster in approved_fuzzy_merges:
-        primary = cluster.primary_title.strip()
-        decisions.record("fuzzy_merge", canonical=primary,
-                         merged=[m.strip() for m in cluster.merged_titles])
-        uf.find(primary)
-        for merged in cluster.merged_titles:
-            uf.union(primary, merged.strip())
+            # Only LLM-approved unions from the word pass feed the character
+            # pass. Neither similarity metric merges anything automatically.
+            for merge in approved:
+                primary = merge.primary_title.strip()
+                decisions.record("fuzzy_merge", method=method, canonical=primary,
+                                 merged=[title.strip() for title in merge.merged_titles])
+                for title in merge.merged_titles:
+                    uf.union(primary, title.strip())
+            if method == "word":
+                current_concepts = merged_fuzzy_views(current_concepts, uf)
+    decisions.close()
 
     # 4. Phase 4: Final Comprehensive Attribute & Citation Fusion
     final_groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -808,6 +847,8 @@ def global_consolidate(domain_dir: Path, args):
             "raw_concepts_loaded": raw_concepts_count,
             "exact_merged_concepts": exact_count,
             "fuzzy_candidate_clusters_evaluated": len(candidate_clusters),
+            "fuzzy_passes": fuzzy_counts,
+            "fuzzy_review_strategy": FUZZY_REVIEW_STRATEGY if not skip_fuzzy else None,
             "fuzzy_review_skipped": skip_fuzzy,
             "llm_fuzzy_merges_applied": len(approved_fuzzy_merges),
             "final_global_concepts": len(global_concepts),

@@ -436,8 +436,13 @@ import sys
 from pathlib import Path
 try:
     data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    skipped = data.get("global_audit_summary", {}).get("fuzzy_review_skipped", False)
-    raise SystemExit(0 if skipped is (sys.argv[2] == "true") else 1)
+    summary = data.get("global_audit_summary", {})
+    skipped = summary.get("fuzzy_review_skipped", False)
+    if skipped is not (sys.argv[2] == "true"):
+        raise SystemExit(1)
+    if not skipped and summary.get("fuzzy_review_strategy") != "word-then-character-balanced-cut-v1":
+        raise SystemExit(1)
+    raise SystemExit(0)
 except Exception:
     raise SystemExit(1)
 PY

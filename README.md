@@ -318,12 +318,22 @@ python3 consolidate_global.py --domain $D --wiki_base_dir $W
 ```
 
 Needs: step 5. Writes: `global_concepts.json`, `global_consolidation.json`.
-If fuzzy clusters are very large, LLM review uses bounded batches of at most
-32 concepts / 20,000 characters, with a compact numbered text input (title,
-up to 8 aliases and a 30-word hint) rather than pretty-printed JSON. Responses
-remain JSON; all sub-batches must succeed. Batching caps size, not semantic
-quality: very large communities are currently divided by title order, which
-may miss fuzzy matches across batches. To proceed with exact and alias matches
+Fuzzy review is two sequential, LLM-confirmed passes. The first graph connects
+concepts by word containment (at least two words shared, score >= 0.60). After
+applying **only** the LLM-approved word merges, the second graph is rebuilt from
+the merged concepts using character-trigram Jaccard (score >= 0.50). Each edge
+is weighted with its pass's similarity score; there is no mixed score or Louvain
+community detection. Non-singleton connected components with 30 or more nodes
+are recursively split with a seeded, weighted Kernighan–Lin **balanced min-cut
+heuristic** until every reviewed group has fewer than 30 nodes. Exact balanced
+min-cut is computationally hard; an unconstrained min-cut tends to peel off
+single nodes. Cut edges are not reviewed in that pass, so merges across splits
+can be missed. Prompt-length limits can also require further splitting.
+
+LLM requests show up to 8 aliases and a 30-word hint per concept in compact
+numbered text, not input JSON; responses remain JSON. Requests are limited to
+20,000 rendered characters, and context/response-length errors split a request
+further. All requests must succeed. To proceed with exact and alias matches
 only, pass `run_pipeline.sh --skip-global-fuzzy` (or
 `consolidate_global.py --skip_fuzzy_review`). This skips candidate generation and
 LLM review, but still fuses descriptions, citations and relations. The audit

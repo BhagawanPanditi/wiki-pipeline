@@ -1,5 +1,6 @@
 """Exercise runner skip flags with fake stage scripts, without an LLM server."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -58,7 +59,8 @@ elif name == "consolidate_global":
     skip = "--skip_fuzzy_review" in args
     (root / "global_concepts.json").write_text('{"concepts": [{"title": "topic"}]}')
     (root / "global_consolidation.json").write_text(json.dumps({
-        "global_audit_summary": {"fuzzy_review_skipped": skip}}))
+        "global_audit_summary": {"fuzzy_review_skipped": skip,
+                                 "fuzzy_review_strategy": "word-then-character-balanced-cut-v1"}}))
 elif name == "resolve_stubs":
     sys.exit(86)
 '''
@@ -126,6 +128,16 @@ class RunnerSkipTests(unittest.TestCase):
         calls = [line for line in self.calls() if line.startswith("consolidate_global ")]
         self.assertEqual(len(calls), 2, full.stdout)
         self.assertNotIn("--skip_fuzzy_review", calls[-1])
+
+        # An older full-fuzzy output is not valid for the new two-pass strategy.
+        audit_path = self.run_dir / "global_consolidation.json"
+        audit = json.loads(audit_path.read_text())
+        audit["global_audit_summary"].pop("fuzzy_review_strategy")
+        audit_path.write_text(json.dumps(audit))
+        renewed = self.run_pipeline(*flags, allow_consolidation=True)
+        self.assertEqual(renewed.returncode, 86, renewed.stdout + renewed.stderr)
+        self.assertEqual(len([line for line in self.calls()
+                              if line.startswith("consolidate_global ")]), 3)
 
     def test_skip_pass2_after_failed_audit_and_resume_it_later(self):
         failed = self.run_pipeline(fail_pass2=True)
