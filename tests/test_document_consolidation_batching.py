@@ -81,7 +81,8 @@ class MergeRequestTests(unittest.IsolatedAsyncioTestCase):
             text = kwargs["messages"][1]["content"]
             batch = json.loads(text.split("CONCEPT LIST (only merge titles present in this list):\n")[1])
             self.assertEqual(len(batch[0]["aliases"]), 8)
-            self.assertLessEqual(len(batch[0]["description_hint"]), 200)
+            self.assertLessEqual(len(batch[0]["description_hint"]), 400)
+            self.assertEqual(len(batch[0]["description_hint"].removesuffix("...").split()), 30)
             self.assertNotIn("outbound_relations", text)
             self.assertNotIn("long long", text)
             return response([])

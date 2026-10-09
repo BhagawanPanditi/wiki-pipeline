@@ -303,8 +303,9 @@ python3 consolidate_documents.py --domain $D --wiki_base_dir $W
 
 Needs: step 3 (or 1). Writes: `consolidated/<doc>/concepts.json`. With `--no-chunking`
 it writes the concepts unchanged and makes no LLM call. Merge-planning prompts
-contain only each concept's title, up to 8 aliases, and a short description hint;
-full descriptions and relations stay in the saved output. For very large chunked
+contain only each concept's title, up to 8 aliases, and a description hint of
+up to 30 words (at most 400 characters); full descriptions and relations stay
+in the saved output. For very large chunked
 documents, the planner sorts titles and splits the list into context-bounded batches;
 all batches must succeed before the document is checkpointed. Exact-title duplicates
 still combine across batches, but unusual aliases spanning distant batches may need

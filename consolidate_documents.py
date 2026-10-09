@@ -201,7 +201,7 @@ class DocumentConsolidatorPipeline:
                 "title": c.get("title"),
                 "aliases": c.get("aliases", [])[:8],
                 "description_hint": snippet_description(
-                    c.get("description", ""), max_words=18)[:200],
+                    c.get("description", ""), max_words=30)[:400],
             })
 
         batches = make_merge_batches(lightweight_concepts)
