@@ -302,7 +302,11 @@ python3 consolidate_documents.py --domain $D --wiki_base_dir $W
 ```
 
 Needs: step 3 (or 1). Writes: `consolidated/<doc>/concepts.json`. With `--no-chunking`
-it writes the concepts unchanged and makes no LLM call.
+it writes the concepts unchanged and makes no LLM call. For very large chunked documents,
+the merge planner sorts titles and splits the concept list into context-bounded batches;
+all batches must succeed before the document is checkpointed. Exact-title duplicates
+still combine across batches, but unusual aliases spanning distant batches may need
+later global consolidation to detect them.
 
 **6. Consolidate across documents**
 
