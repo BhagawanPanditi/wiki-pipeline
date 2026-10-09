@@ -53,7 +53,7 @@ from utils.json_repair import clean_json_string
 from utils.llm_pool import pool_for_stage
 
 STAGE = "consolidate-global"
-FUZZY_REVIEW_STRATEGY = "word-then-character-balanced-cut-v1"
+FUZZY_REVIEW_STRATEGY = "word-then-character-balanced-cut-ids-v2"
 MAX_FUZZY_CLUSTER_CONCEPTS = 29  # strictly fewer than 30
 MAX_FUZZY_BATCH_CONCEPTS = MAX_FUZZY_CLUSTER_CONCEPTS
 MAX_FUZZY_BATCH_CHARS = 20000
@@ -68,6 +68,13 @@ class MergeCluster(BaseModel):
 
 class GlobalFuzzyMergeSchema(BaseModel):
     merge_clusters: List[MergeCluster] = Field(default_factory=list)
+
+class FuzzyIdMerge(BaseModel):
+    primary_id: int
+    merged_ids: List[int]
+
+class FuzzyIdResponse(BaseModel):
+    merge_clusters: List[FuzzyIdMerge]
 
 # ── Union-Find Disjoint Set ──────────────────────────────────────────────────
 # Domain-agnostic web scraping artifacts and structural document boilerplate
@@ -252,16 +259,16 @@ CRITICAL MERGE RULES:
 2. DO NOT MERGE DISTINCT SUB-TYPES OR OPPOSITES: 
    - DO NOT merge distinct sub-types (e.g. "Type 1 Diabetes" vs "Type 2 Diabetes", "Quicksort" vs "Mergesort", "Microeconomics" vs "Macroeconomics").
    - DO NOT merge a general parent concept with a specific, independent sub-component.
-3. PRIMARY TITLE: Choose the cleanest, most canonical and comprehensive title from the cluster.
+3. PRIMARY CONCEPT: Choose the best existing numbered candidate as the primary.
+   Only return numbers shown in this request. Do not return names, aliases,
+   new titles, or concepts from other requests. Each group needs two or more
+   different candidate IDs; do not repeat an ID across groups.
 
 OUTPUT FORMAT:
 Return valid JSON matching this structure:
 {
   "merge_clusters": [
-    {
-      "primary_title": "Exact Chosen Canonical Title",
-      "merged_titles": ["Alternative Title 1", "Alternative Title 2"]
-    }
+    {"primary_id": 1, "merged_ids": [2, 3]}
   ]
 }
 If no concepts should be merged, return: {"merge_clusters": []}.
@@ -367,9 +374,9 @@ def merged_fuzzy_views(concepts: List[Dict[str, Any]], uf: UnionFind) -> List[Di
 def format_fuzzy_review_batch(batch: List[Dict[str, Any]]) -> str:
     """Render a compact two-line numbered list, not verbose JSON input.
 
-    Titles stay verbatim (apart from whitespace) because the output schema uses
-    exact titles to map decisions back to concepts. Numbers are local to each
-    batch, for readability only; the model still responds with title-based JSON.
+    Numbers are local to each batch; the model returns those IDs as JSON. The
+    caller maps valid IDs back to exact stored titles, so display whitespace or
+    a rewritten title can never create a new concept.
     """
     lines = []
     for number, concept in enumerate(batch, 1):
@@ -380,8 +387,9 @@ def format_fuzzy_review_batch(batch: List[Dict[str, Any]]) -> str:
         if aliases:
             heading += f" (aliases: {'; '.join(aliases)})"
         lines.append(heading + (f"\n   {hint}" if hint else ""))
-    return ("CANDIDATE CONCEPTS FOR REVIEW. Use exact titles in your JSON answer; "
-            "merge only equivalent concepts:\n\n" + "\n\n".join(lines) + "\n")
+    return ("CANDIDATE CONCEPTS FOR REVIEW. Merge only equivalent concepts. "
+            "Return only the numbered IDs below in your JSON answer:\n\n"
+            + "\n\n".join(lines) + "\n")
 
 
 def make_fuzzy_review_batches(cluster: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -412,6 +420,37 @@ def make_fuzzy_review_batches(cluster: List[Dict[str, Any]]) -> List[List[Dict[s
     return batches
 
 
+def map_fuzzy_ids(reply: FuzzyIdResponse, batch: List[Dict[str, Any]]) -> List[MergeCluster]:
+    """Translate model IDs to stored titles; never let fabricated IDs enter UF."""
+    converted = []
+    used_ids: Set[int] = set()
+    for group in reply.merge_clusters:
+        primary = group.primary_id
+        if not 1 <= primary <= len(batch):
+            print(f"WARNING: ignoring fuzzy merge with unknown primary ID {primary}; "
+                  f"valid IDs are 1..{len(batch)}", flush=True)
+            continue
+        valid = []
+        for candidate in group.merged_ids:
+            if not 1 <= candidate <= len(batch):
+                print(f"WARNING: ignoring unknown fuzzy merge ID {candidate}; "
+                      f"valid IDs are 1..{len(batch)}", flush=True)
+            elif candidate != primary and candidate not in valid:
+                valid.append(candidate)
+        if not valid:
+            continue
+        if used_ids.intersection([primary, *valid]):
+            print(f"WARNING: ignoring overlapping fuzzy merge IDs "
+                  f"{[primary, *valid]}; a candidate was already merged", flush=True)
+            continue
+        used_ids.update([primary, *valid])
+        converted.append(MergeCluster(
+            primary_title=batch[primary - 1]["title"],
+            merged_titles=[batch[i - 1]["title"] for i in valid],
+        ))
+    return converted
+
+
 async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) -> GlobalFuzzyMergeSchema:
     """Review a candidate cluster using bounded requests; all sub-batches must pass."""
     batches = make_fuzzy_review_batches(cluster)
@@ -436,14 +475,9 @@ async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) ->
                 finish_reason = choice.finish_reason
                 if finish_reason == "length":
                     raise ValueError("Fuzzy review truncated at max_tokens")
-                result = GlobalFuzzyMergeSchema.model_validate_json(
+                result = FuzzyIdResponse.model_validate_json(
                     clean_json_string(choice.message.content))
-                titles = {view["title"] for view in batch}
-                for merge in result.merge_clusters:
-                    if (merge.primary_title not in titles or
-                            any(title not in titles for title in merge.merged_titles)):
-                        raise ValueError("Fuzzy review returned a title outside its candidate batch")
-                return result.merge_clusters
+                return map_fuzzy_ids(result, batch)
             except Exception as exc:
                 too_long = (finish_reason == "length" or
                             isinstance(exc, BadRequestError) and

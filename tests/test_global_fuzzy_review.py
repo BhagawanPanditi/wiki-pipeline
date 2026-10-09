@@ -92,6 +92,7 @@ class FuzzyBatchesTests(unittest.TestCase):
             "aliases": ["Neuronal Migration in Adult Brain", "Neuron movement"],
             "description_hint": "The movement of neurons in the adult brain.",
         }])
+        self.assertIn("Return only the numbered IDs", prompt)
         self.assertIn("1. Long-Distance Neuronal Migration "
                       "(aliases: Neuronal Migration in Adult Brain; Neuron movement)\n"
                       "   The movement of neurons in the adult brain.", prompt)
@@ -166,15 +167,20 @@ class FuzzyBatchesTests(unittest.TestCase):
 
 
 class FuzzyRequestTests(unittest.IsolatedAsyncioTestCase):
-    async def test_rejects_titles_outside_reviewed_batch(self):
+    async def test_invalid_ids_are_ignored_without_losing_valid_merges(self):
         async def create(**kwargs):
-            return response([{"primary_title": "Topic 1", "merged_titles": ["Unknown"]}])
+            return response([{"primary_id": 1, "merged_ids": [2, 999]},
+                             {"primary_id": 77, "merged_ids": [1]},
+                             {"primary_id": 1, "merged_ids": [2]}])
 
-        cluster = [{"title": f"Topic {i}", "aliases": [], "description": "Hint."}
-                   for i in range(2)]
-        with self.assertRaisesRegex(ValueError, "outside its candidate batch"):
-            await verify_cluster_llm(client_for(create), cluster,
-                                     SimpleNamespace(model_name="test", max_tokens=8192))
+        cluster = [{"title": "Topic   1", "aliases": [], "description": "Hint."},
+                   {"title": "Topic 2", "aliases": [], "description": "Hint."}]
+        with patch("builtins.print") as warning:
+            result = await verify_cluster_llm(client_for(create), cluster,
+                                              SimpleNamespace(model_name="test", max_tokens=8192))
+        self.assertTrue(warning.called)
+        self.assertEqual([m.model_dump() for m in result.merge_clusters], [
+            {"primary_title": "Topic   1", "merged_titles": ["Topic 2"]}])
 
     async def test_splits_400_context_error_instead_of_failing_entire_cluster(self):
         seen = []
@@ -201,8 +207,7 @@ class FuzzyRequestTests(unittest.IsolatedAsyncioTestCase):
             batch = prompt_titles(kwargs)
             if len(batch) > 2:
                 return response([], reason="length")
-            return response([{"primary_title": batch[0],
-                              "merged_titles": [batch[-1]]}])
+            return response([{"primary_id": 1, "merged_ids": [len(batch)]}])
 
         cluster = [{"title": f"Topic {i}", "aliases": [], "description": "Hint."}
                    for i in range(8)]

@@ -331,10 +331,13 @@ single nodes. Cut edges are not reviewed in that pass, so merges across splits
 can be missed. Prompt-length limits can also require further splitting.
 
 LLM requests show up to 8 aliases and a 30-word hint per concept in compact
-numbered text, not input JSON; responses remain JSON. Requests are limited to
-20,000 rendered characters, and context/response-length errors split a request
-further. All requests must succeed. To proceed with exact and alias matches
-only, pass `run_pipeline.sh --skip-global-fuzzy` (or
+numbered text, not input JSON; responses are JSON containing only those numeric
+candidate IDs. Valid IDs are translated back to the stored titles; unknown or
+duplicate suggestions are ignored with warnings rather than inventing concepts
+or failing the whole cluster. Requests are limited to 20,000 rendered
+characters, and context/response-length errors split a request further. All
+requests must succeed. To proceed with exact and alias matches only, pass
+`run_pipeline.sh --skip-global-fuzzy` (or
 `consolidate_global.py --skip_fuzzy_review`). This skips candidate generation and
 LLM review, but still fuses descriptions, citations and relations. The audit
 summary records `fuzzy_review_skipped: true`, and the runner won't mistake an

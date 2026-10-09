@@ -60,7 +60,7 @@ elif name == "consolidate_global":
     (root / "global_concepts.json").write_text('{"concepts": [{"title": "topic"}]}')
     (root / "global_consolidation.json").write_text(json.dumps({
         "global_audit_summary": {"fuzzy_review_skipped": skip,
-                                 "fuzzy_review_strategy": "word-then-character-balanced-cut-v1"}}))
+                                 "fuzzy_review_strategy": "word-then-character-balanced-cut-ids-v2"}}))
 elif name == "resolve_stubs":
     sys.exit(86)
 '''

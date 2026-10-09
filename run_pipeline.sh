@@ -440,7 +440,7 @@ try:
     skipped = summary.get("fuzzy_review_skipped", False)
     if skipped is not (sys.argv[2] == "true"):
         raise SystemExit(1)
-    if not skipped and summary.get("fuzzy_review_strategy") != "word-then-character-balanced-cut-v1":
+    if not skipped and summary.get("fuzzy_review_strategy") != "word-then-character-balanced-cut-ids-v2":
         raise SystemExit(1)
     raise SystemExit(0)
 except Exception:
