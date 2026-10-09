@@ -52,31 +52,31 @@ class StageProfile:
 
 STAGE_PROFILES: Dict[str, StageProfile] = {
     # ── extraction: 8192-token outputs dominate KV, keep fan-out low ────────
-    "extract-concepts":       StageProfile("extract-concepts", 8, 300.0, 30.0, 8192),
-    "refine-concepts":       StageProfile("refine-concepts", 8, 300.0, 10.0, 8192),
-    "consolidate-documents": StageProfile("consolidate-documents", 6, 300.0, None, 8192),
+    "extract-concepts":       StageProfile("extract-concepts", 32, 1200.0, 30.0, 16384 ),
+    "refine-concepts":       StageProfile("refine-concepts", 32, 12000.0, 10.0, 16384),
+    "consolidate-documents": StageProfile("consolidate-documents", 32, 1200.0, None, 16384),
     # Each stub fans out over its own source chunks 5 at a time, so 2 stubs in
     # flight is ~10 concurrent 8192-token requests per server - the KV-correct
     # figure. The old code ran 15 stubs x 5 chunks = 75 in flight, which
-    # oversubscribed KV cache ~7x and caused preemption and recompute.
-    "resolve-stubs":        StageProfile("resolve-stubs", 2, 45.0, None, 8192),
+    # oversubscribed KV cache ~7x and caused preemption and recompute.  
+    "resolve-stubs":        StageProfile("resolve-stubs", 2, 1200.0, None, 16384),
 
     # ── verification: long prompt, structured JSON out ─────────────────────
-    "verify-pass1":           StageProfile("verify-pass1", 12, 450.0, 10.0, 4096),
-    "verify-pass2":     StageProfile("verify-pass2", 12, 450.0, 10.0, 4096),
+    "verify-pass1":           StageProfile("verify-pass1", 32, 1200.0, 10.0, 16384),
+    "verify-pass2":     StageProfile("verify-pass2", 32, 1200.0, 10.0, 16384),
 
     # ── consolidation: medium outputs ──────────────────────────────────────
-    "consolidate-global":   StageProfile("consolidate-global", 16, 300.0, None, 4096),
-    "final-macro-scan":       StageProfile("final-macro-scan", 12, 300.0, None, 4096),
-    "final-deep-verify":      StageProfile("final-deep-verify", 24, 60.0, None, 1000),
+    "consolidate-global":   StageProfile("consolidate-global", 16, 600.0, None, 8192),
+    "final-macro-scan":       StageProfile("final-macro-scan", 12, 600.0, None, 8192),
+    "final-deep-verify":      StageProfile("final-deep-verify", 24, 600.0, None, 4096),
 
     # ── graph enrichment: small outputs, high fan-out ──────────────────────
     # max_tokens is 4096 because that is what this stage has always requested;
     # a smaller budget would truncate fold decisions and change output quality.
-    "fold-thin-concepts":   StageProfile("fold-thin-concepts", 16, 45.0, None, 4096),
-    "write-briefs":       StageProfile("write-briefs", 40, 40.0, None, 256),
-    "audit-islands":           StageProfile("audit-islands", 32, 60.0, None, 400),
-    "add-reverse-links":      StageProfile("add-reverse-links", 48, 60.0, None, 256),
+    "fold-thin-concepts":   StageProfile("fold-thin-concepts", 16, 600.0, None, 8192),
+    "write-briefs":       StageProfile("write-briefs", 40, 600.0, None, 1024),
+    "audit-islands":           StageProfile("audit-islands", 32, 600.0, None, 4096),
+    "add-reverse-links":      StageProfile("add-reverse-links", 48, 600.0, None, 1024),
 }
 
 
