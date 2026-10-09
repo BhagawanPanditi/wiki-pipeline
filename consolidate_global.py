@@ -341,12 +341,33 @@ def build_fuzzy_candidate_clusters(concepts: List[Dict[str, Any]]) -> List[List[
     return candidate_clusters
 
 # ── Async LLM Verification Runner ────────────────────────────────────────────
-def make_fuzzy_review_batches(cluster: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-    """Bound the prompt built from an often very large graph community.
+def format_fuzzy_review_batch(batch: List[Dict[str, Any]]) -> str:
+    """Render a compact two-line numbered list, not verbose JSON input.
 
-    Exact-match fusion can aggregate many aliases onto a single concept. Neither
-    the alias list nor a Louvain cluster has a fixed size, so cap both the per-
-    concept evidence and the request size before invoking the server.
+    Titles stay verbatim (apart from whitespace) because the output schema uses
+    exact titles to map decisions back to concepts. Numbers are local to each
+    batch, for readability only; the model still responds with title-based JSON.
+    """
+    lines = []
+    for number, concept in enumerate(batch, 1):
+        title = " ".join(str(concept["title"]).split())
+        aliases = [" ".join(str(a).split()) for a in concept["aliases"] if str(a).strip()]
+        hint = " ".join(str(concept["description_hint"]).split())
+        heading = f"{number}. {title}"
+        if aliases:
+            heading += f" (aliases: {'; '.join(aliases)})"
+        lines.append(heading + (f"\n   {hint}" if hint else ""))
+    return ("CANDIDATE CONCEPTS FOR REVIEW. Use exact titles in your JSON answer; "
+            "merge only equivalent concepts:\n\n" + "\n\n".join(lines) + "\n")
+
+
+def make_fuzzy_review_batches(cluster: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Bound both the concept count and the *rendered* prompt length.
+
+    Exact-match fusion can accumulate many aliases, and Louvain communities have
+    no size limit. Count characters on the actual text we send, rather than an
+    approximate serialized representation. This is a character budget, not a
+    substitute for the server's token budget (context errors are also split).
     """
     views = sorted(({
         "title": c.get("title"),
@@ -355,18 +376,14 @@ def make_fuzzy_review_batches(cluster: List[Dict[str, Any]]) -> List[List[Dict[s
     } for c in cluster), key=lambda c: str(c["title"] or "").casefold())
     batches: List[List[Dict[str, Any]]] = []
     batch: List[Dict[str, Any]] = []
-    size = 2
     for view in views:
-        item_size = len(json.dumps(view, ensure_ascii=False, separators=(",", ":"))) + 1
-        if item_size + 2 > MAX_FUZZY_BATCH_CHARS:
+        if len(format_fuzzy_review_batch([view])) > MAX_FUZZY_BATCH_CHARS:
             raise ValueError(f"Fuzzy candidate {view['title']!r} is too large for a review batch")
         if batch and (len(batch) >= MAX_FUZZY_BATCH_CONCEPTS or
-                      size + item_size > MAX_FUZZY_BATCH_CHARS):
+                      len(format_fuzzy_review_batch(batch + [view])) > MAX_FUZZY_BATCH_CHARS):
             batches.append(batch)
             batch = []
-            size = 2
         batch.append(view)
-        size += item_size
     if batch:
         batches.append(batch)
     return batches
@@ -379,8 +396,7 @@ async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) ->
 
     async def review_batch(batch: List[Dict[str, Any]]) -> List[MergeCluster]:
         async with semaphore:
-            prompt = ("CANDIDATE CONCEPT CLUSTER FOR REVIEW (merge only titles shown):\n"
-                      + json.dumps(batch, ensure_ascii=False, separators=(",", ":")) + "\n")
+            prompt = format_fuzzy_review_batch(batch)
             finish_reason = None
             try:
                 response = await client.chat.completions.create(

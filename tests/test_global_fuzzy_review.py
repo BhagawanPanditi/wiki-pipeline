@@ -1,6 +1,7 @@
 """Bound global fuzzy prompts and allow an explicit exact-only global pass."""
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,8 +12,13 @@ import httpx
 from openai import BadRequestError
 
 from consolidate_global import (MAX_FUZZY_BATCH_CHARS, MAX_FUZZY_BATCH_CONCEPTS,
-                                global_consolidate, make_fuzzy_review_batches,
-                                verify_cluster_llm)
+                                format_fuzzy_review_batch, global_consolidate,
+                                make_fuzzy_review_batches, verify_cluster_llm)
+
+
+def prompt_titles(kwargs):
+    """Extract numbered titles from the sent *plain-text* user message."""
+    return re.findall(r"(?m)^\d+\. (Topic \d+)", kwargs["messages"][1]["content"])
 
 
 def client_for(create):
@@ -35,10 +41,22 @@ class FuzzyBatchesTests(unittest.TestCase):
                          sorted(c["title"] for c in concepts))
         for part in batches:
             self.assertLessEqual(len(part), MAX_FUZZY_BATCH_CONCEPTS)
-            self.assertLessEqual(len(json.dumps(part, separators=(",", ":"))),
+            self.assertLessEqual(len(format_fuzzy_review_batch(part)),
                                  MAX_FUZZY_BATCH_CHARS)
             self.assertEqual(len(part[0]["aliases"]), 8)
             self.assertLessEqual(len(part[0]["description_hint"]), 400)
+
+    def test_numbered_text_not_json_is_sent_with_two_line_evidence(self):
+        prompt = format_fuzzy_review_batch([{
+            "title": "Long-Distance Neuronal Migration",
+            "aliases": ["Neuronal Migration in Adult Brain", "Neuron movement"],
+            "description_hint": "The movement of neurons in the adult brain.",
+        }])
+        self.assertIn("1. Long-Distance Neuronal Migration "
+                      "(aliases: Neuronal Migration in Adult Brain; Neuron movement)\n"
+                      "   The movement of neurons in the adult brain.", prompt)
+        self.assertNotIn('"title":', prompt)
+        self.assertNotIn('"aliases":', prompt)
 
     def test_no_concept_is_discarded_when_single_entry_is_oversized(self):
         with self.assertRaisesRegex(ValueError, "too large"):
@@ -74,7 +92,7 @@ class FuzzyRequestTests(unittest.IsolatedAsyncioTestCase):
         seen = []
 
         async def create(**kwargs):
-            batch = json.loads(kwargs["messages"][1]["content"].split("\n", 1)[1])
+            batch = prompt_titles(kwargs)
             seen.append(len(batch))
             if len(batch) > 8:
                 resp = httpx.Response(400, request=httpx.Request("POST", "https://example.com/v1"))
@@ -92,11 +110,11 @@ class FuzzyRequestTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_split_truncated_generation_and_combine_results(self):
         async def create(**kwargs):
-            batch = json.loads(kwargs["messages"][1]["content"].split("\n", 1)[1])
+            batch = prompt_titles(kwargs)
             if len(batch) > 2:
                 return response([], reason="length")
-            return response([{"primary_title": batch[0]["title"],
-                              "merged_titles": [batch[-1]["title"]]}])
+            return response([{"primary_title": batch[0],
+                              "merged_titles": [batch[-1]]}])
 
         cluster = [{"title": f"Topic {i}", "aliases": [], "description": "Hint."}
                    for i in range(8)]

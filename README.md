@@ -318,9 +318,13 @@ python3 consolidate_global.py --domain $D --wiki_base_dir $W
 ```
 
 Needs: step 5. Writes: `global_concepts.json`, `global_consolidation.json`.
-If fuzzy clusters are very large, LLM review uses bounded batches of titles, up to
-8 aliases and a 30-word hint; all sub-batches must succeed. To proceed with exact
-and alias matches only, pass `run_pipeline.sh --skip-global-fuzzy` (or
+If fuzzy clusters are very large, LLM review uses bounded batches of at most
+32 concepts / 20,000 characters, with a compact numbered text input (title,
+up to 8 aliases and a 30-word hint) rather than pretty-printed JSON. Responses
+remain JSON; all sub-batches must succeed. Batching caps size, not semantic
+quality: very large communities are currently divided by title order, which
+may miss fuzzy matches across batches. To proceed with exact and alias matches
+only, pass `run_pipeline.sh --skip-global-fuzzy` (or
 `consolidate_global.py --skip_fuzzy_review`). This skips candidate generation and
 LLM review, but still fuses descriptions, citations and relations. The audit
 summary records `fuzzy_review_skipped: true`, and the runner won't mistake an
