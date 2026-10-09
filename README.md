@@ -635,8 +635,8 @@ comes from how much KV cache a server has. A request reserves its prompt plus
 | `refine-concepts` | 8 | 300 | 8192 |
 | `consolidate-documents` | 6 | 300 | 8192 |
 | `resolve-stubs` | 2 | 45 | 8192 |
-| `verify-pass1` | 12 | 450 | 4096 |
-| `verify-pass2` | 12 | 450 | 4096 |
+| `verify-pass1` | 32 | 1200 | 16384 |
+| `verify-pass2` | 32 | 1200 | 16384 |
 | `consolidate-global` | 16 | 300 | 4096 |
 | `final-macro-scan` | 12 | 300 | 4096 |
 | `final-deep-verify` | 24 | 60 | 1000 |
@@ -679,6 +679,13 @@ changing it changes the output.
 
 Verification scores each extraction against its source. Each unit gets a
 `coverage_score`, a sufficiency flag, and the concepts and facts it missed.
+The audit checks the whole chunk but reports only the highest-priority unique
+omissions (up to 8 concepts, 20 facts, and 8 hallucinations per chunk), not a
+copy of the source. These are feedback limits, not extraction limits; a chunk
+with more than 20 important missing facts may need smaller verification units
+for exhaustive feedback. Replies stopped by `max_tokens` or missing required
+fields are retried rather than accepted. On `--resume`, checkpointed verdicts
+that no longer pass the verifier's schema are re-audited.
 
 The pipeline verifies twice. Verification 1 scores the Pass 1 concepts. Verification 2
 re-scores the **same chunks** against the Pass 2 output. The report shows both scores and

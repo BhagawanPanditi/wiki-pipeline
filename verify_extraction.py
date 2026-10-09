@@ -27,7 +27,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from utils.atomic_io import atomic_write_text
 from utils.checkpoint import CheckpointLog
@@ -44,28 +44,48 @@ from utils.reporting import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESUL
 
 # ── Pydantic Data Schemas for Verification ────────────────────────────────────
 
+# The report is feedback, not a copy of the source. Keep it small enough to
+# finish reliably even when the input chunk and concepts.json are both large.
+MAX_MISSING_CONCEPTS = 8
+MAX_MISSING_FACTS = 20
+MAX_HALLUCINATIONS = 8
+
+
 class VerificationResult(BaseModel):
     coverage_score: float = Field(
+        ge=0.0, le=1.0,
         description="Score between 0.0 and 1.0 representing how thoroughly concepts and facts were retained."
     )
     is_sufficient: bool = Field(
         description="True if all primary concepts and essential metrics/facts were captured without critical omissions."
     )
     missing_concepts: List[str] = Field(
-        default_factory=list,
+        max_length=MAX_MISSING_CONCEPTS,
         description="Primary thematic concepts present in the text chunk that were completely omitted from the extraction."
     )
     missing_facts: List[str] = Field(
-        default_factory=list,
+        max_length=MAX_MISSING_FACTS,
         description="Important metrics, parameters, findings, tools, or dates present in text but absent from descriptions."
     )
     hallucinations: List[str] = Field(
-        default_factory=list,
+        max_length=MAX_HALLUCINATIONS,
         description="Facts or statements in the extracted JSON that contradict or are absent from the source chunk."
     )
     critique: str = Field(
+        min_length=1,
         description="1-2 sentences summarizing the completeness, factual accuracy, and granularity of the extraction."
     )
+
+    @model_validator(mode="after")
+    def check_verdict(self) -> "VerificationResult":
+        if self.is_sufficient and (self.coverage_score < 0.85 or self.missing_concepts):
+            raise ValueError("is_sufficient cannot be true below 0.85 or with missing primary concepts")
+        for field in ("missing_concepts", "missing_facts", "hallucinations"):
+            values = getattr(self, field)
+            normalized = [value.strip().casefold() for value in values]
+            if any(not value for value in normalized) or len(set(normalized)) != len(values):
+                raise ValueError(f"{field} must contain only nonempty, unique items")
+        return self
 
 # ── System Prompt for Audit Verification ─────────────────────────────────────
 VERIFICATION_SYSTEM_PROMPT = """\
@@ -103,6 +123,12 @@ You MUST SILENTLY IGNORE and NOT penalize the extraction for omitting:
   - 0.5 - 0.7: Omitted a primary thematic concept or several key findings/metrics.
   - < 0.5: Severe omissions of main body content.
 - `is_sufficient`: `true` if coverage_score >= 0.85 and no major primary concept was completely dropped.
+
+REPORT BUDGET (audit the whole chunk, but report only actionable gaps):
+- Rank omissions by importance. Return at most 8 missing PRIMARY concepts, 20 missing substantive facts, and 8 actual hallucinations. If more remain, mention the additional omissions briefly in `critique` instead of enumerating them.
+- Each array entry must be unique and concise (one short sentence, not a paragraph). Do not quote or copy long passages from the input. Never repeat entries to fill the output.
+- A fact already captured anywhere in descriptions or outbound relations is not missing. An accurate statement is not a hallucination. Do not list a fact as missing merely because it is in a different concept.
+- Always include every JSON field, including `critique`. If there are no findings for a category, use []. Do not leave `is_sufficient` true when `missing_concepts` is nonempty.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON matching this exact structure:
@@ -204,8 +230,9 @@ class WikiVerifierPipeline:
                 try:
                     with result_file.open("r", encoding="utf-8") as f:
                         prior = json.load(f)
-                    if not isinstance(prior, dict) or "coverage_score" not in prior:
-                        raise ValueError(f"{self.result_filename} is incomplete")
+                    # Re-audit previously checkpointed results if they would
+                    # fail today's schema (including runaway/contradictory lists).
+                    VerificationResult.model_validate(prior)
                 except Exception:
                     self.checkpoint.mark(key, False)
 
@@ -242,6 +269,7 @@ class WikiVerifierPipeline:
         return f"""\
 You are an auditor verifying the extraction quality. Compare the RAW CHUNK against EXTRACTED CONCEPTS JSON.
 Produce a verification report evaluating coverage and factual accuracy.
+List only the most important, unique, genuinely absent findings: at most {MAX_MISSING_CONCEPTS} missing concepts, {MAX_MISSING_FACTS} missing facts, and {MAX_HALLUCINATIONS} hallucinations. Keep entries short; do not copy the raw text or explain why accurate claims are accurate. Always provide a brief critique.
 
 OUTPUT FORMAT MUST BE VALID JSON:
 {{
@@ -261,7 +289,7 @@ EXTRACTED CONCEPTS JSON:
 """
 
     def parse_verification(self, raw_text: Optional[str], key: str) -> VerificationResult:
-        """Parse an audit response, keeping the original resilient fallbacks.
+        """Parse an audit response without inventing a positive verdict.
 
         A malformed payload is streamed to the debug log in full before raising,
         so the exact model output can be inspected offline; raising lets the
@@ -282,25 +310,6 @@ EXTRACTED CONCEPTS JSON:
             self.debug.record("parse_failure", key=key, raw_response=raw_text,
                               reason="top-level JSON is not an object")
             raise ValueError("Verification response is not a JSON object")
-
-        # Resilient handling: If LLM re-extracted concepts instead of auditing
-        if "coverage_score" not in parsed_data:
-            concepts_list = parsed_data.get("concepts", [])
-            if concepts_list or "concepts" in parsed_data:
-                # Model confused verification with re-extraction
-                parsed_data["coverage_score"] = 0.85
-                parsed_data["is_sufficient"] = True
-                parsed_data["critique"] = "Extracted concepts verified."
-            else:
-                parsed_data.setdefault("coverage_score", 0.8)
-                parsed_data.setdefault("is_sufficient", True)
-                parsed_data.setdefault("critique", "Audit completed.")
-            self.debug.record("recovered_response_shape", key=key,
-                              raw_response=raw_text, parsed=parsed_data)
-
-        parsed_data.setdefault("missing_concepts", [])
-        parsed_data.setdefault("missing_facts", [])
-        parsed_data.setdefault("hallucinations", [])
 
         try:
             return VerificationResult.model_validate(parsed_data)
@@ -327,7 +336,13 @@ EXTRACTED CONCEPTS JSON:
             max_tokens=self.settings.max_tokens or 4096,
             response_format={"type": "json_object"},
         )
-        return self.parse_verification(response.choices[0].message.content, item["key"])
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            self.debug.record("truncated_response", key=item["key"],
+                              max_tokens=self.settings.max_tokens or 4096,
+                              raw_response=choice.message.content)
+            raise ValueError("Verification response truncated: hit max_tokens limit")
+        return self.parse_verification(choice.message.content, item["key"])
 
     # ── streaming persistence ──────────────────────────────────────────────
     async def persist_result(self, item: Dict[str, Any],
