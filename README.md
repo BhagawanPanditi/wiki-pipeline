@@ -413,8 +413,9 @@ in `DIR/.export_manifest.json`. Other files in the folder are not touched.
 | `--max-stage-attempts N` | 3 | How many times the runner restarts a failed stage. |
 | `--retry-forever` | off | Never give up on a stage. This also retries permanent errors, so use it with care. |
 | `--skip-verify-pass2` | off | Bypass Pass 2 verification and continue to document consolidation. No verification summary is updated. |
-| `--skip-verify-pass1` | off | Bypass Pass 1 verification; refinement runs without audit feedback, even if old audit files exist. |
-| `--skip-verification` | off | Bypass both extraction verification passes; equivalent to both flags above. Does not skip final consolidation's candidate review. |
+| `--skip-verify-pass1` | off | Bypass Pass 1 verification; refinement runs without audit feedback unless also skipped. |
+| `--skip-refinement` | off | Bypass Pass 2 refinement and implicitly bypass Pass 2 verification; consolidate the currently available concepts. Can be combined with `--skip-verify-pass1`. |
+| `--skip-verification` | off | Bypass both extraction verification passes; refinement still runs unless `--skip-refinement` is also set. Does not skip final consolidation's candidate review. |
 | `--fresh` | off | Clear the completion markers so that every stage runs again. No output is deleted. |
 
 `./run_pipeline.sh --help` prints these, with the resolved default paths at the end.
@@ -426,7 +427,12 @@ audit files intact but does not mark an audit as done. A later run without the
 flag can resume it. An existing `verification_summary.json` may be stale; it is
 not refreshed when either audit is skipped. Skipping Pass 1 also suppresses
 reading old Pass 1 audit files during *new* refinement work; completed
-refinements are not undone.
+refinements are not undone. To go directly from extraction to document
+consolidation, use `--skip-verify-pass1 --skip-refinement` (the latter also
+skips Pass 2 verification). Skipping refinement preserves the staging concepts
+as they are: if an earlier run already refined them, the skip flag does not
+restore the Pass 1 backup. Skipped stages leave their output data and logs
+intact and can be resumed on a subsequent run without skip flags.
 
 ### 7.2 Stages
 

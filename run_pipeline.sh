@@ -16,7 +16,8 @@
 #       [--wiki-base-dir PATH] [--data-dir PATH]
 #       [--chunking | --no-chunking] [--chunk-size N] [--chunk-overlap N]
 #       [--llm-log full|compact|errors] [--fresh]
-#       [--skip-verify-pass1] [--skip-verify-pass2] [--skip-verification]
+#       [--skip-verify-pass1] [--skip-refinement] [--skip-verify-pass2]
+#       [--skip-verification]
 #       [--servers URL [URL ...]] [--max-stage-attempts N | --retry-forever]
 #       [--item-attempts N] [--stage-budget-minutes MIN]
 #
@@ -58,6 +59,7 @@ WIKI_BASE_DIR="${WIKI_BASE_DIR:-$DEFAULT_WIKI_BASE_DIR}"
 DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
 FRESH=false
 SKIP_VERIFY_PASS1=false
+SKIP_REFINEMENT=false
 SKIP_VERIFY_PASS2=false
 RETRY_FOREVER=false
 MAX_STAGE_ATTEMPTS=3
@@ -76,7 +78,8 @@ Usage:
       [--wiki-base-dir PATH] [--data-dir PATH]
       [--chunking | --no-chunking] [--chunk-size N] [--chunk-overlap N]
       [--llm-log full|compact|errors] [--fresh]
-      [--skip-verify-pass1] [--skip-verify-pass2] [--skip-verification]
+      [--skip-verify-pass1] [--skip-refinement] [--skip-verify-pass2]
+      [--skip-verification]
       [--servers URL [URL ...]] [--max-stage-attempts N | --retry-forever]
       [--item-attempts N] [--stage-budget-minutes MIN]
 
@@ -93,11 +96,15 @@ continue from their own checkpoint, and the run proceeds to the end. Use
 Verification (no verification files are deleted):
   --skip-verify-pass2  Skip the final audit and continue to consolidation. This
                        is useful when Pass 2 verification is stuck or too slow.
-  --skip-verify-pass1  Skip the first audit. Refinement still runs, but without
-                       audit feedback, even if old verification files exist.
-  --skip-verification  Skip both extraction verification passes (both flags).
-                       Refinement still runs without audit feedback. This does
-                       not skip final consolidation's candidate review.
+  --skip-verify-pass1  Skip the first audit. Refinement still runs unless
+                       --skip-refinement is also given; stale feedback is ignored.
+  --skip-refinement    Skip the Pass 2 refinement and its verification pass;
+                       consolidate the available staging concepts unchanged.
+                       Combine with --skip-verify-pass1 to skip both upstream
+                       audit and refinement. Existing refinements are not undone.
+  --skip-verification  Skip both extraction verification passes. Refinement
+                       still runs unless --skip-refinement is also given. This
+                       does not skip final consolidation's candidate review.
   Skipped verification does not produce/update verification_summary.json.
   A later run without skip flags can resume either verification pass.
 
@@ -153,6 +160,8 @@ while [[ $# -gt 0 ]]; do
             FRESH=true; shift ;;
         --skip-verify-pass1)
             SKIP_VERIFY_PASS1=true; shift ;;
+        --skip-refinement)
+            SKIP_REFINEMENT=true; SKIP_VERIFY_PASS2=true; shift ;;
         --skip-verify-pass2)
             SKIP_VERIFY_PASS2=true; shift ;;
         --skip-verification)
@@ -533,8 +542,8 @@ invalidate_downstream_markers() {
     done
 }
 
-skip_verification_step() {
-    # Do not claim a skipped audit completed or failed. Leave its data and
+skip_step() {
+    # Do not claim a skipped stage completed or failed. Leave its data and
     # run log intact; a later run without this flag will resume/recheck it.
     local step="$1"
     rm -f -- "$STATE_DIR/${step}.done" "$STATE_DIR/${step}.failed"
@@ -634,6 +643,7 @@ cat <<EOF
  LLM call log:     ${LLM_LOG} (per stage, under ${LOG_DIR}/)
  Fresh run:        ${FRESH}
  Skip verify Pass 1: ${SKIP_VERIFY_PASS1}
+ Skip refinement:  ${SKIP_REFINEMENT}
  Skip verify Pass 2: ${SKIP_VERIFY_PASS2}
  Retry forever:    ${RETRY_FOREVER}
  Max stage tries:  ${MAX_STAGE_ATTEMPTS}
@@ -652,19 +662,23 @@ run_step preflight python3 "$SCRIPT_DIR/check_servers.py"
 run_step extract-concepts python3 "$SCRIPT_DIR/extract_concepts.py" \
     "${PASS1_ARGS[@]}" --resume
 if [[ "$SKIP_VERIFY_PASS1" == true ]]; then
-    skip_verification_step verify-pass1
+    skip_step verify-pass1
 else
     run_step verify-pass1 python3 "$SCRIPT_DIR/verify_extraction.py" \
         "${STAGE_ARGS[@]}" --phase 1 --resume
 fi
-REFINE_ARGS=("${STAGE_ARGS[@]}")
-if [[ "$SKIP_VERIFY_PASS1" == true ]]; then
-    REFINE_ARGS+=(--ignore_audit_feedback)
+if [[ "$SKIP_REFINEMENT" == true ]]; then
+    skip_step refine-concepts
+else
+    REFINE_ARGS=("${STAGE_ARGS[@]}")
+    if [[ "$SKIP_VERIFY_PASS1" == true ]]; then
+        REFINE_ARGS+=(--ignore_audit_feedback)
+    fi
+    run_step refine-concepts python3 "$SCRIPT_DIR/refine_concepts.py" \
+        "${REFINE_ARGS[@]}" --resume
 fi
-run_step refine-concepts python3 "$SCRIPT_DIR/refine_concepts.py" \
-    "${REFINE_ARGS[@]}" --resume
 if [[ "$SKIP_VERIFY_PASS2" == true ]]; then
-    skip_verification_step verify-pass2
+    skip_step verify-pass2
 else
     run_step verify-pass2 python3 "$SCRIPT_DIR/verify_extraction.py" \
         "${STAGE_ARGS[@]}" --phase 2 --resume

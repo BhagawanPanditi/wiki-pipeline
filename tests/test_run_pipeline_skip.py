@@ -43,6 +43,8 @@ elif name == "verify_extraction":
     if phase == "2":
         (root / "verification_summary.json").write_text('{}')
 elif name == "refine_concepts":
+    if os.environ.get("FAIL_REFINEMENT"):
+        sys.exit(73)
     (root / "pass2_log.json").write_text('{"doc::chunk": true}')
 elif name == "consolidate_documents":
     # Reaching this step proves neither audit is required downstream.
@@ -73,10 +75,12 @@ class RunnerSkipTests(unittest.TestCase):
         self.corpus.write_text('{"id": "doc", "contents": "topic"}\n')
         self.run_dir = self.root / "wiki" / "demo"
 
-    def run_pipeline(self, *flags, fail_pass2=False):
+    def run_pipeline(self, *flags, fail_pass2=False, fail_refinement=False):
         env = {**os.environ, "TEST_WIKI_BASE": str(self.root / "wiki")}
         if fail_pass2:
             env["FAIL_VERIFY_PASS2"] = "1"
+        if fail_refinement:
+            env["FAIL_REFINEMENT"] = "1"
         return subprocess.run(
             ["bash", str(self.bin / "run_pipeline.sh"),
              "--corpus", str(self.corpus), "--domain", "demo",
@@ -113,6 +117,33 @@ class RunnerSkipTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("consolidate_documents ") for line in lines))
         self.assertFalse((self.run_dir / ".pipeline_state" / "verify-pass1.done").exists())
         self.assertFalse((self.run_dir / ".pipeline_state" / "verify-pass2.done").exists())
+
+    def test_skip_verify_pass1_and_refinement_proceeds_without_pass2_audit(self):
+        result = self.run_pipeline("--skip-verify-pass1", "--skip-refinement")
+        self.assertEqual(result.returncode, 85, result.stdout + result.stderr)
+        self.assertIn("[SKIP] refine-concepts: requested", result.stdout)
+        self.assertIn("[SKIP] verify-pass2: requested", result.stdout)
+        lines = self.calls()
+        self.assertFalse(any(line.startswith("verify_extraction ") or
+                             line.startswith("refine_concepts ") for line in lines))
+        self.assertTrue(any(line.startswith("consolidate_documents ") for line in lines))
+        self.assertFalse((self.run_dir / ".pipeline_state" / "refine-concepts.done").exists())
+        self.assertFalse((self.run_dir / "pass2_log.json").exists())
+
+    def test_refinement_can_be_skipped_then_resumed(self):
+        failed = self.run_pipeline(fail_refinement=True)
+        self.assertEqual(failed.returncode, 73, failed.stdout + failed.stderr)
+        skipped = self.run_pipeline("--skip-refinement", fail_refinement=True)
+        self.assertEqual(skipped.returncode, 85, skipped.stdout + skipped.stderr)
+        self.assertFalse((self.run_dir / ".pipeline_state" / "refine-concepts.failed").exists())
+        self.assertFalse((self.run_dir / ".pipeline_state" / "refine-concepts.done").exists())
+        self.assertFalse((self.run_dir / ".pipeline_state" / "verify-pass2.done").exists())
+        self.assertTrue(any("--phase 1" in line for line in self.calls()))
+        self.assertFalse(any("--phase 2" in line for line in self.calls()))
+        resumed = self.run_pipeline()
+        self.assertEqual(resumed.returncode, 85, resumed.stdout + resumed.stderr)
+        self.assertTrue((self.run_dir / ".pipeline_state" / "refine-concepts.done").exists())
+        self.assertTrue((self.run_dir / ".pipeline_state" / "verify-pass2.done").exists())
 
 
 if __name__ == "__main__":
