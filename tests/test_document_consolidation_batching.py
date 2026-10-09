@@ -60,6 +60,7 @@ class MergeRequestTests(unittest.IsolatedAsyncioTestCase):
             batch = json.loads(kwargs["messages"][1]["content"].split("CONCEPT LIST (only merge titles present in this list):\n")[1])
             requests.append(batch)
             self.assertLessEqual(len(batch), MAX_MERGE_BATCH_CONCEPTS)
+            self.assertEqual(set(batch[0]), {"title", "aliases", "description_hint"})
             return response([{"primary_title": batch[0]["title"],
                               "merged_titles": [batch[1]["title"]]}])
 
@@ -69,6 +70,25 @@ class MergeRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(requests), 1)
         self.assertEqual(len(obj.execute_programmatic_merge(raw, result)),
                          len(raw) - len(requests))
+
+    async def test_merge_prompt_excludes_long_descriptions_and_relations(self):
+        obj = pipeline()
+        raw = [{"title": "Human biology", "aliases": [f"alias {i}" for i in range(25)],
+                "description": "detail " * 1000,
+                "outbound_relations": [{"target_concept": "Other", "relation": "long " * 500}]}]
+
+        async def create(**kwargs):
+            text = kwargs["messages"][1]["content"]
+            batch = json.loads(text.split("CONCEPT LIST (only merge titles present in this list):\n")[1])
+            self.assertEqual(len(batch[0]["aliases"]), 8)
+            self.assertLessEqual(len(batch[0]["description_hint"]), 200)
+            self.assertNotIn("outbound_relations", text)
+            self.assertNotIn("long long", text)
+            return response([])
+
+        result = await obj.get_merge_clusters(client_for(create),
+                                               {"doc_id": "doc", "raw_concepts": raw}, 0)
+        self.assertEqual(result.merge_clusters, [])
 
     async def test_server_context_rejection_splits_batch_without_losing_results(self):
         obj = pipeline()
