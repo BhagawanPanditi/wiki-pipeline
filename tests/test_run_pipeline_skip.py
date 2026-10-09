@@ -47,8 +47,20 @@ elif name == "refine_concepts":
         sys.exit(73)
     (root / "pass2_log.json").write_text('{"doc::chunk": true}')
 elif name == "consolidate_documents":
-    # Reaching this step proves neither audit is required downstream.
-    sys.exit(85)
+    if not os.environ.get("ALLOW_CONSOLIDATION"):
+        # Most tests stop here, proving earlier stages were skipped.
+        sys.exit(85)
+    (root / "doc_consolidation_log.json").write_text('{"canon_doc": true}')
+    output = root / "consolidated" / "canon_doc"
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "concepts.json").write_text('{"concepts": [{"title": "topic"}]}')
+elif name == "consolidate_global":
+    skip = "--skip_fuzzy_review" in args
+    (root / "global_concepts.json").write_text('{"concepts": [{"title": "topic"}]}')
+    (root / "global_consolidation.json").write_text(json.dumps({
+        "global_audit_summary": {"fuzzy_review_skipped": skip}}))
+elif name == "resolve_stubs":
+    sys.exit(86)
 '''
 
 
@@ -69,14 +81,17 @@ class RunnerSkipTests(unittest.TestCase):
         (self.bin / "utils").mkdir()
         (self.bin / "utils" / "corpus.py").write_text('def cache_manifest(*args, **kwargs): return {}\n')
         for name in ("check_servers", "extract_concepts", "verify_extraction",
-                     "refine_concepts", "consolidate_documents"):
+                     "refine_concepts", "consolidate_documents", "consolidate_global", "resolve_stubs"):
             (self.bin / f"{name}.py").write_text(STUB)
         self.corpus = self.root / "demo.jsonl"
         self.corpus.write_text('{"id": "doc", "contents": "topic"}\n')
         self.run_dir = self.root / "wiki" / "demo"
 
-    def run_pipeline(self, *flags, fail_pass2=False, fail_refinement=False):
+    def run_pipeline(self, *flags, fail_pass2=False, fail_refinement=False,
+                     allow_consolidation=False):
         env = {**os.environ, "TEST_WIKI_BASE": str(self.root / "wiki")}
+        if allow_consolidation:
+            env["ALLOW_CONSOLIDATION"] = "1"
         if fail_pass2:
             env["FAIL_VERIFY_PASS2"] = "1"
         if fail_refinement:
@@ -91,6 +106,26 @@ class RunnerSkipTests(unittest.TestCase):
 
     def calls(self):
         return (self.run_dir / "calls.txt").read_text().splitlines()
+
+    def test_exact_only_global_output_is_not_reused_for_fuzzy_mode(self):
+        flags = ("--skip-verify-pass1", "--skip-refinement", "--skip-verify-pass2")
+        first = self.run_pipeline(*flags, "--skip-global-fuzzy", allow_consolidation=True)
+        self.assertEqual(first.returncode, 86, first.stdout + first.stderr)
+        calls = [line for line in self.calls() if line.startswith("consolidate_global ")]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--skip_fuzzy_review", calls[0])
+        self.assertTrue((self.run_dir / "global_consolidation.json").exists())
+
+        second = self.run_pipeline(*flags, "--skip-global-fuzzy", allow_consolidation=True)
+        self.assertEqual(second.returncode, 86, second.stdout + second.stderr)
+        calls = [line for line in self.calls() if line.startswith("consolidate_global ")]
+        self.assertEqual(len(calls), 1, second.stdout)
+
+        full = self.run_pipeline(*flags, allow_consolidation=True)
+        self.assertEqual(full.returncode, 86, full.stdout + full.stderr)
+        calls = [line for line in self.calls() if line.startswith("consolidate_global ")]
+        self.assertEqual(len(calls), 2, full.stdout)
+        self.assertNotIn("--skip_fuzzy_review", calls[-1])
 
     def test_skip_pass2_after_failed_audit_and_resume_it_later(self):
         failed = self.run_pipeline(fail_pass2=True)

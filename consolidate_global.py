@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
 import networkx as nx
+from openai import BadRequestError
 # nltk only supplies a stopword list for the fuzzy-similarity heuristics. It is
 # optional: without it the module falls back to a small built-in list rather than
 # refusing to import, so the pipeline runs on a bare environment.
@@ -52,6 +53,8 @@ from utils.json_repair import clean_json_string
 from utils.llm_pool import pool_for_stage
 
 STAGE = "consolidate-global"
+MAX_FUZZY_BATCH_CONCEPTS = 32
+MAX_FUZZY_BATCH_CHARS = 20000
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
 class MergeCluster(BaseModel):
@@ -338,38 +341,83 @@ def build_fuzzy_candidate_clusters(concepts: List[Dict[str, Any]]) -> List[List[
     return candidate_clusters
 
 # ── Async LLM Verification Runner ────────────────────────────────────────────
-async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) -> GlobalFuzzyMergeSchema:
-    """One cluster verdict.
+def make_fuzzy_review_batches(cluster: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Bound the prompt built from an often very large graph community.
 
-    Raises on any unusable response so ServerPool can classify and retry it.
-    Returning None after 10 silent attempts used to mean "this cluster failed";
-    an exhausted retry means the same thing now, except it is also recorded in
-    the debug log and counted per server.
+    Exact-match fusion can aggregate many aliases onto a single concept. Neither
+    the alias list nor a Louvain cluster has a fixed size, so cap both the per-
+    concept evidence and the request size before invoking the server.
     """
-    lightweight_concepts = []
-    for idx, c in enumerate(cluster, 1):
-        lightweight_concepts.append({
-            "id": idx,
-            "title": c.get("title"),
-            "aliases": c.get("aliases", []),
-            "description_snippet": snippet_description(c.get("description", ""), max_words=30)
-        })
+    views = sorted(({
+        "title": c.get("title"),
+        "aliases": c.get("aliases", [])[:8],
+        "description_hint": snippet_description(c.get("description", ""), max_words=30)[:400],
+    } for c in cluster), key=lambda c: str(c["title"] or "").casefold())
+    batches: List[List[Dict[str, Any]]] = []
+    batch: List[Dict[str, Any]] = []
+    size = 2
+    for view in views:
+        item_size = len(json.dumps(view, ensure_ascii=False, separators=(",", ":"))) + 1
+        if item_size + 2 > MAX_FUZZY_BATCH_CHARS:
+            raise ValueError(f"Fuzzy candidate {view['title']!r} is too large for a review batch")
+        if batch and (len(batch) >= MAX_FUZZY_BATCH_CONCEPTS or
+                      size + item_size > MAX_FUZZY_BATCH_CHARS):
+            batches.append(batch)
+            batch = []
+            size = 2
+        batch.append(view)
+        size += item_size
+    if batch:
+        batches.append(batch)
+    return batches
 
-    user_prompt = f"CANDIDATE CONCEPT CLUSTER FOR REVIEW:\n{json.dumps(lightweight_concepts, indent=2)}\n"
 
-    response = await client.chat.completions.create(
-        model=settings.model_name,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_FUZZY_MERGE},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=0.1,
-        max_tokens=settings.max_tokens,
-        response_format={"type": "json_object"}
+async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) -> GlobalFuzzyMergeSchema:
+    """Review a candidate cluster using bounded requests; all sub-batches must pass."""
+    batches = make_fuzzy_review_batches(cluster)
+    semaphore = asyncio.Semaphore(2)
+
+    async def review_batch(batch: List[Dict[str, Any]]) -> List[MergeCluster]:
+        async with semaphore:
+            prompt = ("CANDIDATE CONCEPT CLUSTER FOR REVIEW (merge only titles shown):\n"
+                      + json.dumps(batch, ensure_ascii=False, separators=(",", ":")) + "\n")
+            finish_reason = None
+            try:
+                response = await client.chat.completions.create(
+                    model=settings.model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT_FUZZY_MERGE},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=settings.max_tokens,
+                    response_format={"type": "json_object"}
+                )
+                choice = response.choices[0]
+                finish_reason = choice.finish_reason
+                if finish_reason == "length":
+                    raise ValueError("Fuzzy review truncated at max_tokens")
+                result = GlobalFuzzyMergeSchema.model_validate_json(
+                    clean_json_string(choice.message.content))
+                return result.merge_clusters
+            except Exception as exc:
+                too_long = (finish_reason == "length" or
+                            isinstance(exc, BadRequestError) and
+                            ("maximum context length" in str(exc).lower() or
+                             "input_tokens" in str(exc).lower()))
+                if not too_long or len(batch) == 1:
+                    raise
+        # Release the semaphore before child requests so recursive splitting
+        # cannot deadlock. Never accept a partially reviewed cluster.
+        mid = len(batch) // 2
+        left, right = await asyncio.gather(review_batch(batch[:mid]),
+                                           review_batch(batch[mid:]))
+        return left + right
+
+    results = await asyncio.gather(*(review_batch(batch) for batch in batches))
+    return GlobalFuzzyMergeSchema(
+        merge_clusters=[merge for part in results for merge in part]
     )
-    raw_text = response.choices[0].message.content
-    cleaned = clean_json_string(raw_text)
-    return GlobalFuzzyMergeSchema.model_validate_json(cleaned)
 
 async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], args) -> Tuple[List[MergeCluster], List[Dict[str, Any]]]:
     """Ask the LLM which fuzzy candidate clusters really are the same concept.
@@ -576,9 +624,16 @@ def global_consolidate(domain_dir: Path, args):
     exact_count = len(exact_concepts)
     print(f"Concepts after Exact-Match UnionFind: {exact_count}")
 
-    # 3. Phase 2 & 3: Fuzzy Blocking & LLM Verification
-    candidate_clusters = build_fuzzy_candidate_clusters(exact_concepts)
-    approved_fuzzy_merges, llm_evaluations = asyncio.run(run_llm_fuzzy_pass(candidate_clusters, args))
+    # 3. Optional fuzzy blocking & LLM review. Exact-match merging and all
+    # downstream citation/relation fusion still run when fuzzy review is skipped.
+    skip_fuzzy = getattr(args, "skip_fuzzy_review", False)
+    if skip_fuzzy:
+        print("Skipping global fuzzy LLM review; continuing with exact/alias matches only.")
+        candidate_clusters = []
+        approved_fuzzy_merges, llm_evaluations = [], []
+    else:
+        candidate_clusters = build_fuzzy_candidate_clusters(exact_concepts)
+        approved_fuzzy_merges, llm_evaluations = asyncio.run(run_llm_fuzzy_pass(candidate_clusters, args))
 
     # Apply LLM Approved Fuzzy Merges to UnionFind
     for cluster in approved_fuzzy_merges:
@@ -737,6 +792,7 @@ def global_consolidate(domain_dir: Path, args):
             "raw_concepts_loaded": raw_concepts_count,
             "exact_merged_concepts": exact_count,
             "fuzzy_candidate_clusters_evaluated": len(candidate_clusters),
+            "fuzzy_review_skipped": skip_fuzzy,
             "llm_fuzzy_merges_applied": len(approved_fuzzy_merges),
             "final_global_concepts": len(global_concepts),
             "total_global_relations": total_global_relations,
@@ -792,6 +848,8 @@ def main():
     parser = build_parser(
         stage=STAGE,
         description="Global Knowledge Graph Consolidation (Exact + Fuzzy Blocking + LLM Verification)")
+    parser.add_argument("--skip_fuzzy_review", action="store_true",
+                        help="Skip fuzzy candidate generation/LLM review; keep only exact-title and alias merges.")
     args = parser.parse_args()
     domain_dir = Path(args.wiki_base_dir) / args.domain
 

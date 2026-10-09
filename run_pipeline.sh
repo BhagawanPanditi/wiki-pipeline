@@ -17,7 +17,7 @@
 #       [--chunking | --no-chunking] [--chunk-size N] [--chunk-overlap N]
 #       [--llm-log full|compact|errors] [--fresh]
 #       [--skip-verify-pass1] [--skip-refinement] [--skip-verify-pass2]
-#       [--skip-verification]
+#       [--skip-verification] [--skip-global-fuzzy]
 #       [--servers URL [URL ...]] [--max-stage-attempts N | --retry-forever]
 #       [--item-attempts N] [--stage-budget-minutes MIN]
 #
@@ -61,6 +61,7 @@ FRESH=false
 SKIP_VERIFY_PASS1=false
 SKIP_REFINEMENT=false
 SKIP_VERIFY_PASS2=false
+SKIP_GLOBAL_FUZZY=false
 RETRY_FOREVER=false
 MAX_STAGE_ATTEMPTS=3
 ITEM_ATTEMPTS=""
@@ -79,7 +80,7 @@ Usage:
       [--chunking | --no-chunking] [--chunk-size N] [--chunk-overlap N]
       [--llm-log full|compact|errors] [--fresh]
       [--skip-verify-pass1] [--skip-refinement] [--skip-verify-pass2]
-      [--skip-verification]
+      [--skip-verification] [--skip-global-fuzzy]
       [--servers URL [URL ...]] [--max-stage-attempts N | --retry-forever]
       [--item-attempts N] [--stage-budget-minutes MIN]
 
@@ -105,6 +106,10 @@ Verification (no verification files are deleted):
   --skip-verification  Skip both extraction verification passes. Refinement
                        still runs unless --skip-refinement is also given. This
                        does not skip final consolidation's candidate review.
+  --skip-global-fuzzy  In global consolidation, perform exact-title/alias merges
+                       and relation/citation fusion but skip fuzzy candidate
+                       generation and LLM review. Faster, but near-duplicate
+                       concepts may remain separate.
   Skipped verification does not produce/update verification_summary.json.
   A later run without skip flags can resume either verification pass.
 
@@ -166,6 +171,8 @@ while [[ $# -gt 0 ]]; do
             SKIP_VERIFY_PASS2=true; shift ;;
         --skip-verification)
             SKIP_VERIFY_PASS1=true; SKIP_VERIFY_PASS2=true; shift ;;
+        --skip-global-fuzzy)
+            SKIP_GLOBAL_FUZZY=true; shift ;;
         --retry-forever)
             RETRY_FOREVER=true; shift ;;
         --no-chunking)
@@ -421,6 +428,21 @@ except Exception:
 PY
 }
 
+global_fuzzy_mode_matches() {
+    # Do not reuse an exact-only graph for a requested fuzzy run (or vice versa).
+    python3 - "$DOMAIN_DIR/global_consolidation.json" "$SKIP_GLOBAL_FUZZY" <<'PY'
+import json
+import sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    skipped = data.get("global_audit_summary", {}).get("fuzzy_review_skipped", False)
+    raise SystemExit(0 if skipped is (sys.argv[2] == "true") else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 verification_complete() {
     # A verification pass is complete only when every unit in the chunk cache has
     # a parseable result file carrying a coverage score. The aggregate summary is
@@ -505,7 +527,7 @@ step_outputs_ready() {
             return 1
             ;;
         consolidate-global)
-            json_has_concepts "$DOMAIN_DIR/global_concepts.json"
+            json_has_concepts "$DOMAIN_DIR/global_concepts.json" && global_fuzzy_mode_matches
             ;;
         resolve-stubs)
             json_has_concepts "$DOMAIN_DIR/global_concepts_stubs_resolved.json"
@@ -645,6 +667,7 @@ cat <<EOF
  Skip verify Pass 1: ${SKIP_VERIFY_PASS1}
  Skip refinement:  ${SKIP_REFINEMENT}
  Skip verify Pass 2: ${SKIP_VERIFY_PASS2}
+ Skip global fuzzy: ${SKIP_GLOBAL_FUZZY}
  Retry forever:    ${RETRY_FOREVER}
  Max stage tries:  ${MAX_STAGE_ATTEMPTS}
  Item attempts:    ${ITEM_ATTEMPTS:-stage default}
@@ -688,8 +711,12 @@ fi
 run_step consolidate-documents python3 "$SCRIPT_DIR/consolidate_documents.py" \
     "${STAGE_ARGS[@]}"
 
+GLOBAL_ARGS=("${STAGE_ARGS[@]}")
+if [[ "$SKIP_GLOBAL_FUZZY" == true ]]; then
+    GLOBAL_ARGS+=(--skip_fuzzy_review)
+fi
 run_step consolidate-global python3 "$SCRIPT_DIR/consolidate_global.py" \
-    "${STAGE_ARGS[@]}"
+    "${GLOBAL_ARGS[@]}"
 run_step resolve-stubs python3 "$SCRIPT_DIR/resolve_stubs.py" \
     "${STAGE_ARGS[@]}"
 run_step fold-thin-concepts python3 "$SCRIPT_DIR/fold_thin_concepts.py" \

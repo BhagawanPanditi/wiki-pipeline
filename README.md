@@ -318,6 +318,13 @@ python3 consolidate_global.py --domain $D --wiki_base_dir $W
 ```
 
 Needs: step 5. Writes: `global_concepts.json`, `global_consolidation.json`.
+If fuzzy clusters are very large, LLM review uses bounded batches of titles, up to
+8 aliases and a 30-word hint; all sub-batches must succeed. To proceed with exact
+and alias matches only, pass `run_pipeline.sh --skip-global-fuzzy` (or
+`consolidate_global.py --skip_fuzzy_review`). This skips candidate generation and
+LLM review, but still fuses descriptions, citations and relations. The audit
+summary records `fuzzy_review_skipped: true`, and the runner won't mistake an
+exact-only output for a completed fuzzy run or vice versa.
 
 **7. Resolve stubs**
 
@@ -423,6 +430,7 @@ in `DIR/.export_manifest.json`. Other files in the folder are not touched.
 | `--skip-verify-pass1` | off | Bypass Pass 1 verification; refinement runs without audit feedback unless also skipped. |
 | `--skip-refinement` | off | Bypass Pass 2 refinement and implicitly bypass Pass 2 verification; consolidate the currently available concepts. Can be combined with `--skip-verify-pass1`. |
 | `--skip-verification` | off | Bypass both extraction verification passes; refinement still runs unless `--skip-refinement` is also set. Does not skip final consolidation's candidate review. |
+| `--skip-global-fuzzy` | off | In global consolidation, keep exact/alias merges but skip fuzzy candidate generation and LLM review. Near-duplicates may remain separate. |
 | `--fresh` | off | Clear the completion markers so that every stage runs again. No output is deleted. |
 
 `./run_pipeline.sh --help` prints these, with the resolved default paths at the end.
@@ -461,7 +469,8 @@ Three stages also take `--resume` (`extract_concepts.py`, `refine_concepts.py` a
 `verify_extraction.py`): it clears the incomplete marks and continues from the
 checkpoint. The runner passes it where it exists.
 
-Stage-specific flags: `--phase 1|2` (`verify_extraction.py`), `--min_concept_words`
+Stage-specific flags: `--phase 1|2` (`verify_extraction.py`), `--skip_fuzzy_review`
+(`consolidate_global.py`), `--min_concept_words`
 (`fold_thin_concepts.py`), `--min_shared_entities`, `--max_links_per_node`, `--dry_run`
 (`link_entities.py`), `--max_island_size` (`audit_islands.py`), `--fast`
 (`add_reverse_links.py`), `--from_log` (`final_consolidation.py`), `--output_dir`
