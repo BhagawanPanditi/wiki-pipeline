@@ -191,18 +191,17 @@ class DocumentConsolidatorPipeline:
         doc_id = item["doc_id"]
         raw_concepts = item["raw_concepts"]
 
+        # Merge identity is decided from names and a short disambiguation hint.
+        # Relations and full descriptions belong in the saved concepts, not in
+        # this prompt: repeating them for every chunk made large documents exceed
+        # the server's input-token allowance.
         lightweight_concepts = []
-        for idx, c in enumerate(raw_concepts, 1):
-            # Relations are only disambiguation hints for a title-merge decision;
-            # sending hundreds per concept can make even a single item unfit.
-            relations_summary = [
-                {"target": r.get("target_concept"), "relation_snippet": snippet_description(r.get("relation", ""), max_words=15)}
-                for r in c.get("outbound_relations", [])[:8]
-            ]
+        for c in raw_concepts:
             lightweight_concepts.append({
-                "id": idx, "title": c.get("title"), "aliases": c.get("aliases", [])[:12],
-                "description_snippet": snippet_description(c.get("description", ""), max_words=30),
-                "outbound_relations": relations_summary
+                "title": c.get("title"),
+                "aliases": c.get("aliases", [])[:8],
+                "description_hint": snippet_description(
+                    c.get("description", ""), max_words=18)[:200],
             })
 
         batches = make_merge_batches(lightweight_concepts)
