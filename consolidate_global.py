@@ -260,6 +260,11 @@ CRITICAL MERGE RULES:
 2. DO NOT MERGE DISTINCT SUB-TYPES OR OPPOSITES: 
    - DO NOT merge distinct sub-types (e.g. "Type 1 Diabetes" vs "Type 2 Diabetes", "Quicksort" vs "Mergesort", "Microeconomics" vs "Macroeconomics").
    - DO NOT merge a general parent concept with a specific, independent sub-component.
+   - DO NOT merge a topic with studies, terminology, statistical artifacts, or
+     evidence *about* that topic. Do not merge two different named products just
+     because they are in the same category.
+   - A two-candidate batch is NOT a request to merge those two candidates.
+     If equivalence is uncertain, return {"merge_clusters": []}.
 3. PRIMARY CONCEPT: Choose the best existing numbered candidate as the primary.
    Only return numbers shown in this request. Do not return names, aliases,
    new titles, or concepts from other requests. Each group needs two or more
