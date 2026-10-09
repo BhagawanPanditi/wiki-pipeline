@@ -222,7 +222,7 @@ class WikiSecondPassPipeline:
             # Check if audit verification log exists for extra guidance
             verification_file = chunk_dir / "verification.json"
             audit_feedback = None
-            if verification_file.exists():
+            if not getattr(self.args, "ignore_audit_feedback", False) and verification_file.exists():
                 try:
                     with open(verification_file, "r", encoding="utf-8") as f:
                         vf_data = json.load(f)
@@ -523,6 +523,8 @@ def main():
         stage=STAGE,
         description="Second-Pass Concept Extraction & Patching Pipeline",
         include_resume=True)
+    parser.add_argument("--ignore_audit_feedback", action="store_true",
+                        help="Do not read existing Pass 1 verification files for refinement hints.")
     args = parser.parse_args()
     pipeline = WikiSecondPassPipeline(args)
     asyncio.run(pipeline.run())
