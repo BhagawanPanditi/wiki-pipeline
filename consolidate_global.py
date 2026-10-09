@@ -13,6 +13,7 @@ Global Knowledge Graph Consolidation Pipeline
 """
 
 import asyncio
+import hashlib
 import json
 import re
 from collections import Counter
@@ -43,7 +44,7 @@ except Exception:
     STOP_WORDS = {"a", "an", "the", "and", "or", "in", "of", "on", "at", "to", "for", "with", "by", "is", "it", "as", "that", "this", "are", "was"}
 
 # ── Server Configuration ─────────────────────────────────────────────────────
-from utils.atomic_io import atomic_write_json, sanitize_filename
+from utils.atomic_io import atomic_write_json, read_json, sanitize_filename
 from utils.cli import build_parser, resolve_settings
 from utils.event_log import EventLog
 from utils.text import snippet_description
@@ -451,6 +452,23 @@ def map_fuzzy_ids(reply: FuzzyIdResponse, batch: List[Dict[str, Any]]) -> List[M
     return converted
 
 
+def parse_fuzzy_id_response(text: str) -> FuzzyIdResponse:
+    """Accept the requested wrapper or one unwrapped merge object.
+
+    Small two-concept requests often produce {"primary_id":1,"merged_ids":[2]}
+    despite the wrapper in the prompt. Both shapes carry the same decision;
+    anything else still fails rather than masquerading as an empty verdict.
+    """
+    payload = json.loads(clean_json_string(text))
+    if not isinstance(payload, dict):
+        raise ValueError("Fuzzy review answer must be a JSON object")
+    if "merge_clusters" not in payload and "primary_id" in payload:
+        payload = {"merge_clusters": [payload]}
+    elif isinstance(payload.get("merge_clusters"), dict):
+        payload = {"merge_clusters": [payload["merge_clusters"]]}
+    return FuzzyIdResponse.model_validate(payload)
+
+
 async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) -> GlobalFuzzyMergeSchema:
     """Review a candidate cluster using bounded requests; all sub-batches must pass."""
     batches = make_fuzzy_review_batches(cluster)
@@ -475,8 +493,7 @@ async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) ->
                 finish_reason = choice.finish_reason
                 if finish_reason == "length":
                     raise ValueError("Fuzzy review truncated at max_tokens")
-                result = FuzzyIdResponse.model_validate_json(
-                    clean_json_string(choice.message.content))
+                result = parse_fuzzy_id_response(choice.message.content)
                 return map_fuzzy_ids(result, batch)
             except Exception as exc:
                 too_long = (finish_reason == "length" or
@@ -497,89 +514,106 @@ async def verify_cluster_llm(client, cluster: List[Dict[str, Any]], settings) ->
         merge_clusters=[merge for part in results for merge in part]
     )
 
-async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], args) -> Tuple[List[MergeCluster], List[Dict[str, Any]]]:
-    """Ask the LLM which fuzzy candidate clusters really are the same concept.
+def fuzzy_review_key(cluster: List[Dict[str, Any]], method: str, settings) -> str:
+    """Hash everything that affects the LLM verdict, including rendered inputs."""
+    prompts = [format_fuzzy_review_batch(batch)
+               for batch in make_fuzzy_review_batches(cluster)]
+    payload = {
+        "cache_format": 1, "strategy": FUZZY_REVIEW_STRATEGY,
+        "method": method, "model": settings.model_name,
+        "max_tokens": settings.max_tokens, "system": SYSTEM_PROMPT_FUZZY_MERGE,
+        "prompts": prompts,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False)
+                          .encode("utf-8")).hexdigest()
 
-    Args:
-        candidate_clusters: Groups of concept dicts that look alike.
-        args: Parsed CLI namespace.
 
-    Returns:
-        A 2-tuple of the approved :class:`MergeCluster` list and one evaluation record
-        per cluster, holding what was sent and what came back. Both are empty when
-        there are no clusters.
+def valid_fuzzy_verdict(cluster: List[Dict[str, Any]], verdict: GlobalFuzzyMergeSchema) -> bool:
+    """Never replay a checkpoint referring to titles outside its candidate group."""
+    titles = {concept["title"] for concept in cluster}
+    return all(merge.primary_title in titles and
+               all(title in titles for title in merge.merged_titles)
+               for merge in verdict.merge_clusters)
 
-    Raises:
-        RuntimeError: If clusters exist but no LLM server is configured, or if any
-            cluster fails after retries. Failed clusters are recorded before the error."""
+
+async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], args,
+                             method: str = "word") -> Tuple[List[MergeCluster], List[Dict[str, Any]]]:
+    """Review one metric's candidate groups, checkpointing each successful group.
+
+    A failed group is never cached. A later attempt reuses successful decisions,
+    including empty merge lists, and asks the model only about pending groups.
+    Cache keys include the exact prompts, model, strategy, and pass name so a
+    changed input cannot silently reuse an unrelated decision.
+    """
     if not candidate_clusters:
         return [], []
+    settings = resolve_settings(args, STAGE)
+    cache_dir = run_dir_for(args) / "cache" / "consolidate-global" / method
+    approved_merges: List[MergeCluster] = []
+    llm_evaluations: List[Dict[str, Any]] = []
+    pending: List[List[Dict[str, Any]]] = []
+    pending_keys: Dict[int, str] = {}
+    reused = 0
+
+    def collect(cluster: List[Dict[str, Any]], verdict: GlobalFuzzyMergeSchema) -> None:
+        llm_evaluations.append({
+            "candidates_sent": [c.get("title", "Unknown") for c in cluster],
+            "decisions": [m.model_dump() for m in verdict.merge_clusters],
+        })
+        approved_merges.extend(verdict.merge_clusters)
+
+    for cluster in candidate_clusters:
+        key = fuzzy_review_key(cluster, method, settings)
+        checkpoint = read_json(cache_dir / f"{key}.json")
+        if (isinstance(checkpoint, dict) and checkpoint.get("key") == key and
+                isinstance(checkpoint.get("verdict"), dict) and
+                isinstance(checkpoint["verdict"].get("merge_clusters"), list)):
+            try:
+                verdict = GlobalFuzzyMergeSchema.model_validate(checkpoint["verdict"])
+                if valid_fuzzy_verdict(cluster, verdict):
+                    collect(cluster, verdict)
+                    reused += 1
+                    continue
+            except (KeyError, ValueError, TypeError):
+                pass  # Corrupt or incompatible checkpoints are reviewed again.
+        pending_keys[id(cluster)] = key
+        pending.append(cluster)
+
+    print(f"{method.capitalize()} fuzzy review: {len(candidate_clusters)} clusters, "
+          f"{reused} cached verdicts, {len(pending)} pending requests.")
+    if not pending:
+        return approved_merges, llm_evaluations
     if not args.servers:
         raise RuntimeError("Fuzzy concept clusters require at least one configured LLM server.")
 
-    settings = resolve_settings(args, STAGE)
-    print(f"Evaluating {len(candidate_clusters)} fuzzy candidate clusters using LLM pool...")
     print(f"Spreading clusters across {len(settings.servers)} server(s) at "
           f"{settings.concurrency_per_server} concurrent request(s) each "
           f"(item i -> server i % N).")
-
-    debug_path = log_path(run_dir_for(args), STAGE, "debug")
-    debug = EventLog(debug_path, label=STAGE)
+    debug = EventLog(log_path(run_dir_for(args), STAGE, "debug"), label=STAGE)
     budget = StageBudget(settings.budget_minutes)
     print(f"Per-item attempts: {settings.attempts} | Stage budget: "
           f"{settings.budget_minutes:g} min | Debug log: {debug.path}")
-
-    # Accumulators shared by the result callback and the failure sweep below.
-    approved_merges: List[MergeCluster] = []
-    llm_evaluations: List[Dict[str, Any]] = []
     failed_clusters: List[List[str]] = []
 
     async def handler(client, cluster, server_index):
-        """Verify one fuzzy candidate cluster through the pool.
-
-        Args:
-            client: The ``AsyncOpenAI`` client bound to one server.
-            cluster: The candidate concepts proposed for merging.
-            server_index: Index of the server handling this item, used only for
-                per-server accounting.
-
-        Returns:
-            The parsed ``GlobalFuzzyMergeSchema`` verdict.
-
-        Raises:
-            Whatever :func:`verify_cluster_llm` raises, so the pool can classify
-            and retry it; failures are collected after the map completes.
-        """
         return await verify_cluster_llm(client, cluster, settings)
 
-    async def record(cluster, result):
-        """Append one successful verdict to the shared accumulators.
-
-        Args:
-            cluster: The candidate concepts that were sent to the model.
-            result: The parsed ``GlobalFuzzyMergeSchema`` verdict.
-
-        Returns:
-            None. Mutates ``llm_evaluations`` (always, so the audit trail shows
-            which candidates were sent) and ``approved_merges`` (only when the
-            model actually approved a merge).
-        """
-        # Record the candidate titles sent, and the LLM's returned merge decisions
-        llm_evaluations.append({
-            "candidates_sent": [c.get("title", "Unknown") for c in cluster],
-            "decisions": [m.model_dump() for m in result.merge_clusters] if result and result.merge_clusters else []
-        })
-        if result and result.merge_clusters:
-            approved_merges.extend(result.merge_clusters)
+    async def record(cluster, verdict):
+        # Commit a verdict before marking this task complete. An interruption or
+        # later failure cannot lose results that were already accepted.
+        key = pending_keys[id(cluster)]
+        await asyncio.to_thread(atomic_write_json, cache_dir / f"{key}.json",
+                                {"key": key, "verdict": verdict.model_dump()})
+        collect(cluster, verdict)
 
     pool = pool_for_stage(args, settings, STAGE)
     try:
         async with pool:
             result = await pool.map(
-                candidate_clusters,
+                pending,
                 handler,
                 attempts=settings.attempts,
-                desc="LLM Fuzzy Cluster Verification",
+                desc=f"LLM {method.capitalize()} Fuzzy Verification",
                 key_fn=lambda cl: "|".join(sorted(c.get("title", "") for c in cl)),
                 budget=budget,
                 debug=debug,
@@ -589,27 +623,20 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
     finally:
         debug.close()
 
-    # A cluster that never produced a verdict is still logged with empty
-    # decisions, exactly as the old worker did, and still fails the stage.
     for failure in result.failures:
-        cluster = candidate_clusters[failure["index"]]
+        cluster = pending[failure["index"]]
         failed_clusters.append([c.get("title", "Unknown") for c in cluster])
-        llm_evaluations.append({
-            "candidates_sent": [c.get("title", "Unknown") for c in cluster],
-            "decisions": []
-        })
+        llm_evaluations.append({"candidates_sent": failed_clusters[-1], "decisions": []})
 
     print("Requests served per server:")
     for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
         print(f"  {url:<40} {count}")
-
     if failed_clusters:
         raise RuntimeError(
-            f"LLM fuzzy review failed for {len(failed_clusters)} cluster(s) after retries. "
-            f"Examples: {failed_clusters[:5]}"
+            f"LLM {method} fuzzy review failed for {len(failed_clusters)} cluster(s) "
+            f"after retries. Examples: {failed_clusters[:5]}"
         )
-
-    print(f"LLM approved {len(approved_merges)} fuzzy merge clusters.")
+    print(f"LLM approved {len(approved_merges)} {method} fuzzy merges.")
     return approved_merges, llm_evaluations
 
 # ── Core Pipeline Logic ──────────────────────────────────────────────────────
@@ -715,7 +742,7 @@ def global_consolidate(domain_dir: Path, args):
         current_concepts = exact_concepts
         for method in ("word", "character"):
             clusters = build_fuzzy_candidate_clusters(current_concepts, method)
-            approved, evaluations = asyncio.run(run_llm_fuzzy_pass(clusters, args))
+            approved, evaluations = asyncio.run(run_llm_fuzzy_pass(clusters, args, method))
             fuzzy_counts[method] = {"clusters": len(clusters), "merges": len(approved)}
             candidate_clusters.extend(clusters)
             approved_fuzzy_merges.extend(approved)

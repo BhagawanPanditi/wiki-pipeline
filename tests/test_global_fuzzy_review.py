@@ -13,10 +13,11 @@ import networkx as nx
 from openai import BadRequestError
 
 from consolidate_global import (MAX_FUZZY_BATCH_CHARS, MAX_FUZZY_BATCH_CONCEPTS,
-                                MergeCluster, balanced_cut_clusters,
+                                GlobalFuzzyMergeSchema, MergeCluster,
+                                balanced_cut_clusters,
                                 build_fuzzy_candidate_clusters, format_fuzzy_review_batch,
                                 global_consolidate, make_fuzzy_review_batches,
-                                verify_cluster_llm)
+                                run_llm_fuzzy_pass, verify_cluster_llm)
 
 
 def prompt_titles(kwargs):
@@ -117,7 +118,8 @@ class FuzzyBatchesTests(unittest.TestCase):
             ]}))
             seen = []
 
-            async def fake_review(clusters, args):
+            async def fake_review(clusters, args, method):
+                self.assertEqual(method, "word" if not seen else "character")
                 seen.append([[c["title"] for c in group] for group in clusters])
                 if len(seen) == 1:
                     self.assertEqual(seen[0], [[titles[0], titles[1]]])
@@ -166,7 +168,110 @@ class FuzzyBatchesTests(unittest.TestCase):
             self.assertEqual(audit["global_audit_summary"]["llm_fuzzy_merges_applied"], 0)
 
 
+class FuzzyCheckpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_verdict_is_a_durable_success_not_an_uncached_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(wiki_base_dir=tmp, domain="test", servers=["server"])
+            settings = SimpleNamespace(model_name="test", max_tokens=8192,
+                                       servers=["server"], concurrency_per_server=1,
+                                       attempts=1, budget_minutes=1,
+                                       profile=SimpleNamespace(attempt_timeout=30))
+            cluster = [[{"title": title, "aliases": [], "description": "Hint."}
+                        for title in ("Topic A", "Topic B")]]
+            seen = []
+
+            class FakePool:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return False
+
+                async def map(self, items, handler, *, on_result, **kwargs):
+                    seen.extend(items)
+                    for item in items:
+                        await on_result(item, GlobalFuzzyMergeSchema(merge_clusters=[]))
+                    return SimpleNamespace(failures=[], per_server={"server": len(items)})
+
+            with patch("consolidate_global.resolve_settings", return_value=settings), \
+                 patch("consolidate_global.pool_for_stage", return_value=FakePool()):
+                self.assertEqual((await run_llm_fuzzy_pass(cluster, args, "word"))[0], [])
+                self.assertEqual((await run_llm_fuzzy_pass(cluster, args, "word"))[0], [])
+            self.assertEqual(len(seen), 1)
+
+    async def test_only_failed_clusters_are_retried_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(wiki_base_dir=tmp, domain="test", servers=["server"])
+            settings = SimpleNamespace(model_name="test", max_tokens=8192,
+                                       servers=["server"], concurrency_per_server=1,
+                                       attempts=1, budget_minutes=1,
+                                       profile=SimpleNamespace(attempt_timeout=30))
+            clusters = [[{"title": name, "aliases": [], "description": "Hint."}
+                         for name in names] for names in (("Alpha", "Alphaa"),
+                                                         ("Beta", "Betaa"))]
+            requested = []
+            fail_second = True
+
+            class FakePool:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return False
+
+                async def map(self, items, handler, *, on_result, **kwargs):
+                    failures = []
+                    for index, cluster in enumerate(items):
+                        requested.append(cluster[0]["title"])
+                        if fail_second and cluster[0]["title"] == "Beta":
+                            failures.append({"index": index})
+                        else:
+                            verdict = GlobalFuzzyMergeSchema(merge_clusters=[MergeCluster(
+                                primary_title=cluster[0]["title"],
+                                merged_titles=[cluster[1]["title"]])])
+                            await on_result(cluster, verdict)
+                    return SimpleNamespace(failures=failures, per_server={"server": len(items)})
+
+            with patch("consolidate_global.resolve_settings", return_value=settings), \
+                 patch("consolidate_global.pool_for_stage", return_value=FakePool()):
+                with self.assertRaisesRegex(RuntimeError, "failed for 1 cluster"):
+                    await run_llm_fuzzy_pass(clusters, args, "word")
+                self.assertEqual(requested, ["Alpha", "Beta"])
+                fail_second = False
+                merges, _ = await run_llm_fuzzy_pass(clusters, args, "word")
+                self.assertEqual(requested, ["Alpha", "Beta", "Beta"])
+                self.assertEqual(len(merges), 2)
+                merges, _ = await run_llm_fuzzy_pass(clusters, args, "word")
+                self.assertEqual(requested, ["Alpha", "Beta", "Beta"])
+                self.assertEqual(len(merges), 2)
+                # The other metric must not reuse word-pass decisions.
+                await run_llm_fuzzy_pass(clusters, args, "character")
+                self.assertEqual(requested[-2:], ["Alpha", "Beta"])
+
+
 class FuzzyRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_merge_clusters_and_missing_ids_still_fail(self):
+        async def create(**kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="stop", message=SimpleNamespace(content='{"other": []}'))])
+        cluster = [{"title": "Topic 1", "aliases": [], "description": "Hint."}]
+        with self.assertRaisesRegex(ValueError, "merge_clusters"):
+            await verify_cluster_llm(client_for(create), cluster,
+                                     SimpleNamespace(model_name="test", max_tokens=8192))
+
+    async def test_unwrapped_id_merge_is_accepted_for_two_concept_batch(self):
+        async def create(**kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="stop", message=SimpleNamespace(
+                    content='{"primary_id": 1, "merged_ids": [2]}'))])
+
+        cluster = [{"title": f"Topic {i}", "aliases": [], "description": "Hint."}
+                   for i in range(1, 3)]
+        result = await verify_cluster_llm(client_for(create), cluster,
+                                          SimpleNamespace(model_name="test", max_tokens=8192))
+        self.assertEqual([m.model_dump() for m in result.merge_clusters], [
+            {"primary_title": "Topic 1", "merged_titles": ["Topic 2"]}])
+
     async def test_invalid_ids_are_ignored_without_losing_valid_merges(self):
         async def create(**kwargs):
             return response([{"primary_id": 1, "merged_ids": [2, 999]},

@@ -335,8 +335,14 @@ numbered text, not input JSON; responses are JSON containing only those numeric
 candidate IDs. Valid IDs are translated back to the stored titles; unknown or
 duplicate suggestions are ignored with warnings rather than inventing concepts
 or failing the whole cluster. Requests are limited to 20,000 rendered
-characters, and context/response-length errors split a request further. All
-requests must succeed. To proceed with exact and alias matches only, pass
+characters, and context/response-length errors split a request further. For a
+two-concept batch the model sometimes returns one bare
+`{"primary_id": 1, "merged_ids": [2]}` object; this is accepted alongside the
+`merge_clusters` wrapper. Successful verdicts (even empty ones) are saved
+atomically under `cache/consolidate-global/{word,character}/` and reused when
+the pass, model, strategy and rendered prompts match. Failed clusters are not
+checkpointed; all must eventually succeed. To proceed with exact and alias
+matches only, pass
 `run_pipeline.sh --skip-global-fuzzy` (or
 `consolidate_global.py --skip_fuzzy_review`). This skips candidate generation and
 LLM review, but still fuses descriptions, citations and relations. The audit
