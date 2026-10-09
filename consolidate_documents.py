@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+from openai import BadRequestError
 from pydantic import BaseModel, Field
 
 # ── Server & Concurrency Configuration ───────────────────────────────────────
@@ -25,6 +26,10 @@ from utils.json_repair import clean_json_string
 from utils.llm_pool import pool_for_stage
 
 STAGE = "consolidate-documents"
+# A whole document can contain hundreds of extracted concepts. Keep each
+# request far below the model context window even with a large output reserve.
+MAX_MERGE_BATCH_CHARS = 30000
+MAX_MERGE_BATCH_CONCEPTS = 80
 
 # ── Pydantic Data Schemas for LLM Consolidation ──────────────────────────────
 class MergeCluster(BaseModel):
@@ -74,6 +79,33 @@ If no concepts need to be merged, return: {"merge_clusters": []}.
 """
 
 # ── Pipeline Implementation ──────────────────────────────────────────────────
+def make_merge_batches(concepts: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Pack similar titles together while bounding each request's JSON payload.
+
+    Exact-title duplicates still merge programmatically across batch boundaries;
+    the LLM considers near-duplicates within each batch. Extremely long single
+    entries are rejected rather than silently omitted.
+    """
+    ordered = sorted(concepts, key=lambda c: str(c.get("title") or "").casefold())
+    batches: List[List[Dict[str, Any]]] = []
+    batch: List[Dict[str, Any]] = []
+    size = 2  # opening and closing JSON brackets
+    for concept in ordered:
+        item_size = len(json.dumps(concept, ensure_ascii=False, separators=(",", ":"))) + 1
+        if item_size + 2 > MAX_MERGE_BATCH_CHARS:
+            raise ValueError(f"Concept {concept.get('title')!r} is too large for a merge batch")
+        if batch and (len(batch) >= MAX_MERGE_BATCH_CONCEPTS or
+                      size + item_size > MAX_MERGE_BATCH_CHARS):
+            batches.append(batch)
+            batch = []
+            size = 2
+        batch.append(concept)
+        size += item_size
+    if batch:
+        batches.append(batch)
+    return batches
+
+
 class DocumentConsolidatorPipeline:
     def __init__(self, args):
         """Prepare document consolidation, creating the ``consolidated/`` folder.
@@ -151,54 +183,89 @@ class DocumentConsolidatorPipeline:
 
     async def get_merge_clusters(self, client, item: Dict[str, Any],
                                  server_index: int) -> DocumentConsolidationSchema:
-        """One document's merge plan.
+        """Build a document's merge plan from context-bounded title batches.
 
         Raises on any unusable response so ServerPool classifies and retries it.
-        Token-limit truncation is raised as a plain ValueError, so - as before -
-        it stays retryable rather than failing fast.
+        Context overflow or truncated output splits the affected batch further.
         """
         doc_id = item["doc_id"]
         raw_concepts = item["raw_concepts"]
 
         lightweight_concepts = []
         for idx, c in enumerate(raw_concepts, 1):
+            # Relations are only disambiguation hints for a title-merge decision;
+            # sending hundreds per concept can make even a single item unfit.
             relations_summary = [
                 {"target": r.get("target_concept"), "relation_snippet": snippet_description(r.get("relation", ""), max_words=15)}
-                for r in c.get("outbound_relations", [])
+                for r in c.get("outbound_relations", [])[:8]
             ]
             lightweight_concepts.append({
-                "id": idx, "title": c.get("title"), "aliases": c.get("aliases", []),
+                "id": idx, "title": c.get("title"), "aliases": c.get("aliases", [])[:12],
                 "description_snippet": snippet_description(c.get("description", ""), max_words=30),
                 "outbound_relations": relations_summary
             })
 
-        user_prompt = f"DOCUMENT ID: {doc_id}\nTOTAL EXTRACTED CONCEPTS ACROSS CHUNKS: {len(lightweight_concepts)}\n\nCONCEPT LIST:\n{json.dumps(lightweight_concepts, indent=2)}\n"
+        batches = make_merge_batches(lightweight_concepts)
+        if len(batches) > 1:
+            self.debug.record("document_batched", doc_id=doc_id,
+                              concepts=len(lightweight_concepts), batches=len(batches))
+        # A large document is one checkpointed unit. Persist it only after EVERY
+        # batch succeeds; partial merge plans never mark the document complete.
+        semaphore = asyncio.Semaphore(3)
 
-        raw_text = None
-        finish_reason = None
-        try:
-            response = await client.chat.completions.create(
-                model=self.settings.model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_CONSOLIDATE},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.1, max_tokens=self.settings.max_tokens,
-                response_format={"type": "json_object"}
-            )
-            choice = response.choices[0]
-            finish_reason = choice.finish_reason
-            raw_text = choice.message.content
+        async def merge_batch(batch: List[Dict[str, Any]]) -> List[MergeCluster]:
+            async with semaphore:
+                user_prompt = (
+                    f"DOCUMENT ID: {doc_id}\nTOTAL EXTRACTED CONCEPTS ACROSS CHUNKS: "
+                    f"{len(lightweight_concepts)}\nCONCEPTS IN THIS BATCH: {len(batch)}\n\n"
+                    "CONCEPT LIST (only merge titles present in this list):\n"
+                    + json.dumps(batch, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+                raw_text = None
+                finish_reason = None
+                try:
+                    response = await client.chat.completions.create(
+                        model=self.settings.model_name,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT_CONSOLIDATE},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.1, max_tokens=self.settings.max_tokens,
+                        response_format={"type": "json_object"}
+                    )
+                    choice = response.choices[0]
+                    finish_reason = choice.finish_reason
+                    raw_text = choice.message.content
+                    if finish_reason == "length":
+                        raise ValueError(f"Response truncated: Hit max_tokens ({self.settings.max_tokens}).")
+                    delta = DocumentConsolidationSchema.model_validate_json(clean_json_string(raw_text))
+                    return delta.merge_clusters
+                except Exception as exc:
+                    self.attempts.record(doc_id, finish_reason=finish_reason, raw_text=raw_text,
+                                         error_type=type(exc).__name__, error_message=str(exc),
+                                         batch_size=len(batch))
+                    # Server-side tokenization is authoritative. If a batch
+                    # unexpectedly exceeds its context/output allowance, halve
+                    # it and try again; a single unfit concept fails explicitly.
+                    too_long = (finish_reason == "length" or
+                                isinstance(exc, BadRequestError) and
+                                ("maximum context length" in str(exc).lower() or
+                                 "input_tokens" in str(exc).lower()))
+                    if not too_long or len(batch) == 1:
+                        raise
+                    self.debug.record("split_merge_batch", doc_id=doc_id,
+                                      batch_size=len(batch), error=str(exc))
+            # Split outside the semaphore to avoid deadlock when child calls
+            # need the same limited pool of request slots.
+            mid = len(batch) // 2
+            left, right = await asyncio.gather(
+                merge_batch(batch[:mid]), merge_batch(batch[mid:]))
+            return left + right
 
-            if finish_reason == "length":
-                raise ValueError(f"Response truncated: Hit max_tokens ({self.settings.max_tokens}).")
-
-            cleaned_json = clean_json_string(raw_text)
-            return DocumentConsolidationSchema.model_validate_json(cleaned_json)
-        except Exception as exc:
-            self.attempts.record(doc_id, finish_reason=finish_reason, raw_text=raw_text,
-                                 error_type=type(exc).__name__, error_message=str(exc))
-            raise
+        batch_results = await asyncio.gather(*(merge_batch(batch) for batch in batches))
+        return DocumentConsolidationSchema(
+            merge_clusters=[cluster for clusters in batch_results for cluster in clusters]
+        )
 
     async def persist_consolidation(self, item: Dict[str, Any],
                                     delta: DocumentConsolidationSchema) -> None:
@@ -438,8 +505,11 @@ class DocumentConsolidatorPipeline:
             for failure in result.failures:
                 await self.write_failure_debug(pending[failure["index"]], failure)
 
-            print("Requests served per server:")
+            print("Documents consolidated per server:")
             for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
+                print(f"  {url:<40} {count}")
+            print("Document attempts per server (one attempt may contain several batch requests):")
+            for url, count in sorted(pool.per_server_counts.items(), key=lambda kv: -kv[1]):
                 print(f"  {url:<40} {count}")
         else:
             print("All documents are already consolidated!")
