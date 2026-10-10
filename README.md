@@ -318,6 +318,36 @@ python3 consolidate_global.py --domain $D --wiki_base_dir $W
 ```
 
 Needs: step 5. Writes: `global_concepts.json`, `global_consolidation.json`.
+Fuzzy review is two sequential, LLM-confirmed passes. The first graph connects
+concepts by word containment (at least two words shared, score >= 0.60). After
+applying **only** the LLM-approved word merges, the second graph is rebuilt from
+the merged concepts using character-trigram Jaccard (score >= 0.50). Each edge
+is weighted with its pass's similarity score; there is no mixed score or Louvain
+community detection. Non-singleton connected components with 30 or more nodes
+are recursively split with a seeded, weighted Kernighan–Lin **balanced min-cut
+heuristic** until every reviewed group has fewer than 30 nodes. Exact balanced
+min-cut is computationally hard; an unconstrained min-cut tends to peel off
+single nodes. Cut edges are not reviewed in that pass, so merges across splits
+can be missed. Prompt-length limits can also require further splitting.
+
+LLM requests show up to 8 aliases and a 30-word hint per concept in compact
+numbered text, not input JSON; responses are JSON containing only those numeric
+candidate IDs. Valid IDs are translated back to the stored titles; unknown or
+duplicate suggestions are ignored with warnings rather than inventing concepts
+or failing the whole cluster. Requests are limited to 20,000 rendered
+characters, and context/response-length errors split a request further. For a
+two-concept batch the model sometimes returns one bare
+`{"primary_id": 1, "merged_ids": [2]}` object; this is accepted alongside the
+`merge_clusters` wrapper. Successful verdicts (even empty ones) are saved
+atomically under `cache/consolidate-global/{word,character}/` and reused when
+the pass, model, strategy and rendered prompts match. Failed clusters are not
+checkpointed; all must eventually succeed. To proceed with exact and alias
+matches only, pass
+`run_pipeline.sh --skip-global-fuzzy` (or
+`consolidate_global.py --skip_fuzzy_review`). This skips candidate generation and
+LLM review, but still fuses descriptions, citations and relations. The audit
+summary records `fuzzy_review_skipped: true`, and the runner won't mistake an
+exact-only output for a completed fuzzy run or vice versa.
 
 **7. Resolve stubs**
 
@@ -423,6 +453,7 @@ in `DIR/.export_manifest.json`. Other files in the folder are not touched.
 | `--skip-verify-pass1` | off | Bypass Pass 1 verification; refinement runs without audit feedback unless also skipped. |
 | `--skip-refinement` | off | Bypass Pass 2 refinement and implicitly bypass Pass 2 verification; consolidate the currently available concepts. Can be combined with `--skip-verify-pass1`. |
 | `--skip-verification` | off | Bypass both extraction verification passes; refinement still runs unless `--skip-refinement` is also set. Does not skip final consolidation's candidate review. |
+| `--skip-global-fuzzy` | off | In global consolidation, keep exact/alias merges but skip fuzzy candidate generation and LLM review. Near-duplicates may remain separate. |
 | `--fresh` | off | Clear the completion markers so that every stage runs again. No output is deleted. |
 
 `./run_pipeline.sh --help` prints these, with the resolved default paths at the end.
@@ -461,7 +492,8 @@ Three stages also take `--resume` (`extract_concepts.py`, `refine_concepts.py` a
 `verify_extraction.py`): it clears the incomplete marks and continues from the
 checkpoint. The runner passes it where it exists.
 
-Stage-specific flags: `--phase 1|2` (`verify_extraction.py`), `--min_concept_words`
+Stage-specific flags: `--phase 1|2` (`verify_extraction.py`), `--skip_fuzzy_review`
+(`consolidate_global.py`), `--min_concept_words`
 (`fold_thin_concepts.py`), `--min_shared_entities`, `--max_links_per_node`, `--dry_run`
 (`link_entities.py`), `--max_island_size` (`audit_islands.py`), `--fast`
 (`add_reverse_links.py`), `--from_log` (`final_consolidation.py`), `--output_dir`
