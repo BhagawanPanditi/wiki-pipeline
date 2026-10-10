@@ -146,113 +146,128 @@ async def audit_and_connect_islands(domain_dir: Path, domain_name: Optional[str]
 
     decisions = EventLog(log_path(domain_dir, STAGE, "decisions"), label=STAGE)
 
-        # Map each comp tuple to its valid candidate siblings
-        comp_candidates: Dict[Tuple[str, ...], Set[str]] = {}
+    # Map each comp tuple to its valid candidate siblings
+    comp_candidates: Dict[Tuple[str, ...], Set[str]] = {}
 
-        def get_valid_siblings_for_comp(comp: List[str]) -> List[Dict[str, Any]]:
-            source_docs = set()
-            for t_lower in comp:
-                c = title_map.get(t_lower)
-                if c:
-                    for sc in c.get("source_chunks", []):
-                        doc_id = sc.split("::", 1)[0] if "::" in sc else sc.strip()
-                        if doc_id:
-                            source_docs.add(doc_id)
-            sibling_concepts = []
-            seen_siblings = set(comp)
-            for doc_id in source_docs:
-                for sib in doc_to_concepts.get(doc_id, []):
-                    sib_lower = sib["title"].lower().strip()
-                    if sib_lower not in seen_siblings:
-                        seen_siblings.add(sib_lower)
-                        sibling_concepts.append({
-                            "title": sib["title"],
-                            "brief": sib.get("brief", ""),
-                            "aliases": sib.get("aliases", []),
-                            "is_in_mainland": sib_lower in giant_component
-                        })
-                    if len(sibling_concepts) >= 12:
-                        break
+    def get_valid_siblings_for_comp(comp: List[str]) -> List[Dict[str, Any]]:
+        source_docs = set()
+        for t_lower in comp:
+            c = title_map.get(t_lower)
+            if c:
+                for sc in c.get("source_chunks", []):
+                    doc_id = sc.split("::", 1)[0] if "::" in sc else sc.strip()
+                    if doc_id:
+                        source_docs.add(doc_id)
+        sibling_concepts = []
+        seen_siblings = set(comp)
+        for doc_id in source_docs:
+            for sib in doc_to_concepts.get(doc_id, []):
+                sib_lower = sib["title"].lower().strip()
+                if sib_lower not in seen_siblings:
+                    seen_siblings.add(sib_lower)
+                    sibling_concepts.append({
+                        "title": sib["title"],
+                        "brief": sib.get("brief", ""),
+                        "aliases": sib.get("aliases", []),
+                        "is_in_mainland": sib_lower in giant_component
+                    })
                 if len(sibling_concepts) >= 12:
                     break
-            sibling_concepts.sort(key=lambda s: not s.get("is_in_mainland", False))
-            comp_candidates[tuple(comp)] = {s["title"].lower().strip() for s in sibling_concepts}
-            return sibling_concepts
+            if len(sibling_concepts) >= 12:
+                break
+        sibling_concepts.sort(key=lambda s: not s.get("is_in_mainland", False))
+        comp_candidates[tuple(comp)] = {s["title"].lower().strip() for s in sibling_concepts}
+        return sibling_concepts
 
-        def build_audit_prompt(comp: List[str]) -> str:
-            island_payload = []
+    def build_audit_prompt(comp: List[str]) -> str:
+        island_lines = []
+        for t_lower in comp:
+            c = title_map.get(t_lower)
+            if c:
+                ents = ", ".join(c.get("entities", [])[:5])
+                aliases = ", ".join(c.get("aliases", []))
+                block = [f"- Title: \"{c['title']}\""]
+                if aliases:
+                    block.append(f"  Aliases: {aliases}")
+                if c.get("brief"):
+                    block.append(f"  Brief: {c.get('brief')}")
+                if ents:
+                    block.append(f"  Key Entities: {ents}")
+                island_lines.append("\n".join(block))
+        island_concepts_str = "\n\n".join(island_lines)
+
+        sibling_concepts = get_valid_siblings_for_comp(comp)
+        if sibling_concepts:
+            sib_lines = []
+            for s in sibling_concepts:
+                mainland_tag = " (in giant component)" if s.get("is_in_mainland") else ""
+                block = [f"- Title: \"{s['title']}\"{mainland_tag}"]
+                if s.get("brief"):
+                    block.append(f"  Brief: {s.get('brief')}")
+                sib_lines.append("\n".join(block))
+            doc_context_str = "\n\n".join(sib_lines)
+        else:
+            doc_context_str = "No other concepts in same document."
+
+        return SYSTEM_PROMPT_ISLAND_AUDIT.format(
+            scope=domain_scope(
+                "Your job is to examine an isolated concept or small island from "
+                "an automated document extraction pipeline", domain_name),
+            off_topic=out_of_domain_clause(domain_name),
+            island_concepts=island_concepts_str,
+            document_context=doc_context_str
+        )
+
+    async def audit_island(client, comp: List[str], server_index: int):
+        resp = await client.chat.completions.create(
+            model=settings.model_name,
+            messages=[{"role": "user", "content": build_audit_prompt(comp)}],
+            temperature=0.1,
+            max_tokens=settings.max_tokens,
+            response_format={"type": "json_object"}
+        )
+        raw = resp.choices[0].message.content.strip()
+        return json.loads(raw)
+
+    async def record_verdict(comp: List[str], res_json: Dict[str, Any]):
+        decision = str(res_json.get("decision", "KEEP")).strip().upper()
+        target_sib = res_json.get("target_sibling")
+        rel_ab = res_json.get("relation_to_sibling")
+        rel_ba = res_json.get("relation_from_sibling")
+
+        # CRITICAL GUARD: Target MUST be an explicit sibling provided in the prompt
+        # Prevents sink-node / black-hole accumulation into unrelated global concepts.
+        allowed = comp_candidates.get(tuple(comp), set())
+        is_valid_sibling = bool(target_sib and target_sib.lower().strip() in allowed)
+
+        applied = decision == "PRUNE" or (
+            decision in ("MERGE", "LINK") and is_valid_sibling
+            and target_sib.lower().strip() in title_map)
+
+        # If LLM proposed MERGE or LINK to a non-sibling or non-existent concept, downgrade to KEEP
+        if decision in ("MERGE", "LINK") and not applied:
+            decision = "KEEP"
+
+        decisions.record("island_verdict", island_titles=comp, decision=decision,
+                         applied=applied, target_sibling=target_sib if is_valid_sibling else None,
+                         relation_to_sibling=rel_ab, relation_from_sibling=rel_ba,
+                         reason=res_json.get("reason"))
+
+        if decision == "PRUNE":
             for t_lower in comp:
-                c = title_map.get(t_lower)
-                if c:
-                    island_payload.append({
-                        "title": c["title"],
-                        "brief": c.get("brief", ""),
-                        "aliases": c.get("aliases", []),
-                        "entities": c.get("entities", [])[:5]
-                    })
-
-            sibling_concepts = get_valid_siblings_for_comp(comp)
-            doc_context_str = json.dumps(sibling_concepts, indent=2) if sibling_concepts else "No other concepts in same document."
-
-            return SYSTEM_PROMPT_ISLAND_AUDIT.format(
-                scope=domain_scope(
-                    "Your job is to examine an isolated concept or small island from "
-                    "an automated document extraction pipeline", domain_name),
-                off_topic=out_of_domain_clause(domain_name),
-                island_concepts=json.dumps(island_payload, indent=2),
-                document_context=doc_context_str
-            )
-
-        async def audit_island(client, comp: List[str], server_index: int):
-            resp = await client.chat.completions.create(
-                model=settings.model_name,
-                messages=[{"role": "user", "content": build_audit_prompt(comp)}],
-                temperature=0.1,
-                max_tokens=settings.max_tokens,
-                response_format={"type": "json_object"}
-            )
-            raw = resp.choices[0].message.content.strip()
-            return json.loads(raw)
-
-        async def record_verdict(comp: List[str], res_json: Dict[str, Any]):
-            decision = str(res_json.get("decision", "KEEP")).strip().upper()
-            target_sib = res_json.get("target_sibling")
-            rel_ab = res_json.get("relation_to_sibling")
-            rel_ba = res_json.get("relation_from_sibling")
-
-            # CRITICAL GUARD: Target MUST be an explicit sibling provided in the prompt
-            # Prevents sink-node / black-hole accumulation into unrelated global concepts.
-            allowed = comp_candidates.get(tuple(comp), set())
-            is_valid_sibling = bool(target_sib and target_sib.lower().strip() in allowed)
-
-            applied = decision == "PRUNE" or (
-                decision in ("MERGE", "LINK") and is_valid_sibling
-                and target_sib.lower().strip() in title_map)
-
-            # If LLM proposed MERGE or LINK to a non-sibling or non-existent concept, downgrade to KEEP
-            if decision in ("MERGE", "LINK") and not applied:
-                decision = "KEEP"
-
-            decisions.record("island_verdict", island_titles=comp, decision=decision,
-                             applied=applied, target_sibling=target_sib if is_valid_sibling else None,
-                             relation_to_sibling=rel_ab, relation_from_sibling=rel_ba,
-                             reason=res_json.get("reason"))
-
-            if decision == "PRUNE":
-                for t_lower in comp:
-                    prune_titles_set.add(t_lower)
-            elif decision == "MERGE" and is_valid_sibling:
-                merge_actions.append({
-                    "island_titles": comp,
-                    "target_sibling": target_sib
-                })
-            elif decision == "LINK" and is_valid_sibling:
-                link_actions.append({
-                    "island_titles": comp,
-                    "target_sibling": target_sib,
-                    "rel_ab": rel_ab,
-                    "rel_ba": rel_ba
-                })
+                prune_titles_set.add(t_lower)
+        elif decision == "MERGE" and is_valid_sibling:
+            merge_actions.append({
+                "island_titles": comp,
+                "target_sibling": target_sib
+            })
+        elif decision == "LINK" and is_valid_sibling:
+            link_actions.append({
+                "island_titles": comp,
+                "target_sibling": target_sib,
+                "rel_ab": rel_ab,
+                "rel_ba": rel_ba
+            })
 
     pool = pool_for_stage(args, settings, STAGE)
     try:

@@ -269,12 +269,33 @@ class WikiSecondPassPipeline:
         key = item["key"]
         audit_str = ""
         if item["audit_feedback"]:
+            missing_c = "\n  - ".join(item['audit_feedback'].get('missing_concepts', [])) or "None"
+            missing_f = "\n  - ".join(item['audit_feedback'].get('missing_facts', [])) or "None"
             audit_str = f"""
 AUDIT FEEDBACK (PREVIOUS VERIFICATION FOUND OMISSIONS):
-- Missing Concepts: {json.dumps(item['audit_feedback']['missing_concepts'])}
-- Missing Facts/Metrics: {json.dumps(item['audit_feedback']['missing_facts'])}
-- Auditor Critique: {item['audit_feedback']['critique']}
+- Missing Concepts:
+  - {missing_c}
+- Missing Facts/Metrics:
+  - {missing_f}
+- Auditor Critique: {item['audit_feedback'].get('critique', '')}
 """
+
+        pass1_lines = []
+        for i, c in enumerate(item["pass1_concepts"], 1):
+            title = c.get("title", "")
+            aliases = ", ".join(c.get("aliases", []))
+            desc = c.get("description", "").strip()
+            block = [f"CONCEPT {i}: {title}"]
+            if aliases:
+                block.append(f"  Aliases: {aliases}")
+            if desc:
+                block.append(f"  Description: {desc}")
+            rels = [f"- -> {r.get('target_concept')}: {r.get('relation')}" for r in c.get("outbound_relations", []) if r.get("target_concept")]
+            if rels:
+                block.append("  Outbound Relations:\n    " + "\n    ".join(rels))
+            pass1_lines.append("\n".join(block))
+
+        pass1_text = "\n\n".join(pass1_lines) if pass1_lines else "None (empty extraction)"
 
         user_prompt = f"""\
 CONTEXT BEFORE:
@@ -287,7 +308,7 @@ CONTEXT AFTER:
 {item['context_after']}
 
 EXISTING EXTRACTED CONCEPTS (PASS 1):
-{json.dumps(item['pass1_concepts'], indent=2)}
+{pass1_text}
 {audit_str}
 """
         raw_text = None

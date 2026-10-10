@@ -547,22 +547,23 @@ async def run_deep_verification(
             cat, concept_group = item
             call_ctx = {"item": f"category:{cat}", "server": server_url,
                         "size": len(concept_group)}
-            CURRENT_CALL.set(call_ctx)
-            candidates_payload = [
-                {
-                    "title": c["title"],
-                    "brief": c.get("brief", ""),
-                    "entities": c.get("entities", [])[:5]
-                }
-                for c in concept_group
-            ]
+            candidate_lines = []
+            for c in concept_group:
+                ents = ", ".join(c.get("entities", [])[:5])
+                block = [f"- Title: \"{c['title']}\""]
+                if c.get("brief"):
+                    block.append(f"  Brief: {c.get('brief')}")
+                if ents:
+                    block.append(f"  Key Entities: {ents}")
+                candidate_lines.append("\n".join(block))
+            candidates_str = "\n\n".join(candidate_lines)
 
             prompt = PROMPT_DEEP_VERIFICATION.format(
                 scope=domain_scope(
                     "You are an expert technical knowledge graph consolidator "
                     "verifying candidate concept groups", domain_name),
                 suggested_category=cat,
-                candidates_json=json.dumps(candidates_payload, indent=2)
+                candidates_json=candidates_str
             )
 
             completed = False

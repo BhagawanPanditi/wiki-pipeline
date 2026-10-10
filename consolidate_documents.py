@@ -213,13 +213,28 @@ class DocumentConsolidatorPipeline:
         # batch succeeds; partial merge plans never mark the document complete.
         semaphore = asyncio.Semaphore(3)
 
+        def format_batch_for_prompt(batch_concepts: List[Dict[str, Any]]) -> str:
+            lines = []
+            for i, c in enumerate(batch_concepts, 1):
+                title = c.get("title", "")
+                aliases = ", ".join(c.get("aliases", []))
+                hint = c.get("description_hint", "").strip()
+                item_lines = [f"{i}. Title: \"{title}\""]
+                if aliases:
+                    item_lines.append(f"   Aliases: {aliases}")
+                if hint:
+                    item_lines.append(f"   Context: {hint}")
+                lines.append("\n".join(item_lines))
+            return "\n\n".join(lines)
+
         async def merge_batch(batch: List[Dict[str, Any]]) -> List[MergeCluster]:
             async with semaphore:
+                batch_text = format_batch_for_prompt(batch)
                 user_prompt = (
                     f"DOCUMENT ID: {doc_id}\nTOTAL EXTRACTED CONCEPTS ACROSS CHUNKS: "
                     f"{len(lightweight_concepts)}\nCONCEPTS IN THIS BATCH: {len(batch)}\n\n"
-                    "CONCEPT LIST (only merge titles present in this list):\n"
-                    + json.dumps(batch, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    "CANDIDATE CONCEPTS LIST (only merge titles present in this list):\n\n"
+                    f"{batch_text}\n"
                 )
                 raw_text = None
                 finish_reason = None
