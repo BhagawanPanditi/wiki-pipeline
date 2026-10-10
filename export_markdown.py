@@ -77,12 +77,11 @@ def deduplicate_paragraph_citations(text: str) -> str:
 
 def format_description_paragraphs(description: str, source_docs: List[str]) -> str:
     """
-    Format the description with document-level citations on every paragraph.
+    Format description by grouping text by source document.
 
-    Chunk citations are first reduced to document citations. If a paragraph has
-    no inline citation, known concept source documents are added as a fallback;
-    this is done per paragraph rather than only when the entire description is
-    uncited. Stub-resolution sentences remain in their own trailing paragraph.
+    All paragraphs from a single document are concatenated with a space (no newlines),
+    ending with that document's citation [canon_xxx]. Distinct documents form separate
+    paragraphs separated by double newlines.
     """
     clean_desc = clean_chunk_citations(description)
     raw_paras = clean_desc.split("\n\n")
@@ -104,42 +103,61 @@ def format_description_paragraphs(description: str, source_docs: List[str]) -> s
             main_text = p_str
 
         if main_text:
-            cleaned_paras.append(deduplicate_paragraph_citations(main_text))
+            cleaned_paras.append(main_text)
 
-    # Keep resolve-stubs text in a distinct final paragraph.
+    # Normalize known document IDs from source_chunks
+    normalized_source_docs = sorted(list({
+        extract_doc_id(sc)
+        for sc in source_docs
+        if extract_doc_id(sc)
+    }))
+
+    # Group text by its referenced document ID
+    doc_to_sentences: Dict[str, List[str]] = {}
+    uncited_sentences: List[str] = []
+
+    for p in cleaned_paras:
+        # Extract any doc citation present in this paragraph
+        found_docs = sorted(list(set(re.findall(r'\[([a-zA-Z0-9_-]+)\]', p))))
+        # Strip internal citations from the sentence body
+        body_text = re.sub(r'\[[a-zA-Z0-9_-]+\]', '', p).strip()
+        body_text = " ".join(body_text.split())
+        if not body_text:
+            continue
+
+        target_doc = None
+        for d in found_docs:
+            if d in normalized_source_docs or d.startswith("canon_"):
+                target_doc = d
+                break
+
+        if target_doc:
+            doc_to_sentences.setdefault(target_doc, []).append(body_text)
+        elif normalized_source_docs:
+            # Fall back to first known source doc if none explicitly cited in paragraph
+            doc_to_sentences.setdefault(normalized_source_docs[0], []).append(body_text)
+        else:
+            uncited_sentences.append(body_text)
+
+    # Build one concatenated paragraph per document, ending with [doc_id]
+    result_paragraphs = []
+    for doc_id, sents in doc_to_sentences.items():
+        joined_text = " ".join(sents).strip()
+        result_paragraphs.append(f"{joined_text} [{doc_id}]")
+
+    if uncited_sentences and not doc_to_sentences:
+        fallback_cite = " ".join(f"[{d}]" for d in normalized_source_docs)
+        joined_text = " ".join(uncited_sentences).strip()
+        if fallback_cite:
+            joined_text = f"{joined_text} {fallback_cite}"
+        result_paragraphs.append(joined_text)
+
+    # Append resolve-stubs "Additionally..." sentences in a trailing paragraph
     if additionally_sentences:
-        cleaned_add = [deduplicate_paragraph_citations(s) for s in additionally_sentences]
-        cleaned_paras.append(" ".join(cleaned_add))
+        clean_add = [re.sub(r'\s+', ' ', s).strip() for s in additionally_sentences]
+        result_paragraphs.append(" ".join(clean_add))
 
-    # source_chunks are the graph's provenance for the concept. If they do not
-    # contain a document ID, retain canonical document IDs explicitly cited
-    # elsewhere in the text as a fallback for otherwise-uncited paragraphs.
-    normalized_source_docs = {
-        doc_id
-        for doc_id in (extract_doc_id(sc) for sc in source_docs)
-        if doc_id
-    }
-    known_doc_ids = {doc_id.casefold() for doc_id in normalized_source_docs}
-    fallback_doc_ids = set(normalized_source_docs)
-    for paragraph in cleaned_paras:
-        for doc_id in re.findall(r'\[([a-zA-Z0-9_-]+)\]', paragraph):
-            if doc_id.casefold() in known_doc_ids or doc_id.casefold().startswith("canon_"):
-                fallback_doc_ids.add(doc_id)
-    doc_cites = " ".join(f"[{doc_id}]" for doc_id in sorted(fallback_doc_ids))
-
-    cited_paragraphs = []
-    for paragraph in cleaned_paras:
-        paragraph = deduplicate_paragraph_citations(paragraph)
-        paragraph_doc_ids = re.findall(r'\[([a-zA-Z0-9_-]+)\]', paragraph)
-        has_doc_citation = any(
-            doc_id.casefold() in known_doc_ids or doc_id.casefold().startswith("canon_")
-            for doc_id in paragraph_doc_ids
-        )
-        if not has_doc_citation and doc_cites:
-            paragraph = f"{paragraph.rstrip()} {doc_cites}"
-        cited_paragraphs.append(paragraph)
-
-    return "\n\n".join(cited_paragraphs) if cited_paragraphs else clean_desc.strip()
+    return "\n\n".join(result_paragraphs) if result_paragraphs else clean_desc.strip()
 
 def export_wiki_markdown(domain_dir: Path, output_dir: Path = None):
     """Write one Markdown page per concept.

@@ -23,7 +23,13 @@ from utils.layout import log_path
 from utils.errors import StageBudget
 from utils.llm_pool import pool_for_stage
 
+from pydantic import BaseModel, Field
+from utils.json_repair import clean_json_string
+
 STAGE = "add-reverse-links"
+
+class ReverseRelationSchema(BaseModel):
+    relation: str = Field(description="Exactly 1 clear sentence describing how Concept B relates to, influences, is acted upon by, or provides context for Concept A.")
 
 REVERSE_RELATION_PROMPT = """\
 You are an expert technical knowledge graph agent.
@@ -39,7 +45,12 @@ Original Relation (A -> B): {rel_ab}
 
 TASK:
 Write exactly 1 clear sentence describing how Concept B relates to, influences, is acted upon by, or provides context for Concept A.
-Do not include filler or markdown. Just return the single sentence.
+
+OUTPUT FORMAT:
+Return valid JSON with the exact key "relation":
+{{
+  "relation": "One clear sentence describing how Concept B relates to Concept A."
+}}
 """
 
 async def synthesize_reverse_relations(domain_dir: Path, args):
@@ -155,13 +166,30 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                 model=settings.model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=settings.max_tokens
+                max_tokens=settings.max_tokens,
+                response_format={"type": "json_object"}
             )
             raw = (resp.choices[0].message.content or "").strip()
             if not raw:
                 # Recoverable: the pool retries it on a short backoff, as before.
                 raise ValueError("empty completion for reverse relation")
-            return raw
+
+            try:
+                parsed = ReverseRelationSchema.model_validate_json(clean_json_string(raw, allow_bare_object=True))
+                final_line = parsed.relation.strip()
+            except Exception:
+                # Fallback: Strip <think> and extract the last non-scratchpad line
+                cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+                lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+                valid_lines = [
+                    l for l in lines
+                    if not re.match(r"^(?:need\b|we need\b|task:|note:|thinking:|- |\* )", l, re.IGNORECASE)
+                ]
+                final_line = valid_lines[-1] if valid_lines else lines[-1]
+
+            # Strip surrounding markdown quotes or bullet prefixes
+            final_line = re.sub(r"^[\"'\-*\s]+|[\"'\s]+$", "", final_line).strip()
+            return final_line
 
         async def attach_reverse_relation(item, rev_text):
             """Insert or overwrite the back-link on concept B."""
