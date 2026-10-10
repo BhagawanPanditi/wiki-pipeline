@@ -90,7 +90,7 @@ Identify any missing concepts, omitted technical metrics, parameters, or relatio
 CRITICAL RULES:
 1. NO CONCEPT LIMITS: Do NOT artificially restrict concept counts. Extract EVERY substantive concept or sub-topic that has factual explanations in the chunk.
 2. FACTS ARE SENTENCES, NOT ENTITIES:
-   - Entities (`entities`) are ONLY flat named terms (e.g., "CRISPR-Cas9", "ResNet-50", "GSE12345").
+   - Entities (`entities` or `additional_entities`) are STRICTLY a flat list of at most 10 key named terms directly relevant to this concept (e.g., "CRISPR-Cas9", "ResNet-50", "GSE12345"). DO NOT extract peripheral background mentions!
    - ALL technical facts, numbers, bounds, statistical parameters, and procedural details MUST be written as complete sentences inside concept descriptions (`description` or `additional_description_sentences`). Do NOT treat entities as a place to store facts!
 3. AUDIT FEEDBACK HINTS:
    - If AUDIT FEEDBACK is provided below, prioritize extracting all missing concepts and missing facts listed in that audit.

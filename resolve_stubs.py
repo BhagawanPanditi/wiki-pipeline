@@ -55,7 +55,7 @@ RULES:
 
 FACT vs. ENTITY STRICT SEPARATION:
 1. DESCRIPTIONS HOLD ALL FACTS: Write a single, dense, factual paragraph detailing what the stub is. ALL quantitative metrics, ranges, parameters, and experimental findings MUST be written in full complete sentences inside `description`.
-2. ENTITIES LIST: `entities` is STRICTLY a flat list of short named string identifiers (e.g., tools, gene symbols, datasets).
+2. ENTITIES LIST: `entities` is STRICTLY a flat list of at most 10 key named string identifiers directly defining the stub (e.g., tools, gene symbols, datasets). DO NOT extract peripheral or background mentions.
 
 EXHAUSTIVE FACTUAL RETENTION MANDATE:
 Descriptions MUST retain exact detail. You MUST preserve:

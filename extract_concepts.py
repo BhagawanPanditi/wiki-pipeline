@@ -64,7 +64,7 @@ EXHAUSTIVE CONCEPT COVERAGE (UNCAPPED):
 
 FACT vs. ENTITY STRICT SEPARATION:
 1. DESCRIPTIONS HOLD ALL FACTS: Write a single, dense, factual paragraph for each concept. ALL quantitative metrics, ranges, parameters, statistical findings, experimental conditions, and procedural details MUST be written in full complete sentences inside `description`.
-2. ENTITIES LIST: `entities` is STRICTLY a flat list of short named string identifiers (e.g., software tools, biological terms, gene symbols, dataset identifiers, model names, author names, dates). DO NOT place factual claims or parameter values in `entities`.
+2. ENTITIES LIST: `entities` is STRICTLY a flat list of at most 10 key named string identifiers directly relevant to this concept (e.g., software tools, biological terms, gene symbols, dataset identifiers, model names, author names). DO NOT extract peripheral background mentions or place factual claims in `entities`.
 
 EXHAUSTIVE FACTUAL RETENTION MANDATE:
 Descriptions MUST retain exact detail rather than abstracting away technical facts. You MUST preserve in sentence form:
