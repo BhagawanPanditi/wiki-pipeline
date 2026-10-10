@@ -255,37 +255,63 @@ class WikiVerifierPipeline:
         print(f"Found {len(verification_items)} extracted chunks ready for verification.")
         return verification_items
 
+    def format_concepts_for_prompt(self, concepts_json_raw: str) -> str:
+        """Format concepts into clean, readable text so the model does not mistake input JSON for its output schema."""
+        try:
+            data = json.loads(concepts_json_raw)
+            concepts = data.get("concepts", [])
+        except Exception:
+            return concepts_json_raw
+
+        if not concepts:
+            return "No concepts were extracted from this chunk (empty extraction)."
+
+        lines = []
+        for i, c in enumerate(concepts, 1):
+            title = c.get("title", "Untitled")
+            aliases = ", ".join(c.get("aliases", []))
+            desc = c.get("description", "").strip()
+            entities = ", ".join(c.get("entities", []))
+            rels = [f"- -> {r.get('target_concept')}: {r.get('relation')}" for r in c.get("outbound_relations", []) if r.get("target_concept")]
+
+            block = [f"CONCEPT {i}: {title}"]
+            if aliases:
+                block.append(f"  Aliases: {aliases}")
+            if desc:
+                block.append(f"  Description: {desc}")
+            if entities:
+                block.append(f"  Key Entities: {entities}")
+            if rels:
+                block.append("  Outbound Relations:\n    " + "\n    ".join(rels))
+            lines.append("\n".join(block))
+
+        return "\n\n".join(lines)
+
     # ── single LLM interaction ─────────────────────────────────────────────
     def build_prompt(self, item: Dict[str, Any], concepts_json_raw: str) -> str:
-        """Build the auditor prompt for one unit.
+        """Build the auditor prompt for one unit."""
+        concepts_formatted = self.format_concepts_for_prompt(concepts_json_raw)
 
-        Args:
-            item: The unit, with its text, its context and its key.
-            concepts_json_raw: The unit's extracted concepts, as JSON text.
-
-        Returns:
-            The formatted prompt string.
-        """
         return f"""\
-RAW CHUNK TO EVALUATE:
+RAW SOURCE CHUNK:
 {item['current_chunk']}
 
-EXTRACTED CONCEPTS JSON TO EVALUATE:
-{concepts_json_raw}
+CURRENT EXTRACTED CONCEPTS TO AUDIT:
+{concepts_formatted}
 
 AUDITOR INSTRUCTION:
-Compare the RAW CHUNK against the EXTRACTED CONCEPTS JSON.
-Do NOT re-extract concepts! You are an auditor writing an evaluation report on whether the extraction was accurate and complete.
-List only the most important, unique, genuinely absent findings: at most {MAX_MISSING_CONCEPTS} missing concepts, {MAX_MISSING_FACTS} missing facts, and {MAX_HALLUCINATIONS} hallucinations. Keep entries short. Always provide a brief critique.
+Compare the RAW SOURCE CHUNK against the EXTRACTED CONCEPTS above.
+Evaluate whether the extraction accurately captured the core concepts and substantive technical facts from the text.
+Identify any genuinely missing primary concepts (max {MAX_MISSING_CONCEPTS}), missing quantitative facts (max {MAX_MISSING_FACTS}), or hallucinations (max {MAX_HALLUCINATIONS}).
 
-OUTPUT FORMAT MUST BE A VERIFICATION REPORT OBJECT (NOT "concepts"):
+OUTPUT FORMAT: Return ONLY valid JSON with this exact structure:
 {{
   "coverage_score": 0.95,
   "is_sufficient": true,
   "missing_concepts": [],
   "missing_facts": [],
   "hallucinations": [],
-  "critique": "Brief evaluation of the extraction."
+  "critique": "Brief 1-2 sentence evaluation summary."
 }}
 """
 
