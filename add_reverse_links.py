@@ -11,6 +11,7 @@ Makes all outbound relations bidirectional:
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import List, Set, Tuple
 
@@ -97,6 +98,7 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
             if tgt in title_map and tgt != src:
                 existing_edges.add((src, tgt))
 
+    seen_missing: Set[Tuple[str, str]] = set()
     for (src, tgt) in list(existing_edges):
         if (tgt, src) not in existing_edges:
             # Need reverse link from tgt -> src
@@ -106,7 +108,10 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                 if r.get("target_concept", "").lower().strip() == tgt:
                     rel_text = r.get("relation", "")
                     break
-            missing_reverse.append((tgt, src, rel_text))
+            pair = (tgt, src)
+            if pair not in seen_missing:
+                seen_missing.add(pair)
+                missing_reverse.append((tgt, src, rel_text))
 
     # Also rewrite template forward relations planted by the link-entities
     # linker. "semantic affinity" is legacy wording from earlier graph files
@@ -117,7 +122,10 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
             if "semantic affinity" in rel_str.lower() or "shared key entities" in rel_str.lower():
                 tgt = rel.get("target_concept", "").lower().strip()
                 if tgt in title_map and tgt != c["title"].lower().strip():
-                    missing_reverse.append((c["title"].lower().strip(), tgt, rel_str))
+                    pair = (c["title"].lower().strip(), tgt)
+                    if pair not in seen_missing:
+                        seen_missing.add(pair)
+                        missing_reverse.append((pair[0], pair[1], rel_str))
 
     print(f"Found {len(missing_reverse)} directional edges that lack a reverse link.")
     decisions = EventLog(log_path(domain_dir, STAGE, "decisions"), label=STAGE)
@@ -191,8 +199,12 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
             final_line = re.sub(r"^[\"'\-*\s]+|[\"'\s]+$", "", final_line).strip()
             return final_line
 
+        completed_count = 0
+        save_lock = asyncio.Lock()
+
         async def attach_reverse_relation(item, rev_text):
             """Insert or overwrite the back-link on concept B."""
+            nonlocal completed_count
             src_b_lower, tgt_a_lower, _rel_ab = item
             concept_a = title_map[tgt_a_lower]
             concept_b = title_map[src_b_lower]
@@ -215,6 +227,12 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
             decisions.record("reverse_link_added", method="llm", source=concept_b["title"],
                              target=concept_a["title"], relation=rev_text,
                              updated_existing=existing_rel is not None)
+
+            async with save_lock:
+                completed_count += 1
+                # Periodically save checkpoints every 200 items so any crash can resume safely
+                if completed_count % 200 == 0:
+                    atomic_write_json(refined_file, {"concepts": concepts})
 
         print(f"Synthesizing reverse relations using LLM pool across {len(settings.servers)} servers...")
         print(f"Spreading {len(missing_reverse)} edge(s) at {settings.concurrency_per_server} "
