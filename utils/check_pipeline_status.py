@@ -46,14 +46,43 @@ def inspect_domain(domain_dir: Path):
         if not chunk_folder.is_dir():
             continue
 
-        if (chunk_folder / "concepts.json").is_file():
-            counts["extract"] += 1
-        if (chunk_folder / "verification.json").is_file():
-            counts["verify_pass1"] += 1
-        if (chunk_folder / "pass2_refinement.json").is_file() or (chunk_folder / "concepts_pass1_backup.json").is_file():
+        # 1. Extraction: Valid JSON with non-empty concepts list
+        c_file = chunk_folder / "concepts.json"
+        if c_file.is_file():
+            try:
+                with c_file.open("r", encoding="utf-8") as f:
+                    c_data = json.load(f)
+                if isinstance(c_data.get("concepts"), list):
+                    counts["extract"] += 1
+            except Exception:
+                pass
+
+        # 2. Verify Pass 1: Valid JSON with coverage_score
+        v1_file = chunk_folder / "verification.json"
+        if v1_file.is_file():
+            try:
+                with v1_file.open("r", encoding="utf-8") as f:
+                    v1_data = json.load(f)
+                if isinstance(v1_data, dict) and "coverage_score" in v1_data:
+                    counts["verify_pass1"] += 1
+            except Exception:
+                pass
+
+        # 3. Refinement: pass2_refinement.json present
+        p2_file = chunk_folder / "pass2_refinement.json"
+        if p2_file.is_file():
             counts["refine"] += 1
-        if (chunk_folder / "verification_pass2.json").is_file():
-            counts["verify_pass2"] += 1
+
+        # 4. Verify Pass 2: Valid JSON with coverage_score
+        v2_file = chunk_folder / "verification_pass2.json"
+        if v2_file.is_file():
+            try:
+                with v2_file.open("r", encoding="utf-8") as f:
+                    v2_data = json.load(f)
+                if isinstance(v2_data, dict) and "coverage_score" in v2_data:
+                    counts["verify_pass2"] += 1
+            except Exception:
+                pass
 
     print(f"\n==================================================")
     print(f" DOMAIN: {domain_dir.name.upper()}  (Total Chunks: {total_chunks})")
