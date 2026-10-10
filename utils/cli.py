@@ -68,9 +68,10 @@ STAGE_PROFILES: Dict[str, StageProfile] = {
     "fold-thin-concepts":     StageProfile("fold-thin-concepts", 12, 360.0, 20.0, 6144),
 
     # ── graph enrichment & links (lightweight output payloads) ──────────
-    "write-briefs":           StageProfile("write-briefs", 24, 240.0, 20.0, 1536),
+    # Concurrency 8 per server prevents TCP connection queue saturation on vLLM
+    "write-briefs":           StageProfile("write-briefs", 8, 240.0, 60.0, 1536),
     "audit-islands":          StageProfile("audit-islands", 16, 360.0, 20.0, 3072),
-    "add-reverse-links":      StageProfile("add-reverse-links", 24, 240.0, 20.0, 1536),
+    "add-reverse-links":      StageProfile("add-reverse-links", 16, 240.0, 60.0, 1536),
 
     # ── final consolidation (macro scan & deep verify) ──────────────────
     "final-macro-scan":       StageProfile("final-macro-scan", 8, 480.0, 20.0, 6144),
