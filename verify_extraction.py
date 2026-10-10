@@ -361,6 +361,24 @@ OUTPUT FORMAT: Return ONLY valid JSON with this exact structure:
                     "critique": f"Model re-extracted {len(extracted_concepts)} concepts; accepted with baseline coverage."
                 }
 
+        # Normalize boolean is_sufficient: if missing_concepts is non-empty or coverage_score < 0.85,
+        # is_sufficient cannot logically be True. Fix it automatically rather than throwing ValidationError.
+        if isinstance(parsed_data.get("missing_concepts"), list) and len(parsed_data["missing_concepts"]) > 0:
+            parsed_data["is_sufficient"] = False
+        if isinstance(parsed_data.get("coverage_score"), (int, float)) and parsed_data["coverage_score"] < 0.85:
+            parsed_data["is_sufficient"] = False
+
+        # Ensure deduplicated nonempty items for arrays
+        for field in ("missing_concepts", "missing_facts", "hallucinations"):
+            if isinstance(parsed_data.get(field), list):
+                seen = set()
+                deduped = []
+                for val in parsed_data[field]:
+                    if isinstance(val, str) and val.strip() and val.strip().casefold() not in seen:
+                        seen.add(val.strip().casefold())
+                        deduped.append(val.strip())
+                parsed_data[field] = deduped
+
         try:
             return VerificationResult.model_validate(parsed_data)
         except Exception:
