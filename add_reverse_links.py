@@ -98,6 +98,22 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
             if tgt in title_map and tgt != src:
                 existing_edges.add((src, tgt))
 
+    def is_corrupted_relation(text: str) -> bool:
+        """Check if a relation string contains reasoning leaks, thinking dumps, or multi-paragraph scratchpads."""
+        if not text:
+            return True
+        t_lower = text.lower()
+        if any(marker in t_lower for marker in [
+            "<think>", "</think>", "we need", "need to", "need likely",
+            "concept a:", "concept b:", "original relation", "brief a:", "brief b:",
+            "user's request:", "formulate reverse", "one sentence"
+        ]):
+            return True
+        # If it has multiple newlines or is excessively long (> 350 chars), it's a reasoning dump
+        if "\n\n" in text or len(text) > 350:
+            return True
+        return False
+
     seen_missing: Set[Tuple[str, str]] = set()
     for (src, tgt) in list(existing_edges):
         if (tgt, src) not in existing_edges:
@@ -114,14 +130,15 @@ async def synthesize_reverse_relations(domain_dir: Path, args):
                 missing_reverse.append((tgt, src, rel_text))
 
     # Also rewrite template forward relations planted by the link-entities
-    # linker. "semantic affinity" is legacy wording from earlier graph files
-    # and is kept so re-running over old inputs still upgrades those edges.
+    # linker, OR relations that contain leaked thinking / scratchpad dumps.
     for c in concepts:
         for rel in c.get("outbound_relations", []):
             rel_str = rel.get("relation", "")
-            if "semantic affinity" in rel_str.lower() or "shared key entities" in rel_str.lower():
-                tgt = rel.get("target_concept", "").lower().strip()
-                if tgt in title_map and tgt != c["title"].lower().strip():
+            tgt = rel.get("target_concept", "").lower().strip()
+            if tgt in title_map and tgt != c["title"].lower().strip():
+                is_template = "semantic affinity" in rel_str.lower() or "shared key entities" in rel_str.lower()
+                is_corrupted = is_corrupted_relation(rel_str)
+                if is_template or is_corrupted:
                     pair = (c["title"].lower().strip(), tgt)
                     if pair not in seen_missing:
                         seen_missing.add(pair)
