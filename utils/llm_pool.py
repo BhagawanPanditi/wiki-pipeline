@@ -280,12 +280,11 @@ class ServerPool:
             return result
 
         server_count = len(self.servers)
-        queues: List[asyncio.Queue] = [asyncio.Queue() for _ in range(server_count)]
-
-        # Deterministic partition: item i -> server i % N. Every server receives
-        # within one item of the others regardless of how few items remain.
+        # Shared dynamic queue: workers pull the next item as soon as their server
+        # is free, preventing idle GPUs and balancing unequal workloads.
+        shared_queue: asyncio.Queue = asyncio.Queue()
         for index, item in enumerate(items):
-            queues[index % server_count].put_nowait((index, item))
+            shared_queue.put_nowait((index, item))
 
         outstanding = total
         pbar = tqdm(total=total, desc=desc or self.label, disable=not show_progress,
@@ -389,60 +388,29 @@ class ServerPool:
                 pbar.update(1)
 
         async def worker(server_index: int) -> None:
-            """Consume one server's queue until the map is finished.
-
-            Each server has its own worker and its own queue, which is what keeps the
-            spread deterministic: item ``i`` is only ever offered to server ``i % N``. A
-            worker exits when no items remain outstanding and its queue is empty. If its
-            server has been retired, remaining items are handed to another healthy server
-            instead of being dropped.
-
-            Args:
-                server_index: Index of the server this worker serves.
-
-            Returns:
-                None. Runs until the queue is drained.
-
-            Raises:
-                StageBudgetExceeded: Propagated from the budget check, so an expired
-                    wall-clock ceiling stops the map instead of idling on backoff."""
+            """Consume items dynamically as this server becomes ready."""
             nonlocal outstanding
-            queue = queues[server_index]
             while True:
                 if budget is not None:
                     budget.check(self.label)
+                if not self._healthy[server_index]:
+                    return
                 try:
-                    entry = await asyncio.wait_for(queue.get(), timeout=IDLE_POLL_SECONDS)
+                    entry = await asyncio.wait_for(shared_queue.get(), timeout=IDLE_POLL_SECONDS)
                 except asyncio.TimeoutError:
-                    if outstanding <= 0 and queue.empty():
+                    if outstanding <= 0 and shared_queue.empty():
                         return
-                    if not self._healthy[server_index]:
-                        # Nothing left for a retired server to do.
-                        if queue.empty():
-                            return
                     continue
 
                 index, item = entry
-
                 if not self._healthy[server_index]:
-                    target = self._next_healthy()
-                    if target is None:
-                        outstanding -= 1
-                        pbar.update(1)
-                        result.failures.append({
-                            "key": key_fn(item) if key_fn else str(index),
-                            "index": index, "server": self.servers[server_index],
-                            "classification": "permanent",
-                            "error": "all configured servers are unhealthy",
-                        })
-                        queue.task_done()
-                        continue
-                    queues[target].put_nowait((index, item))
-                    queue.task_done()
-                    continue
+                    # Server retired; return item to shared_queue for other healthy servers
+                    shared_queue.put_nowait((index, item))
+                    shared_queue.task_done()
+                    return
 
                 await run_item(server_index, index, item)
-                queue.task_done()
+                shared_queue.task_done()
 
         workers = [asyncio.create_task(worker(s))
                    for s in range(server_count)
