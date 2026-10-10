@@ -264,14 +264,19 @@ class WikiVerifierPipeline:
             concepts_json_raw: The unit's extracted concepts, as JSON text.
 
         Returns:
-            A prompt that asks the model to score coverage and to list missed concepts and
-            facts, with the required JSON output format."""
         return f"""\
-You are an auditor verifying the extraction quality. Compare the RAW CHUNK against EXTRACTED CONCEPTS JSON.
-Produce a verification report evaluating coverage and factual accuracy.
-List only the most important, unique, genuinely absent findings: at most {MAX_MISSING_CONCEPTS} missing concepts, {MAX_MISSING_FACTS} missing facts, and {MAX_HALLUCINATIONS} hallucinations. Keep entries short; do not copy the raw text or explain why accurate claims are accurate. Always provide a brief critique.
+RAW CHUNK TO EVALUATE:
+{item['current_chunk']}
 
-OUTPUT FORMAT MUST BE VALID JSON:
+EXTRACTED CONCEPTS JSON TO EVALUATE:
+{concepts_json_raw}
+
+AUDITOR INSTRUCTION:
+Compare the RAW CHUNK against the EXTRACTED CONCEPTS JSON.
+Do NOT re-extract concepts! You are an auditor writing an evaluation report on whether the extraction was accurate and complete.
+List only the most important, unique, genuinely absent findings: at most {MAX_MISSING_CONCEPTS} missing concepts, {MAX_MISSING_FACTS} missing facts, and {MAX_HALLUCINATIONS} hallucinations. Keep entries short. Always provide a brief critique.
+
+OUTPUT FORMAT MUST BE A VERIFICATION REPORT OBJECT (NOT "concepts"):
 {{
   "coverage_score": 0.95,
   "is_sufficient": true,
@@ -280,12 +285,6 @@ OUTPUT FORMAT MUST BE VALID JSON:
   "hallucinations": [],
   "critique": "Brief evaluation of the extraction."
 }}
-
-RAW CHUNK:
-{item['current_chunk']}
-
-EXTRACTED CONCEPTS JSON:
-{concepts_json_raw}
 """
 
     def parse_verification(self, raw_text: Optional[str], key: str) -> VerificationResult:
