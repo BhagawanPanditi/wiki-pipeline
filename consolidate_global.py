@@ -637,9 +637,10 @@ async def run_llm_fuzzy_pass(candidate_clusters: List[List[Dict[str, Any]]], arg
     for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
         print(f"  {url:<40} {count}")
     if failed_clusters:
-        raise RuntimeError(
-            f"LLM {method} fuzzy review failed for {len(failed_clusters)} cluster(s) "
-            f"after retries. Examples: {failed_clusters[:5]}"
+        print(
+            f"WARNING: LLM {method} fuzzy review failed for {len(failed_clusters)} cluster(s) "
+            f"after retries. Keeping them unmerged. Examples: {failed_clusters[:5]}",
+            flush=True,
         )
     print(f"LLM approved {len(approved_merges)} {method} fuzzy merges.")
     return approved_merges, llm_evaluations
