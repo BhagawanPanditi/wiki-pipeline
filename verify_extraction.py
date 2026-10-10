@@ -368,8 +368,13 @@ OUTPUT FORMAT: Return ONLY valid JSON with this exact structure:
         if isinstance(parsed_data.get("coverage_score"), (int, float)) and parsed_data["coverage_score"] < 0.85:
             parsed_data["is_sufficient"] = False
 
-        # Ensure deduplicated nonempty items for arrays
-        for field in ("missing_concepts", "missing_facts", "hallucinations"):
+        # Ensure deduplicated nonempty items for arrays and slice to max budget
+        limits = {
+            "missing_concepts": MAX_MISSING_CONCEPTS,
+            "missing_facts": MAX_MISSING_FACTS,
+            "hallucinations": MAX_HALLUCINATIONS,
+        }
+        for field, max_limit in limits.items():
             if isinstance(parsed_data.get(field), list):
                 seen = set()
                 deduped = []
@@ -377,7 +382,7 @@ OUTPUT FORMAT: Return ONLY valid JSON with this exact structure:
                     if isinstance(val, str) and val.strip() and val.strip().casefold() not in seen:
                         seen.add(val.strip().casefold())
                         deduped.append(val.strip())
-                parsed_data[field] = deduped
+                parsed_data[field] = deduped[:max_limit]
 
         try:
             return VerificationResult.model_validate(parsed_data)
