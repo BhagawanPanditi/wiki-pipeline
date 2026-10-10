@@ -46,11 +46,11 @@ def inspect_domain(domain_dir: Path):
         if not chunk_folder.is_dir():
             continue
 
-        if (chunk_folder / "extracted.json").is_file():
+        if (chunk_folder / "concepts.json").is_file():
             counts["extract"] += 1
         if (chunk_folder / "verification.json").is_file():
             counts["verify_pass1"] += 1
-        if (chunk_folder / "pass2_extracted.json").is_file():
+        if (chunk_folder / "pass2_refinement.json").is_file() or (chunk_folder / "concepts_pass1_backup.json").is_file():
             counts["refine"] += 1
         if (chunk_folder / "verification_pass2.json").is_file():
             counts["verify_pass2"] += 1
