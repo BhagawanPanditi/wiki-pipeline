@@ -35,10 +35,10 @@ class StubRelation(BaseModel):
     relation: str
 
 class StubConceptExtraction(BaseModel):
-    is_valid_concept: bool = Field(description="True if enough context exists to define this, False if too vague.")
-    title: str
+    is_valid_concept: bool = Field(default=True, description="True if enough context exists to define this, False if too vague.")
+    title: str = ""
     aliases: List[str] = Field(default_factory=list)
-    description: str
+    description: str = ""
     entities: List[str] = Field(default_factory=list)
     outbound_relations: List[StubRelation] = Field(default_factory=list)
 
@@ -244,7 +244,7 @@ class StubResolver:
                         response_format={"type": "json_object"}
                     )
                     return StubConceptExtraction.model_validate_json(
-                        clean_json_string(response.choices[0].message.content))
+                        clean_json_string(response.choices[0].message.content, allow_bare_object=True))
 
                 try:
                     return sc, await retry_async(

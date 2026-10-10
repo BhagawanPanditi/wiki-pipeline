@@ -52,28 +52,29 @@ class StageProfile:
 
 STAGE_PROFILES: Dict[str, StageProfile] = {
     # ── extraction & refinement (structured concept generation) ────────
-    # max_tokens scaled 1.5x from baseline estimates
-    "extract-concepts":       StageProfile("extract-concepts", 8, 300.0, 15.0, 9216),
-    "verify-pass1":           StageProfile("verify-pass1", 12, 180.0, 10.0, 6144),
-    "refine-concepts":        StageProfile("refine-concepts", 8, 300.0, 10.0, 9216),
-    "verify-pass2":           StageProfile("verify-pass2", 12, 180.0, 10.0, 6144),
+    # max_tokens scaled 1.5x, timeouts doubled to prevent transient load timeouts
+    "extract-concepts":       StageProfile("extract-concepts", 8, 600.0, 30.0, 9216),
+    "verify-pass1":           StageProfile("verify-pass1", 12, 360.0, 20.0, 6144),
+    "refine-concepts":        StageProfile("refine-concepts", 8, 600.0, 20.0, 9216),
+    "verify-pass2":           StageProfile("verify-pass2", 12, 360.0, 20.0, 6144),
 
     # ── document & global consolidation ─────────────────────────────────
-    "consolidate-documents":  StageProfile("consolidate-documents", 8, 300.0, 15.0, 9216),
-    "consolidate-global":     StageProfile("consolidate-global", 8, 240.0, 15.0, 6144),
+    "consolidate-documents":  StageProfile("consolidate-documents", 8, 600.0, 30.0, 9216),
+    "consolidate-global":     StageProfile("consolidate-global", 8, 480.0, 30.0, 6144),
 
     # ── stub resolution & folding ───────────────────────────────────────
-    "resolve-stubs":          StageProfile("resolve-stubs", 4, 180.0, 10.0, 6144),
-    "fold-thin-concepts":     StageProfile("fold-thin-concepts", 12, 180.0, 10.0, 6144),
+    # resolve-stubs fans out chunks 5x per stub: concurrency 2 = 10 in-flight requests per server
+    "resolve-stubs":          StageProfile("resolve-stubs", 2, 600.0, 30.0, 6144),
+    "fold-thin-concepts":     StageProfile("fold-thin-concepts", 12, 360.0, 20.0, 6144),
 
     # ── graph enrichment & links (lightweight output payloads) ──────────
-    "write-briefs":           StageProfile("write-briefs", 24, 120.0, 10.0, 1536),
-    "audit-islands":          StageProfile("audit-islands", 16, 180.0, 10.0, 3072),
-    "add-reverse-links":      StageProfile("add-reverse-links", 24, 120.0, 10.0, 1536),
+    "write-briefs":           StageProfile("write-briefs", 24, 240.0, 20.0, 1536),
+    "audit-islands":          StageProfile("audit-islands", 16, 360.0, 20.0, 3072),
+    "add-reverse-links":      StageProfile("add-reverse-links", 24, 240.0, 20.0, 1536),
 
     # ── final consolidation (macro scan & deep verify) ──────────────────
-    "final-macro-scan":       StageProfile("final-macro-scan", 8, 240.0, 10.0, 6144),
-    "final-deep-verify":      StageProfile("final-deep-verify", 12, 180.0, 10.0, 3072),
+    "final-macro-scan":       StageProfile("final-macro-scan", 8, 480.0, 20.0, 6144),
+    "final-deep-verify":      StageProfile("final-deep-verify", 12, 360.0, 20.0, 3072),
 }
 
 
