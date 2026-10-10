@@ -253,7 +253,7 @@ class StubResolver:
                         label=f"stub[{stub_name}][{sc}]",
                         budget=self.budget,
                         debug=self.debug,
-                        attempt_timeout=60.0,
+                        attempt_timeout=self.settings.profile.attempt_timeout,
                         server=str(client.base_url),
                     )
                 except (PermanentFailure, TransientFailureExhausted):

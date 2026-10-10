@@ -390,7 +390,7 @@ async def run_macro_scan(
     # Launch distributed workers across all servers
     tasks, http_clients = [], []
     for server_index, url in enumerate(settings.servers):
-        hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=300.0)
+        hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=settings.profile.request_timeout)
         http_clients.append(hc)
         client = wrap_client(
             AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0),
@@ -659,7 +659,7 @@ async def run_deep_verification(
 
     tasks, http_clients = [], []
     for server_index, url in enumerate(settings.servers):
-        hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=60.0)
+        hc = httpx.AsyncClient(limits=httpx.Limits(max_connections=effective_concurrency + 10), timeout=settings.profile.request_timeout)
         http_clients.append(hc)
         client = wrap_client(
             AsyncOpenAI(base_url=url, api_key="EMPTY", http_client=hc, max_retries=0),
