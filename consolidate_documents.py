@@ -131,6 +131,7 @@ class DocumentConsolidatorPipeline:
         self.decisions = EventLog(log_path(self.base_wiki_dir, STAGE, "decisions"), label=STAGE)
         self.attempts = AttemptHistory()
         self.flush_count = 0
+        self.log_lock = asyncio.Lock()
         self.log_data = load_json_log(
             self.log_file,
             corrupt_message="Consolidation log corrupted. Re-initializing.")
@@ -285,11 +286,12 @@ class DocumentConsolidatorPipeline:
             concepts_before=len(item["raw_concepts"]), concepts_after=len(consolidated),
             merges=[{"canonical": c.primary_title, "merged": list(c.merged_titles)}
                     for c in delta.merge_clusters])
-        self.log_data[doc_id] = True
-        self.flush_count += 1
-        if self.flush_count >= 10:
-            await save_log_async(self.log_file, self.log_data)
-            self.flush_count = 0
+        async with self.log_lock:
+            self.log_data[doc_id] = True
+            self.flush_count += 1
+            if self.flush_count >= 10:
+                await save_log_async(self.log_file, self.log_data)
+                self.flush_count = 0
 
     async def write_failure_debug(self, item: Dict[str, Any],
                                   failure: Dict[str, Any]) -> None:

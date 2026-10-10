@@ -30,12 +30,14 @@ def _fsync_dir(directory: Path) -> None:
         os.close(dir_fd)
 
 
+import uuid
+
 def atomic_write_json(path: PathLike, data: Any, *, indent: int = 2,
                       fsync_dir: bool = True) -> None:
     """Write JSON beside its destination, then atomically replace the old file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=indent, ensure_ascii=False)
@@ -55,7 +57,7 @@ def atomic_write_text(path: PathLike, text: str, *, fsync_dir: bool = True) -> N
     """Atomically replace a text file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8") as f:
             f.write(text)
