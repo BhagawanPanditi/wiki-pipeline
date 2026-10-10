@@ -264,6 +264,8 @@ class WikiVerifierPipeline:
             concepts_json_raw: The unit's extracted concepts, as JSON text.
 
         Returns:
+            The formatted prompt string.
+        """
         return f"""\
 RAW CHUNK TO EVALUATE:
 {item['current_chunk']}
