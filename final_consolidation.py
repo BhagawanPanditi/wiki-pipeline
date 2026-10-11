@@ -203,9 +203,13 @@ async def run_macro_scan(
             batches.append((f"Letter '{letter}'", group))
         else:
             chunk_size = 200
-            for part_idx, i in enumerate(range(0, len(group), chunk_size), 1):
+            overlap = 40
+            stride = chunk_size - overlap
+            for part_idx, i in enumerate(range(0, len(group), stride), 1):
                 sub_part = group[i:i + chunk_size]
                 batches.append((f"Letter '{letter}' (Part {part_idx})", sub_part))
+                if i + chunk_size >= len(group):
+                    break
 
     settings = resolve_settings(args, MACRO_STAGE)
     # This stage builds its own clients (its two passes need different request
