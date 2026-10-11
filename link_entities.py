@@ -17,7 +17,7 @@ from typing import Dict, List, Set, Any, Tuple
 import networkx as nx
 from tqdm import tqdm
 
-from utils.atomic_io import atomic_write_json
+from utils.atomic_io import atomic_write_json, sanitize_filename
 from utils.cli import build_parser
 from utils.event_log import EventLog
 from utils.layout import log_path
@@ -188,11 +188,13 @@ def enrich_graph_via_entity_overlap(
     if concepts_dir.exists():
         print(f"Updating files in {concepts_dir}/...")
         for c in tqdm(concepts, desc="Updating concept files"):
-            name = c["title"].replace(" ", "_")
-            matches = list(concepts_dir.glob(f"{name}*.json"))
-            if matches:
-                with open(matches[0], "w", encoding="utf-8") as f:
-                    json.dump(c, f, indent=2)
+            safe_name = sanitize_filename(c["title"]) or "unnamed_concept"
+            file_path = concepts_dir / f"{safe_name}.json"
+            counter = 1
+            while file_path.exists() and not file_path.is_file():
+                file_path = concepts_dir / f"{safe_name}_{counter}.json"
+                counter += 1
+            atomic_write_json(file_path, c)
 
     print("Successfully enriched graph with entity overlap links!")
 
