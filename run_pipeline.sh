@@ -717,10 +717,7 @@ run_step consolidate-documents python3 "$SCRIPT_DIR/consolidate_documents.py" \
     "${STAGE_ARGS[@]}"
 
 GLOBAL_ARGS=("${STAGE_ARGS[@]}")
-if [[ "$SKIP_GLOBAL_FUZZY" == true ]]; then
-    GLOBAL_ARGS+=(--skip_fuzzy_review)
-fi
-run_step consolidate-global python3 "$SCRIPT_DIR/consolidate_global.py" \
+run_step consolidate-global python3 "$SCRIPT_DIR/consolidate_global_exact.py" \
     "${GLOBAL_ARGS[@]}"
 run_step resolve-stubs python3 "$SCRIPT_DIR/resolve_stubs.py" \
     "${STAGE_ARGS[@]}"

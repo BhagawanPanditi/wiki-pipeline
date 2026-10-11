@@ -219,7 +219,7 @@ by the log file names and by `stage_concurrency` in `config.json`.
 | 3 | refine-concepts | `refine-concepts` | `refine_concepts.py` | Adds what verification found missing. Backs up Pass 1 first. | staging, verification | `pass2_refinement.json`, `concepts_pass1_backup.json`, updated `concepts.json` |
 | 4 | verify-pass2 | `verify-pass2` | `verify_extraction.py --phase 2` | Scores the refined output against the same sources. | staging | `verification_pass2.json`, `verification_summary.json` |
 | 5 | consolidate-documents | `consolidate-documents` | `consolidate_documents.py` | Merges duplicates **within** one document. Passes through when `--no-chunking`. | staging | `consolidated/<doc>/concepts.json` |
-| 6 | consolidate-global | `consolidate-global` | `consolidate_global.py` | Merges duplicates **across** documents: exact matches, then fuzzy matches confirmed by the LLM. | consolidated | `global_concepts.json`, `global_consolidation.json` |
+| 6 | consolidate-global | `consolidate-global` | `consolidate_global_exact.py` | Merges duplicates **across** documents: deterministic exact matches, then LLM-verified alias matches. | consolidated | `global_concepts.json`, `global_consolidation.json` |
 | 7 | resolve-stubs | `resolve-stubs` | `resolve_stubs.py` | Defines concepts that were only ever mentioned, and absorbs minor mentions into their parents. | global, cache | `global_concepts_stubs_resolved.json` |
 | 8 | fold-thin-concepts | `fold-thin-concepts` | `fold_thin_concepts.py` | Folds very short concepts into the best host concept, or prunes them. | stubs resolved | `global_concepts_refined.json` |
 | 9 | write-briefs | `write-briefs` | `write_briefs.py` | Writes the 2–3 sentence brief for each concept. | refined | refined (briefs added) |
