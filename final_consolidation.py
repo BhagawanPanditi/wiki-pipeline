@@ -199,11 +199,11 @@ async def run_macro_scan(
     # so the model never times out or exceeds context limits
     for letter in sorted(letter_groups.keys()):
         group = sorted(letter_groups[letter], key=lambda c: c["title"].lower().strip())
-        if len(group) <= 250:
+        if len(group) <= 150:
             batches.append((f"Letter '{letter}'", group))
         else:
-            chunk_size = 200
-            overlap = 40
+            chunk_size = 120
+            overlap = 30
             stride = chunk_size - overlap
             for part_idx, i in enumerate(range(0, len(group), stride), 1):
                 sub_part = group[i:i + chunk_size]
@@ -411,8 +411,10 @@ async def run_macro_scan(
         await hc.aclose()
 
     if failed_batches:
-        raise RuntimeError(
-            f"Final macro scan failed for {len(failed_batches)} batch(es) after retries: {failed_batches[:10]}"
+        print(
+            f"WARNING: Final macro scan failed for {len(failed_batches)} batch(es) after retries: {failed_batches[:10]}. "
+            f"Proceeding with {len(all_clusters)} candidate clusters found from successful batches.",
+            flush=True,
         )
 
     print(f"Step 1 Complete: Found {len(all_clusters)} candidate clusters for deep brief verification.")
