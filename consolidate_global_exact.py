@@ -34,10 +34,11 @@ from pydantic import BaseModel, Field
 from tqdm import tqdm
 
 from utils.atomic_io import atomic_write_json, sanitize_filename
+from utils.cli import build_parser, resolve_settings
 from utils.event_log import EventLog
+from utils.json_repair import clean_json_string
 from utils.layout import log_path, run_dir_for
 from utils.llm_pool import pool_for_stage
-from utils.text import clean_json_string
 
 STAGE = "consolidate-global"
 
