@@ -453,7 +453,7 @@ def global_consolidate(domain_dir: Path, args):
 
     canonical_titles_set = {gc["title"] for gc in global_concepts}
     total_global_relations = 0
-    unresolved_stubs_set: Set[str] = set()
+    unresolved_stubs_map: Dict[str, Set[str]] = {}
 
     for gc in tqdm(global_concepts, desc="Repointing outbound relations"):
         fused_relations: Dict[str, Dict[str, Set[str]]] = {}
@@ -469,9 +469,6 @@ def global_consolidate(domain_dir: Path, args):
             if canonical_target.lower() == gc["title"].lower():
                 continue
 
-            if canonical_target not in canonical_titles_set:
-                unresolved_stubs_set.add(canonical_target)
-
             key = (canonical_target, rel_type)
             if key not in fused_relations:
                 fused_relations[key] = {
@@ -483,6 +480,9 @@ def global_consolidate(domain_dir: Path, args):
                 fused_relations[key]["descriptions"].add(rel_desc)
             for sc in rel_chunks:
                 fused_relations[key]["source_chunks"].add(sc)
+
+            if canonical_target not in canonical_titles_set:
+                unresolved_stubs_map.setdefault(canonical_target, set()).update(rel_chunks)
 
         final_relations = []
         for (target, rel_type), payload in fused_relations.items():
@@ -497,7 +497,11 @@ def global_consolidate(domain_dir: Path, args):
         total_global_relations += len(final_relations)
         del gc["_raw_relations"]
 
-    sorted_unresolved_stubs = sorted(list(unresolved_stubs_set))
+    sorted_unresolved_stubs = [
+        {"stub_name": tgt, "frequency": len(sources), "source_chunks": sorted(list(sources))}
+        for tgt, sources in unresolved_stubs_map.items()
+    ]
+    sorted_unresolved_stubs.sort(key=lambda x: x["frequency"], reverse=True)
 
     # Save summary and global concepts
     log_data = {

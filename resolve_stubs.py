@@ -129,7 +129,13 @@ class StubResolver:
         with open(self.log_file, "r", encoding="utf-8") as f:
             self.log_data = json.load(f)
             
-        self.stubs = self.log_data.get("unresolved_stubs", [])
+        raw_stubs = self.log_data.get("unresolved_stubs", [])
+        self.stubs = []
+        for s in raw_stubs:
+            if isinstance(s, dict):
+                self.stubs.append(s)
+            elif isinstance(s, str):
+                self.stubs.append({"stub_name": s, "source_chunks": []})
         
         print("Loading chunk text cache...")
         cache_file = self.cache_dir / "chunks_cache.json"
