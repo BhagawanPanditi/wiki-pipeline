@@ -326,21 +326,12 @@ def global_consolidate(domain_dir: Path, args):
             async def handler(client, batch, server_index):
                 return await verify_alias_batch(client, batch, settings)
 
-            async with pool:
-                result = await pool.map(
-                    batches,
-                    handler,
-                    attempts=settings.attempts,
-                    desc="Verifying Alias Candidate Pairs",
-                    budget=None,
-                    attempt_timeout=settings.profile.attempt_timeout,
-                )
-
-            for b_idx, (batch, res) in enumerate(zip(batches, result.items)):
+            async def on_batch_result(batch, res):
+                nonlocal approved_alias_merges
                 if res and hasattr(res, "pair_verdicts"):
                     for pair, verdict in zip(batch, res.pair_verdicts):
+                        c1, c2 = pair
                         if verdict.is_same_entity:
-                            c1, c2 = pair
                             decisions.record("alias_merge_approved",
                                              concept1=c1["title"], concept2=c2["title"],
                                              canonical=verdict.chosen_canonical_title,
@@ -348,10 +339,20 @@ def global_consolidate(domain_dir: Path, args):
                             uf.union(c1["title"], c2["title"])
                             approved_alias_merges += 1
                         else:
-                            c1, c2 = pair
                             decisions.record("alias_merge_rejected",
                                              concept1=c1["title"], concept2=c2["title"],
                                              reason=verdict.reason)
+
+            async with pool:
+                await pool.map(
+                    batches,
+                    handler,
+                    attempts=settings.attempts,
+                    desc="Verifying Alias Candidate Pairs",
+                    budget=None,
+                    attempt_timeout=settings.profile.attempt_timeout,
+                    on_result=on_batch_result,
+                )
 
         asyncio.run(run_alias_verification())
         print(f"LLM approved {approved_alias_merges} title-to-alias merges.")
