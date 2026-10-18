@@ -402,11 +402,16 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
                                 payload, encoding="utf-8")
 
     def apply_merges(
-        self, pass1_data: Dict[str, Any], pass2_delta: Pass2ExtractionSchema
+        self, pass1_data: Any, pass2_delta: Pass2ExtractionSchema
     ) -> Dict[str, Any]:
         """Merges Pass 2 updates cleanly into existing Pass 1 concepts JSON."""
-        concepts_list = pass1_data.get("concepts", [])
-        concept_map = {c["title"].strip().lower(): c for c in concepts_list}
+        if isinstance(pass1_data, list):
+            concepts_list = pass1_data
+        elif isinstance(pass1_data, dict):
+            concepts_list = pass1_data.get("concepts", [])
+        else:
+            concepts_list = []
+        concept_map = {c["title"].strip().lower(): c for c in concepts_list if isinstance(c, dict) and "title" in c}
 
         # 1. Apply concept updates
         for update in pass2_delta.concept_updates:
