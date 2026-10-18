@@ -242,7 +242,7 @@ class WikiSecondPassPipeline:
                 "current_chunk": chunk_data["current_chunk"],
                 "context_before": chunk_data.get("context_before", ""),
                 "context_after": chunk_data.get("context_after", ""),
-                "pass1_concepts": pass1_concepts,
+                "pass1_concepts": pass1_concepts.get("concepts", []) if isinstance(pass1_concepts, dict) else (pass1_concepts if isinstance(pass1_concepts, list) else []),
                 "audit_feedback": audit_feedback,
                 "chunk_dir": chunk_dir
             })
@@ -281,19 +281,29 @@ AUDIT FEEDBACK (PREVIOUS VERIFICATION FOUND OMISSIONS):
 """
 
         pass1_lines = []
-        for i, c in enumerate(item["pass1_concepts"], 1):
-            title = c.get("title", "")
-            aliases = ", ".join(c.get("aliases", []))
-            desc = c.get("description", "").strip()
-            block = [f"CONCEPT {i}: {title}"]
-            if aliases:
-                block.append(f"  Aliases: {aliases}")
-            if desc:
-                block.append(f"  Description: {desc}")
-            rels = [f"- -> {r.get('target_concept')}: {r.get('relation')}" for r in c.get("outbound_relations", []) if r.get("target_concept")]
-            if rels:
-                block.append("  Outbound Relations:\n    " + "\n    ".join(rels))
-            pass1_lines.append("\n".join(block))
+        concepts_list = item["pass1_concepts"]
+        if isinstance(concepts_list, dict):
+            concepts_list = concepts_list.get("concepts", [])
+        if isinstance(concepts_list, list):
+            for i, c in enumerate(concepts_list, 1):
+                if not isinstance(c, dict):
+                    continue
+                title = c.get("title", "")
+                aliases = ", ".join(c.get("aliases", [])) if isinstance(c.get("aliases"), list) else ""
+                desc = c.get("description", "").strip() if isinstance(c.get("description"), str) else ""
+                block = [f"CONCEPT {i}: {title}"]
+                if aliases:
+                    block.append(f"  Aliases: {aliases}")
+                if desc:
+                    block.append(f"  Description: {desc}")
+                rels = [
+                    f"- -> {r.get('target_concept')}: {r.get('relation')}"
+                    for r in c.get("outbound_relations", [])
+                    if isinstance(r, dict) and r.get("target_concept")
+                ]
+                if rels:
+                    block.append("  Outbound Relations:\n    " + "\n    ".join(rels))
+                pass1_lines.append("\n".join(block))
 
         pass1_text = "\n\n".join(pass1_lines) if pass1_lines else "None (empty extraction)"
 
