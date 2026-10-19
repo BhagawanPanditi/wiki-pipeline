@@ -97,7 +97,7 @@ Your task is to compare a RAW TEXT CHUNK against the EXTRACTED CONCEPTS JSON to 
 --------------------------------------------------------------------------------
 A "Substantive Fact" is key informational content. You MUST verify that:
 - Core technical metrics, parameters, benchmark scores, or quantitative data points (e.g., "accuracy of 94.2%", "temperature of 300K") are explicitly retained in the `description` sentences.
-- Specific named entities, tools, biological codes, algorithms, or datasets (e.g., "CRISPR-Cas9", "ResNet-50", "GSE12345") are present either as named strings in `entities` or in `description`.
+- Specific named terms, tools, biological codes, algorithms, or datasets (e.g., "CRISPR-Cas9", "ResNet-50", "GSE12345") are present in `description`.
 - Key causal/functional mechanisms or relationships between concepts are captured.
 
 --------------------------------------------------------------------------------
@@ -112,7 +112,7 @@ You MUST SILENTLY IGNORE and NOT penalize the extraction for omitting:
 3. GRANULARITY & LOCATION RULES
 --------------------------------------------------------------------------------
 - UNCAPPED EXTRACTION: The extractor was instructed to extract ALL distinct concepts/sub-topics present without artificial caps or node limits.
-- FACTS MUST BE IN SENTENCES: A technical metric or factual finding MUST appear in complete sentence form inside a concept's `description` (or `outbound_relations`). Simply listing a string in `entities` does NOT satisfy the retention of a factual claim or quantitative metric.
+- FACTS MUST BE IN SENTENCES: A technical metric or factual finding MUST appear in complete sentence form inside a concept's `description` (or `outbound_relations`). Do NOT penalize concepts for having an empty entities list (entities are extracted later in dedicated enrichment).
 
 --------------------------------------------------------------------------------
 4. SCORING CRITERIA

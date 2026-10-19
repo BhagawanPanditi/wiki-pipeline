@@ -27,12 +27,21 @@ WIKI_BASE_DIR="/home/compiling-ganesh/24m0829/long_document/wiki"
 CONCURRENCY=16
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+SERVERS=()
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --wiki_base_dir|--wiki-base-dir)
             WIKI_BASE_DIR="$2"; shift 2 ;;
         --concurrency)
             CONCURRENCY="$2"; shift 2 ;;
+        --servers)
+            shift
+            while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+                SERVERS+=("$1")
+                shift
+            done
+            ;;
         *)
             echo "Unknown option: $1" >&2; exit 2 ;;
     esac
@@ -44,6 +53,10 @@ COMMON_ARGS=(
     --concurrency_per_server "$CONCURRENCY"
     --no_failover
 )
+
+if [[ ${#SERVERS[@]} -gt 0 ]]; then
+    COMMON_ARGS+=(--servers "${SERVERS[@]}")
+fi
 
 run_stage() {
     local stage_name="$1"
@@ -61,15 +74,15 @@ echo "Starting Full Enrichment Pipeline for Domain: ${DOMAIN}"
 echo "Base Wiki Dir: ${WIKI_BASE_DIR}"
 echo "Concurrency:   ${CONCURRENCY} req/server"
 
-# # 1. Exact Global Consolidation
-# run_stage "1. Consolidate Global Exact" \
-#     python3 "$SCRIPT_DIR/consolidate_global_exact.py" \
-#     --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+# 1. Exact Global Consolidation
+run_stage "1. Consolidate Global Exact" \
+    python3 "$SCRIPT_DIR/consolidate_global_exact.py" \
+    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
 
-# # 2. Re-synthesize Clean Entities (<= 10 per concept)
-# run_stage "2. Resynthesize Entities" \
-#     python3 "$SCRIPT_DIR/resynthesize_entities.py" \
-#     "${COMMON_ARGS[@]}"
+# 2. Re-synthesize Clean Entities (<= 10 per concept)
+run_stage "2. Resynthesize Entities" \
+    python3 "$SCRIPT_DIR/resynthesize_entities.py" \
+    "${COMMON_ARGS[@]}"
 
 # 3. Resolve Outbound Mention Stubs
 run_stage "3. Resolve Stubs" \

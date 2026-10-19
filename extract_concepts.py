@@ -33,7 +33,7 @@ class Concept(BaseModel):
     title: str = Field(description="Exact canonical title (1-6 words, singular).")
     aliases: List[str] = Field(default_factory=list, description="Explicit acronyms or 'also known as' names.")
     description: str = Field(description="Single dense factual paragraph with all metrics, parameters, and details.")
-    entities: List[str] = Field(default_factory=list, description="Flat list of minor named entities, tools, genes, datasets, proteins, dates, or specific terms mentioned.")
+    entities: List[str] = Field(default_factory=list, description="Always empty in Pass 1 extraction; entities are extracted during dedicated enrichment.")
     outbound_relations: List[OutboundRelation] = Field(default_factory=list)
 
 class ChunkExtractionSchema(BaseModel):
@@ -47,7 +47,7 @@ class ChunkExtractionSchema(BaseModel):
 # ── System Prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 You are an expert technical knowledge extractor building an LLM Wiki Knowledge Graph. 
-Analyze the CURRENT CHUNK and extract its core thematic concepts, dense factual descriptions, related named entities, and outbound relationships.
+Analyze the CURRENT CHUNK and extract its core thematic concepts, dense factual descriptions, and outbound relationships.
 
 INPUT & NOISE CLEANING:
 - The text is raw and uncleaned. SILENTLY IGNORE all HTML tags, scraping artifacts, navigation links, headers, footers, cookie notices, and promotional clutter. Focus ONLY on substantive informational text.
@@ -62,9 +62,9 @@ EXHAUSTIVE CONCEPT COVERAGE (UNCAPPED):
 - Extract ALL distinct concepts, core thematic subjects, major sub-topics, conditions, pathways, systems, or technical components discussed in this chunk.
 - Do NOT artificially restrict concept counts. Extract EVERY substantive sub-topic that has meaningful explanatory detail in the text.
 
-FACT vs. ENTITY STRICT SEPARATION:
-1. DESCRIPTIONS HOLD ALL FACTS: Write a single, dense, factual paragraph for each concept. ALL quantitative metrics, ranges, parameters, statistical findings, experimental conditions, and procedural details MUST be written in full complete sentences inside `description`.
-2. ENTITIES LIST: `entities` is STRICTLY a flat list of at most 10 key named string identifiers directly relevant to this concept (e.g., software tools, biological terms, gene symbols, dataset identifiers, model names, author names). DO NOT extract peripheral background mentions or place factual claims in `entities`.
+DESCRIPTIONS HOLD ALL FACTS:
+- Write a single, dense, factual paragraph for each concept. ALL quantitative metrics, ranges, parameters, statistical findings, experimental conditions, tool mentions, and procedural details MUST be written in full complete sentences inside `description`.
+- DO NOT extract named entities into a separate list at this stage (set "entities": []). Dedicated entity extraction runs in a later pipeline stage.
 
 EXHAUSTIVE FACTUAL RETENTION MANDATE:
 Descriptions MUST retain exact detail rather than abstracting away technical facts. You MUST preserve in sentence form:
@@ -87,7 +87,7 @@ Return ONLY valid JSON matching this exact structure:
       "title": "Exact Canonical Title",
       "aliases": ["Acronym or Alt Name"],
       "description": "A single comprehensive paragraph detailing what the concept is along with all raw quantitative metrics, parameter bounds, specific findings, and detailed statements from this chunk.",
-      "entities": ["Tool/Software Name", "Dataset Code", "Gene Symbol", "Formal Benchmark"],
+      "entities": [],
       "outbound_relations": [
         {
           "target_concept": "Target Concept Title",

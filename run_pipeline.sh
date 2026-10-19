@@ -490,7 +490,7 @@ PY
 # because downstream output was derived from the older upstream output.
 PIPELINE_STEPS=(
     preflight extract-concepts verify-pass1 refine-concepts verify-pass2
-    consolidate-documents consolidate-global resolve-stubs fold-thin-concepts
+    consolidate-documents consolidate-global resynthesize-entities resolve-stubs fold-thin-concepts
     write-briefs link-entities audit-islands add-reverse-links
     final-consolidation island-report
 )
@@ -533,6 +533,9 @@ step_outputs_ready() {
             ;;
         consolidate-global)
             json_has_concepts "$DOMAIN_DIR/global_concepts.json" && global_fuzzy_mode_matches
+            ;;
+        resynthesize-entities)
+            json_has_concepts "$DOMAIN_DIR/global_concepts.json"
             ;;
         resolve-stubs)
             json_has_concepts "$DOMAIN_DIR/global_concepts_stubs_resolved.json"
@@ -719,6 +722,8 @@ run_step consolidate-documents python3 "$SCRIPT_DIR/consolidate_documents.py" \
 GLOBAL_ARGS=("${STAGE_ARGS[@]}")
 run_step consolidate-global python3 "$SCRIPT_DIR/consolidate_global_exact.py" \
     "${GLOBAL_ARGS[@]}"
+run_step resynthesize-entities python3 "$SCRIPT_DIR/resynthesize_entities.py" \
+    "${STAGE_ARGS[@]}"
 run_step resolve-stubs python3 "$SCRIPT_DIR/resolve_stubs.py" \
     "${STAGE_ARGS[@]}"
 run_step fold-thin-concepts python3 "$SCRIPT_DIR/fold_thin_concepts.py" \

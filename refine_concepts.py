@@ -89,14 +89,14 @@ Identify any missing concepts, omitted technical metrics, parameters, or relatio
 
 CRITICAL RULES:
 1. NO CONCEPT LIMITS: Do NOT artificially restrict concept counts. Extract EVERY substantive concept or sub-topic that has factual explanations in the chunk.
-2. FACTS ARE SENTENCES, NOT ENTITIES:
-   - Entities (`entities` or `additional_entities`) are STRICTLY a flat list of at most 10 key named terms directly relevant to this concept (e.g., "CRISPR-Cas9", "ResNet-50", "GSE12345"). DO NOT extract peripheral background mentions!
-   - ALL technical facts, numbers, bounds, statistical parameters, and procedural details MUST be written as complete sentences inside concept descriptions (`description` or `additional_description_sentences`). Do NOT treat entities as a place to store facts!
+2. FACTS ARE SENTENCES:
+   - ALL technical facts, numbers, bounds, statistical parameters, tool mentions, and procedural details MUST be written as complete sentences inside concept descriptions (`description` or `additional_description_sentences`).
+   - Do NOT extract named entities into an entities list at this stage (leave entities empty). Dedicated entity extraction runs in a later pipeline stage.
 3. AUDIT FEEDBACK HINTS:
    - If AUDIT FEEDBACK is provided below, prioritize extracting all missing concepts and missing facts listed in that audit.
 4. OUTBOUND RELATIONS REFINEMENT:
    - If an existing relation between Concept A and Concept B is imprecise or redundant, specify its `target_concept` in `relations_to_remove` so it can be pruned.
-   - Add new high-value outbound relations in `additional_outbound_relations`.
+   - Add new high-value outbound relations in `additional_outbound_relations`. Each outbound relation MUST have a concise 1-sentence description explaining how this concept affects or relates outward to Target Concept.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON matching this exact structure:
@@ -106,7 +106,7 @@ Return ONLY valid JSON matching this exact structure:
       "title": "Exact Title of Missed Concept",
       "aliases": ["Acronym or Alt Name"],
       "description": "Dense factual paragraph with all quantitative metrics and findings from this chunk.",
-      "entities": ["Tool Name", "Dataset Code"],
+      "entities": [],
       "outbound_relations": [
         {
           "target_concept": "Target Title",
@@ -123,7 +123,7 @@ Return ONLY valid JSON matching this exact structure:
         "First sentence containing specific metric or finding missed in Pass 1.",
         "Second sentence describing experimental parameter or condition."
       ],
-      "additional_entities": ["New Named Entity"],
+      "additional_entities": [],
       "additional_outbound_relations": [
         {
           "target_concept": "Target Title",
