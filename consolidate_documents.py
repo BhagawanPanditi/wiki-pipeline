@@ -211,7 +211,7 @@ class DocumentConsolidatorPipeline:
                               concepts=len(lightweight_concepts), batches=len(batches))
         # A large document is one checkpointed unit. Persist it only after EVERY
         # batch succeeds; partial merge plans never mark the document complete.
-        semaphore = asyncio.Semaphore(3)
+        semaphore = asyncio.Semaphore(16)
 
         def format_batch_for_prompt(batch_concepts: List[Dict[str, Any]]) -> str:
             lines = []
