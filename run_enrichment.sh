@@ -61,15 +61,15 @@ echo "Starting Full Enrichment Pipeline for Domain: ${DOMAIN}"
 echo "Base Wiki Dir: ${WIKI_BASE_DIR}"
 echo "Concurrency:   ${CONCURRENCY} req/server"
 
-# 1. Exact Global Consolidation
-run_stage "1. Consolidate Global Exact" \
-    python3 "$SCRIPT_DIR/consolidate_global_exact.py" \
-    --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+# # 1. Exact Global Consolidation
+# run_stage "1. Consolidate Global Exact" \
+#     python3 "$SCRIPT_DIR/consolidate_global_exact.py" \
+#     --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
 
-# 2. Re-synthesize Clean Entities (<= 10 per concept)
-run_stage "2. Resynthesize Entities" \
-    python3 "$SCRIPT_DIR/resynthesize_entities.py" \
-    "${COMMON_ARGS[@]}"
+# # 2. Re-synthesize Clean Entities (<= 10 per concept)
+# run_stage "2. Resynthesize Entities" \
+#     python3 "$SCRIPT_DIR/resynthesize_entities.py" \
+#     "${COMMON_ARGS[@]}"
 
 # 3. Resolve Outbound Mention Stubs
 run_stage "3. Resolve Stubs" \
