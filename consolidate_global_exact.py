@@ -460,8 +460,8 @@ def global_consolidate(domain_dir: Path, args):
 
         for rel in gc["_raw_relations"]:
             tgt = rel.get("target_concept", "").strip()
-            rel_type = rel.get("relation_type", "related_to").strip()
-            rel_desc = rel.get("description", "").strip()
+            rel_desc = rel.get("relation", "") or rel.get("description", "")
+            rel_desc = rel_desc.strip()
             rel_chunks = rel.get("source_chunks", [])
 
             canonical_target = canonical_title_map.get(uf.find(tgt), tgt)
@@ -469,27 +469,27 @@ def global_consolidate(domain_dir: Path, args):
             if canonical_target.lower() == gc["title"].lower():
                 continue
 
-            key = (canonical_target, rel_type)
-            if key not in fused_relations:
-                fused_relations[key] = {
-                    "descriptions": set(),
+            if canonical_target not in canonical_titles_set:
+                unresolved_stubs_map.setdefault(canonical_target, set()).update(rel_chunks)
+
+            if canonical_target not in fused_relations:
+                fused_relations[canonical_target] = {
+                    "sentences": set(),
                     "source_chunks": set()
                 }
 
             if rel_desc:
-                fused_relations[key]["descriptions"].add(rel_desc)
+                for sent in re.split(r'(?<=[.!?])\s+', rel_desc):
+                    if sent.strip():
+                        fused_relations[canonical_target]["sentences"].add(sent.strip())
             for sc in rel_chunks:
-                fused_relations[key]["source_chunks"].add(sc)
-
-            if canonical_target not in canonical_titles_set:
-                unresolved_stubs_map.setdefault(canonical_target, set()).update(rel_chunks)
+                fused_relations[canonical_target]["source_chunks"].add(sc)
 
         final_relations = []
-        for (target, rel_type), payload in fused_relations.items():
+        for target, payload in fused_relations.items():
             final_relations.append({
                 "target_concept": target,
-                "relation_type": rel_type,
-                "description": " ".join(sorted(payload["descriptions"])),
+                "relation": " ".join(sorted(payload["sentences"])),
                 "source_chunks": sorted(list(payload["source_chunks"]))
             })
 
