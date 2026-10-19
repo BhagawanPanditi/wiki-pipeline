@@ -59,7 +59,7 @@ STAGE_PROFILES: Dict[str, StageProfile] = {
     "verify-pass2":           StageProfile("verify-pass2", 12, 360.0, 20.0, 6144),
 
     # ── document & global consolidation ─────────────────────────────────
-    "consolidate-documents":  StageProfile("consolidate-documents", 8, 600.0, 30.0, 9216),
+    "consolidate-documents":  StageProfile("consolidate-documents", 8, 1800.0, 30.0, 9216),
     "consolidate-global":     StageProfile("consolidate-global", 8, 480.0, 30.0, 6144),
 
     # ── stub resolution & folding ───────────────────────────────────────
@@ -220,6 +220,19 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
     if max_tokens in (None, 0):
         max_tokens = profile.max_tokens
 
+    timeout = float(pick(getattr(args, "request_timeout", 0.0),
+                          "request_timeout", profile.request_timeout))
+    if timeout != profile.request_timeout:
+        profile = StageProfile(
+            key=profile.key,
+            concurrency_per_server=profile.concurrency_per_server,
+            request_timeout=timeout,
+            connect_timeout=profile.connect_timeout,
+            max_tokens=profile.max_tokens,
+            attempts=profile.attempts,
+            budget_minutes=profile.budget_minutes,
+        )
+
     return StageSettings(
         profile=profile,
         servers=getattr(args, "servers", None) or servers_default,
@@ -323,6 +336,9 @@ def add_common_args(
                         help=f"Wall-clock ceiling for this stage. 0 = default "
                              f"({profile.budget_minutes:g} min). Stops backoff from "
                              f"running indefinitely; checkpoints stay resumable.")
+    parser.add_argument("--request_timeout", type=float, default=0.0,
+                        help=f"Per-attempt request timeout in seconds. 0 = stage default "
+                             f"({profile.request_timeout:g}s).")
     parser.add_argument("--no_failover", action="store_true",
                         help="Do not move work off a server that stops responding.")
     if include_resume:
