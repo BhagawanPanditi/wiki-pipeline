@@ -52,15 +52,15 @@ class StageProfile:
 
 STAGE_PROFILES: Dict[str, StageProfile] = {
     # ── extraction & refinement (structured concept generation) ────────
-    # max_tokens scaled 1.5x, timeouts doubled to prevent transient load timeouts
-    "extract-concepts":       StageProfile("extract-concepts", 64, 1000.0, 50.0, 16000),
-    "verify-pass1":           StageProfile("verify-pass1", 12, 500.0, 50.0, 6144),
-    "refine-concepts":        StageProfile("refine-concepts", 8, 1000.0, 50.0, 13312),
-    "verify-pass2":           StageProfile("verify-pass2", 12, 500.0, 50.0, 6144),
+    # max_tokens set to 16000, timeouts increased for large chunk batches
+    "extract-concepts":       StageProfile("extract-concepts", 64, 1200.0, 50.0, 16000),
+    "verify-pass1":           StageProfile("verify-pass1", 12, 800.0, 50.0, 16000),
+    "refine-concepts":        StageProfile("refine-concepts", 8, 1200.0, 50.0, 16000),
+    "verify-pass2":           StageProfile("verify-pass2", 12, 800.0, 50.0, 16000),
 
     # ── document & global consolidation ─────────────────────────────────
-    "consolidate-documents":  StageProfile("consolidate-documents", 8, 1800.0, 30.0, 9216),
-    "consolidate-global":     StageProfile("consolidate-global", 8, 600.0, 30.0, 6144),
+    "consolidate-documents":  StageProfile("consolidate-documents", 8, 1800.0, 30.0, 16000),
+    "consolidate-global":     StageProfile("consolidate-global", 8, 800.0, 30.0, 8192),
 
 
     # ── stub resolution & folding ───────────────────────────────────────
