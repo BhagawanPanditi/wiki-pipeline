@@ -254,8 +254,16 @@ class DocumentConsolidatorPipeline:
                     )
                     choice = response.choices[0]
                     finish_reason = choice.finish_reason
-                    raw_text = choice.message.content
+                    raw_text = choice.message.content or ""
                     if finish_reason == "length":
+                        # Try to salvage valid clusters from truncated response
+                        try:
+                            delta = DocumentConsolidationSchema.model_validate_json(clean_json_string(raw_text))
+                            if batch_pbar is not None:
+                                batch_pbar.update(1)
+                            return delta.merge_clusters
+                        except Exception:
+                            pass
                         raise ValueError(f"Response truncated: Hit max_tokens ({self.settings.max_tokens}).")
                     delta = DocumentConsolidationSchema.model_validate_json(clean_json_string(raw_text))
                     if batch_pbar is not None:
@@ -269,6 +277,7 @@ class DocumentConsolidatorPipeline:
                     # unexpectedly exceeds its context/output allowance, halve
                     # it and try again; a single unfit concept fails explicitly.
                     too_long = (finish_reason == "length" or
+                                "hit max_tokens" in str(exc).lower() or
                                 isinstance(exc, BadRequestError) and
                                 ("maximum context length" in str(exc).lower() or
                                  "input_tokens" in str(exc).lower()))
@@ -276,6 +285,10 @@ class DocumentConsolidatorPipeline:
                         raise
                     self.debug.record("split_merge_batch", doc_id=doc_id,
                                       batch_size=len(batch), error=str(exc))
+                    if batch_pbar is not None:
+                        # Re-scale progress bar since one batch is now splitting into two child sub-batches
+                        batch_pbar.total += 1
+                        batch_pbar.refresh()
             # Split outside the semaphore to avoid deadlock when child calls
             # need the same limited pool of request slots.
             mid = len(batch) // 2
