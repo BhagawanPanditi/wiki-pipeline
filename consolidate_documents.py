@@ -9,6 +9,7 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+from tqdm import tqdm
 
 from openai import BadRequestError
 from pydantic import BaseModel, Field
@@ -212,6 +213,9 @@ class DocumentConsolidatorPipeline:
         # A large document is one checkpointed unit. Persist it only after EVERY
         # batch succeeds; partial merge plans never mark the document complete.
         semaphore = asyncio.Semaphore(16)
+        batch_pbar = None
+        if len(batches) > 1:
+            batch_pbar = tqdm(total=len(batches), desc=f"  [doc {doc_id[:12]}] {len(raw_concepts)} concepts", leave=False)
 
         def format_batch_for_prompt(batch_concepts: List[Dict[str, Any]]) -> str:
             lines = []
@@ -254,6 +258,8 @@ class DocumentConsolidatorPipeline:
                     if finish_reason == "length":
                         raise ValueError(f"Response truncated: Hit max_tokens ({self.settings.max_tokens}).")
                     delta = DocumentConsolidationSchema.model_validate_json(clean_json_string(raw_text))
+                    if batch_pbar is not None:
+                        batch_pbar.update(1)
                     return delta.merge_clusters
                 except Exception as exc:
                     self.attempts.record(doc_id, finish_reason=finish_reason, raw_text=raw_text,
@@ -278,6 +284,8 @@ class DocumentConsolidatorPipeline:
             return left + right
 
         batch_results = await asyncio.gather(*(merge_batch(batch) for batch in batches))
+        if batch_pbar is not None:
+            batch_pbar.close()
         return DocumentConsolidationSchema(
             merge_clusters=[cluster for clusters in batch_results for cluster in clusters]
         )
