@@ -310,7 +310,15 @@ class WikiExtractorPipeline:
             raw_text = choice.message.content
 
             if finish_reason == "length":
-                # FAIL FAST: Do not retry if we hit the token limit
+                # Try to salvage valid concepts from truncated JSON using clean_json_string
+                try:
+                    cleaned_json = clean_json_string(raw_text)
+                    salvaged = ChunkExtractionSchema.model_validate_json(cleaned_json)
+                    if salvaged.concepts:
+                        return salvaged
+                except Exception:
+                    pass
+                # FAIL FAST: Do not retry if we hit the token limit and cannot salvage
                 self.attempts.record(key, finish_reason=finish_reason, raw_text=raw_text,
                                      error_type="TokenLimitExceeded",
                                      error_message="Response truncated: Hit max_tokens limit.")
