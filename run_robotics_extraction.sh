@@ -55,6 +55,7 @@ python3 "$SCRIPT_DIR/refine_concepts.py" \
   --servers "$SERVER_URL" \
   --concurrency_per_server "$CONCURRENCY" \
   --max_tokens 16000 \
+  --stage_budget_minutes 300 \
   --no_failover \
   --resume
 

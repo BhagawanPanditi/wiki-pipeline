@@ -337,9 +337,17 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
 
             choice = response.choices[0]
             finish_reason = choice.finish_reason
-            raw_text = choice.message.content
+            raw_text = choice.message.content or ""
 
             if finish_reason == "length":
+                # Try to salvage valid concepts from truncated JSON using clean_json_string
+                try:
+                    cleaned_json = clean_json_string(raw_text)
+                    salvaged = Pass2ExtractionSchema.model_validate_json(cleaned_json)
+                    if salvaged.new_concepts or salvaged.concept_updates:
+                        return salvaged
+                except Exception:
+                    pass
                 raise ValueError(f"Response truncated: Hit max_tokens ({self.settings.max_tokens}).")
 
             cleaned_json = clean_json_string(raw_text)
