@@ -76,8 +76,8 @@ CRITICAL RULES:
    - Concepts are strictly composed of `title`, `aliases`, and `description`. Do not extract relations or separate entities.
 3. FACTS ARE COMPLETE SENTENCES:
    - ALL technical facts, numbers, bounds, parameters, tool mentions, and findings MUST be complete sentences inside concept descriptions.
-4. AUDIT FEEDBACK HINTS:
-   - If AUDIT FEEDBACK is provided below, prioritize extracting all missing concepts and missing facts listed in that audit.
+4. SELF-AUDIT FACTUAL GAPS:
+   - Perform an objective comparison between the raw chunk and existing concepts. If a metric, parameter, or concept was missed, output a patch.
 
 THINKING PROCESS (SANDBOXED):
 - If you need to analyze the text, plan missing concepts, or deliberate on updates, you MUST do so strictly inside `<think>...</think>` tags at the very beginning of your response.
@@ -281,22 +281,6 @@ class WikiSecondPassPipeline:
                 missing_or_invalid.append(f"{key} ({type(exc).__name__}: {exc})")
                 continue
 
-            # Check if audit verification log exists for extra guidance
-            verification_file = chunk_dir / "verification.json"
-            audit_feedback = None
-            if not getattr(self.args, "ignore_audit_feedback", False) and verification_file.exists():
-                try:
-                    with open(verification_file, "r", encoding="utf-8") as f:
-                        vf_data = json.load(f)
-                        if not vf_data.get("is_sufficient", True):
-                            audit_feedback = {
-                                "missing_concepts": vf_data.get("missing_concepts", []),
-                                "missing_facts": vf_data.get("missing_facts", []),
-                                "critique": vf_data.get("critique", "")
-                            }
-                except Exception:
-                    pass
-
             items.append({
                 "doc_id": doc_id,
                 "chunk_id": chunk_id,
@@ -305,7 +289,6 @@ class WikiSecondPassPipeline:
                 "context_before": chunk_data.get("context_before", ""),
                 "context_after": chunk_data.get("context_after", ""),
                 "pass1_concepts": pass1_concepts.get("concepts", []) if isinstance(pass1_concepts, dict) else (pass1_concepts if isinstance(pass1_concepts, list) else []),
-                "audit_feedback": audit_feedback,
                 "chunk_dir": chunk_dir
             })
 
@@ -320,28 +303,8 @@ class WikiSecondPassPipeline:
 
     async def extract_pass2_refinement(self, client, item: Dict[str, Any],
                                        server_index: int) -> Pass2ExtractionSchema:
-        """Queries the LLM for second-pass deltas and missing facts.
-
-        Raises on any unusable response so ServerPool can classify it and apply
-        the retry ladder. Unlike Pass 1, token-limit truncation is raised as a
-        plain ValueError here, so it stays retryable on another server - that is
-        the behaviour this stage has always had. Manual client rotation per
-        attempt is gone because the pool re-dispatches to a healthy server.
-        """
+        """Queries the LLM for second-pass deltas and missing facts."""
         key = item["key"]
-        audit_str = ""
-        if item["audit_feedback"]:
-            missing_c = "\n  - ".join(item['audit_feedback'].get('missing_concepts', [])) or "None"
-            missing_f = "\n  - ".join(item['audit_feedback'].get('missing_facts', [])) or "None"
-            audit_str = f"""
-AUDIT FEEDBACK (PREVIOUS VERIFICATION FOUND OMISSIONS):
-- Missing Concepts:
-  - {missing_c}
-- Missing Facts/Metrics:
-  - {missing_f}
-- Auditor Critique: {item['audit_feedback'].get('critique', '')}
-"""
-
         pass1_lines = []
         concepts_list = item["pass1_concepts"]
         if isinstance(concepts_list, dict):
@@ -374,9 +337,11 @@ CONTEXT AFTER:
 
 EXISTING EXTRACTED CONCEPTS (PASS 1):
 {pass1_text}
-{audit_str}
 
-Output refinement patch updates in XML format using <new_concept> and <update_concept>. If you need to think, do so strictly inside <think>...</think>.
+Compare the CURRENT CHUNK against EXISTING EXTRACTED CONCEPTS.
+If any primary concepts were missed, output them as <new_concept>.
+If any quantitative metrics, bounds, or key facts were missed from existing concepts, output <update_concept> with the exact factual sentences to append.
+If the existing extraction is already factually complete, output nothing.
 """
         raw_text = None
         finish_reason = None
@@ -630,16 +595,11 @@ Output refinement patch updates in XML format using <new_concept> and <update_co
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
 def main():
-    """Parse the command line and run Pass 2 refinement.
-
-    Returns:
-        None."""
+    """Parse the command line and run Pass 2 refinement."""
     parser = build_parser(
         stage=STAGE,
         description="Second-Pass Concept Extraction & Patching Pipeline",
         include_resume=True)
-    parser.add_argument("--ignore_audit_feedback", action="store_true",
-                        help="Do not read existing Pass 1 verification files for refinement hints.")
     args = parser.parse_args()
     pipeline = WikiSecondPassPipeline(args)
     asyncio.run(pipeline.run())

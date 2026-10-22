@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from .atomic_io import atomic_write_json, read_json
 
-PASS1_RESULT = "verification.json"
+PASS1_RESULT = "verification_pass1.json"
 PASS2_RESULT = "verification_pass2.json"
 PASS1_LABEL = "PASS 1 (raw extraction)"
 PASS2_LABEL = "PASS 2 (after refinement)"
@@ -62,7 +62,8 @@ class VerificationMetrics:
 
 
 def collect_metrics(staging_dir: Path, *, label: str,
-                    result_filename: str = PASS1_RESULT) -> VerificationMetrics:
+                    result_filename: str = PASS1_RESULT,
+                    target_keys: Optional[set] = None) -> VerificationMetrics:
     """Aggregate every per-chunk verification result under ``staging_dir``."""
     metrics = VerificationMetrics(label=label, result_filename=result_filename)
     scores: List[float] = []
@@ -74,9 +75,22 @@ def collect_metrics(staging_dir: Path, *, label: str,
         return metrics
 
     for chunk_dir in sorted(staging_dir.glob("*/*")):
+        key = f"{chunk_dir.parent.name}::{chunk_dir.name}"
+        if target_keys is not None and key not in target_keys:
+            continue
+
         result_file = chunk_dir / result_filename
         if not result_file.is_file():
-            continue
+            # Legacy fallback for pass 1
+            if result_filename == "verification_pass1.json":
+                legacy_file = chunk_dir / "verification.json"
+                if legacy_file.is_file():
+                    result_file = legacy_file
+                else:
+                    continue
+            else:
+                continue
+
         data = read_json(result_file, default=None)
         if not isinstance(data, dict) or "coverage_score" not in data:
             continue

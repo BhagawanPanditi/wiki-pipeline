@@ -176,10 +176,9 @@ class WikiVerifierPipeline:
         self.staging_dir = self.base_wiki_dir / "staging"
         self.cache_dir = self.base_wiki_dir / "cache"
 
-        # Phase-specific outputs: phase 2 must not overwrite phase 1, because
-        # Pass 2 consumes phase 1's missing_concepts / missing_facts.
+        # Phase-specific outputs: phase 2 must not overwrite phase 1
         self.result_filename = PASS1_RESULT if self.phase == 1 else PASS2_RESULT
-        log_name = "verification_log.json" if self.phase == 1 else "verification_pass2_log.json"
+        log_name = "verification_pass1_log.json" if self.phase == 1 else "verification_pass2_log.json"
         debug_stage = self.stage  # log/<stage>.debug.jsonl: one file per phase
         self.verification_log_file = self.base_wiki_dir / log_name
 
@@ -201,7 +200,7 @@ class WikiVerifierPipeline:
 
     # ── item preparation ───────────────────────────────────────────────────
     def prepare_verification_items(self) -> List[Dict[str, Any]]:
-        """Collect chunks whose extracted concepts are present and parseable."""
+        """Collect chunks whose extracted concepts are present and parseable, with deterministic sampling."""
         chunks_map = load_cached_chunks(self.cache_dir)
 
         print("Locating extracted concepts in staging directory...")
@@ -233,8 +232,6 @@ class WikiVerifierPipeline:
                 try:
                     with result_file.open("r", encoding="utf-8") as f:
                         prior = json.load(f)
-                    # Re-audit previously checkpointed results if they would
-                    # fail today's schema (including runaway/contradictory lists).
                     VerificationResult.model_validate(prior)
                 except Exception:
                     self.checkpoint.mark(key, False)
@@ -255,7 +252,22 @@ class WikiVerifierPipeline:
                 f"Examples: {missing_extractions[:10]}. Complete {stage_hint} before verification."
             )
 
-        print(f"Found {len(verification_items)} extracted chunks ready for verification.")
+        # Deterministic sorting so sampling is identical between Phase 1 and Phase 2
+        verification_items.sort(key=lambda x: x["key"])
+
+        sample_size = getattr(self.args, "sample_size", 50)
+        seed = getattr(self.args, "seed", 42)
+        total_found = len(verification_items)
+        if sample_size and sample_size > 0 and total_found > sample_size:
+            import random
+            rng = random.Random(seed)
+            sampled = rng.sample(verification_items, sample_size)
+            sampled_keys = {item["key"] for item in sampled}
+            verification_items = [item for item in verification_items if item["key"] in sampled_keys]
+            print(f"Sampled {len(verification_items)} random chunks for audit (seed={seed}, total available: {total_found}).")
+        else:
+            print(f"Found {len(verification_items)} extracted chunks ready for verification.")
+
         return verification_items
 
     def format_concepts_for_prompt(self, concepts_json_raw: str) -> str:
@@ -480,9 +492,13 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
 
     # ── reporting ──────────────────────────────────────────────────────────
     def generate_summary_report(self) -> None:
-        """Print both runs and, for phase 2, the measured improvement."""
+        """Print both runs and, for phase 2, the measured improvement on the evaluated sample."""
+        items = self.prepare_verification_items()
+        target_keys = {i["key"] for i in items}
+
         before = collect_metrics(self.staging_dir, label=PASS1_LABEL,
-                                 result_filename=PASS1_RESULT)
+                                 result_filename=PASS1_RESULT,
+                                 target_keys=target_keys)
         print("\n" + format_report(self.domain, before) + "\n")
 
         if self.phase == 1:
@@ -492,7 +508,8 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
             return
 
         after = collect_metrics(self.staging_dir, label=PASS2_LABEL,
-                                result_filename=PASS2_RESULT)
+                                result_filename=PASS2_RESULT,
+                                target_keys=target_keys)
         print(format_report(self.domain, after) + "\n")
 
         if before.total_chunks == 0 or after.total_chunks == 0:
@@ -595,6 +612,10 @@ def main():
     parser.add_argument("--phase", type=int, default=1, choices=(1, 2),
                         help="1 = audit raw Pass 1 output (default); "
                              "2 = re-audit after Pass 2 and report the improvement.")
+    parser.add_argument("--sample_size", type=int, default=50,
+                        help="Number of random chunks to audit (default: 50; set 0 to audit all chunks).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for deterministic chunk sampling across phases (default: 42).")
     args = parser.parse_args()
 
     verifier = WikiVerifierPipeline(args)

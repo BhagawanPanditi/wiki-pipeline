@@ -65,7 +65,7 @@ If a chunk hits the token ceiling (`finish_reason == "length"`), the extractor s
 
 ### Stage 2: Audit Verification (`verify_extraction.py --phase 1`)
 
-Audits the raw extracted concepts against the original source chunk to evaluate coverage and find omissions.
+Audits a deterministic random sample (default **50 chunks** with fixed seed `--seed 42`, or custom via `--sample_size`) to evaluate factual completeness before refinement.
 
 #### XML Output Format:
 ```xml
@@ -88,21 +88,23 @@ Audits the raw extracted concepts against the original source chunk to evaluate 
 </verification>
 ```
 
-The output is saved as `staging/<doc>/<chunk>/verification.json` for consumption by the refinement pass.
+The output is saved as `staging/<doc>/<chunk>/verification_pass1.json`.
 
 ---
 
-### Stage 3: Second-Pass Refinement (`refine_concepts.py`)
+### Stage 3: Second-Pass Self-Auditing Refinement (`refine_concepts.py`)
 
-Consumes the raw chunk, Pass 1 concepts, and audit verification feedback to patch omissions.
-- Creates brand-new concepts via `<new_concept>`.
-- Patches existing concepts with newly discovered facts via `<update_concept>`.
-- Backs up original Pass 1 output to `concepts_pass1_backup.json`.
+A pure, self-auditing second pass that does **not** rely on verification files:
+- Directly compares the raw chunk against Pass 1 concepts.
+- Creates brand-new concepts via `<new_concept>` if major themes were missed.
+- Patches existing concepts with newly discovered facts/metrics via `<update_concept>`.
+- If the extraction is already complete, it emits nothing (near-zero token cost).
+- Safely backs up original Pass 1 concepts to `concepts_pass1_backup.json`.
 
 #### XML Patch Format:
 ```xml
 <think>
-[Refinement planning addressing audit feedback]
+[Refinement planning addressing omissions]
 </think>
 <new_concept>
 <title>Monozygotic Twins</title>
@@ -121,7 +123,23 @@ Consumes the raw chunk, Pass 1 concepts, and audit verification feedback to patc
 
 ### Stage 4: Second-Pass Verification (`verify_extraction.py --phase 2`)
 
-Re-audits the refined chunks and writes `verification_summary.json`, displaying an automated before/after quality improvement report.
+Re-audits the **exact same 50 sampled chunks** (via the same seed) and saves results to `verification_pass2.json`.
+It displays an automated before/after quality improvement delta table and persists `verification_summary.json`:
+
+```text
+============================================================
+VERIFICATION IMPROVEMENT [BIOLOGY]  PASS 1 -> PASS 2
+============================================================
+Chunks Compared       : 50
+Metric                     Before     After         Delta
+------------------------------------------------------------
+Average Coverage            0.871     0.963        +0.092
+Pass Rate (%)                78.0%     96.0%       +18.0p
+Sufficient Chunks              39        48            +9
+Missed Concepts                18         3           -15  -83.3%
+Missed Facts                   42         7           -35  -83.3%
+============================================================
+```
 
 ---
 
