@@ -2,13 +2,19 @@
 """
 Final Knowledge Graph Consolidation, Island Health Audit & Markdown Wiki Export
 --------------------------------------------------------------------------------
-Combines:
-1. Macro Alphabetical Scan: Evaluates concepts grouped by initial character (A-Z, 0-9) to detect remaining duplicates/links.
-2. Deep Verification: Confirms candidate actions (MERGE, LINK, PRUNE, KEEP_SEPARATE) using Briefs and vital Entities.
-3. Graph Harmonization: Absorbs merged concepts, normalizes bidirectional relations, removes pruned noise.
-4. Island Health Audit: Computes connected components, giant component coverage, and writes `islands_report.json`.
-5. Markdown Wiki Export: Compiles every concept into clean, cited Markdown files in `concepts_md/<title>.md` + `concept_index.md`.
-Fast execution, strict CLI / config.json parameter resolution, pure XML prompts, no disk debug logs.
+1. Alphabetical Candidate Scan: Groups concepts with high character/token overlap.
+2. Parallel LLM Decision: Evaluates candidate pairs in parallel across cluster (MERGE, LINK, PRUNE, KEEP).
+3. Sequential Execution Phase:
+   - PRUNE executed first: Drops noise/boilerplate nodes.
+   - MERGE executed second:
+       * Unified DisjointSet maps aliases/titles into single canonical root.
+       * Provenance sources concatenated & deduplicated.
+       * Descriptions merged with unique sentence preservation.
+       * Most comprehensive brief selected.
+       * Relations remapped to new canonical targets with SELF-LOOPS removed.
+   - LINK executed third: Adds bidirectional relations with Jaccard tracking.
+4. Island Health Audit: Computes connected components, giant component size & coverage %, writes `islands_report.json`.
+5. Markdown Wiki Export: Compiles into `concepts_md/<title>.md` (with Jaccard similarity displayed in relations) + `concept_index.md`.
 """
 
 import asyncio
@@ -78,7 +84,6 @@ def parse_xml_final_action(text: str) -> FinalActionVerdict:
     reason_m = re.search(r"<reason>(.*?)</reason>", clean_text, re.DOTALL | re.IGNORECASE)
     reason = reason_m.group(1).strip() if reason_m else ""
 
-    # JSON fallback
     if action == "KEEP_SEPARATE" and "{" in clean_text:
         try:
             m = re.search(r"\{.*\}", clean_text, re.DOTALL)
@@ -92,7 +97,7 @@ def parse_xml_final_action(text: str) -> FinalActionVerdict:
 
     return FinalActionVerdict(action=action, primary_title=primary, reason=reason)
 
-# ── UnionFind Data Structure ──────────────────────────────────────────────────
+# ── DisjointSet ───────────────────────────────────────────────────────────────
 
 class DisjointSet:
     def __init__(self):
@@ -163,7 +168,6 @@ class FinalConsolidationPipeline:
             for i in range(len(sorted_b) - 1):
                 c1, c2 = sorted_b[i], sorted_b[i + 1]
                 t1, t2 = c1["title"].lower(), c2["title"].lower()
-                # Check for shared prefixes or high token overlap
                 words1 = set(t1.split())
                 words2 = set(t2.split())
                 overlap = words1 & words2
@@ -175,14 +179,8 @@ class FinalConsolidationPipeline:
 
         print(f"Alphabetical scan identified {len(candidate_pairs)} candidate pair(s) for deep verification.")
 
-        # 2. Deep Verification via LLM
-        uf = DisjointSet()
-        for c in concepts:
-            uf.find(c["title"])
-
-        verified_merges = 0
-        new_links = 0
-        pruned_titles: Set[str] = set()
+        # 2. Parallel LLM Decisions (Cluster Execution)
+        decisions: List[Tuple[Tuple[Dict[str, Any], Dict[str, Any]], FinalActionVerdict]] = []
 
         if candidate_pairs and not getattr(self.args, "skip_deep_verify", False):
             pool = pool_for_stage(self.args, self.settings, DEEP_STAGE)
@@ -229,16 +227,7 @@ class FinalConsolidationPipeline:
                 return parse_xml_final_action(raw_text)
 
             async def on_verdict(pair: Tuple[Dict[str, Any], Dict[str, Any]], res: FinalActionVerdict):
-                nonlocal verified_merges, new_links
-                c1, c2 = pair
-                if res.action == "MERGE":
-                    uf.union(c1["title"], c2["title"])
-                    verified_merges += 1
-                elif res.action == "LINK":
-                    # Add bidirectional relation
-                    new_links += 1
-                elif res.action == "PRUNE":
-                    pruned_titles.add(c2["title"])
+                decisions.append((pair, res))
 
             async with pool:
                 await pool.map(
@@ -251,14 +240,41 @@ class FinalConsolidationPipeline:
                     on_result=on_verdict,
                 )
 
-            print(f"Deep verification results: {verified_merges} merges approved, {pruned_titles} pruned.")
+        # 3. Sequential Deterministic Application: PRUNE -> MERGE -> LINK
+        pruned_titles: Set[str] = set()
+        merge_uf = DisjointSet()
+        for c in concepts:
+            merge_uf.find(c["title"])
 
-        # 3. Fuse Merged Concepts & Apply Pruning
+        additional_links: List[Tuple[str, str]] = []
+
+        # (A) Collect PRUNE
+        for (c1, c2), verdict in decisions:
+            if verdict.action == "PRUNE":
+                # Prune candidate with shorter description
+                victim = c2["title"] if len(c2.get("description", "")) <= len(c1.get("description", "")) else c1["title"]
+                pruned_titles.add(victim)
+
+        # (B) Collect MERGE
+        verified_merges = 0
+        for (c1, c2), verdict in decisions:
+            if verdict.action == "MERGE" and c1["title"] not in pruned_titles and c2["title"] not in pruned_titles:
+                merge_uf.union(c1["title"], c2["title"])
+                verified_merges += 1
+
+        # (C) Collect LINK
+        for (c1, c2), verdict in decisions:
+            if verdict.action == "LINK" and c1["title"] not in pruned_titles and c2["title"] not in pruned_titles:
+                additional_links.append((c1["title"], c2["title"]))
+
+        print(f"Decisions collected: {len(pruned_titles)} pruned, {verified_merges} merged, {len(additional_links)} linked.")
+
+        # 4. Group by Canonical Root
         grouped_concepts: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for c in concepts:
             if c["title"] in pruned_titles:
                 continue
-            root = uf.find(c["title"])
+            root = merge_uf.find(c["title"])
             grouped_concepts[root].append(c)
 
         final_concepts: List[Dict[str, Any]] = []
@@ -272,47 +288,139 @@ class FinalConsolidationPipeline:
             merged_aliases = set()
             merged_entities = set()
             merged_chunks = set()
+            seen_sentences = set()
+            description_sentences = []
             briefs = []
-            descriptions = []
 
             for c in group:
                 merged_aliases.add(c["title"])
                 for a in c.get("aliases", []):
-                    merged_aliases.add(a)
+                    if a.strip():
+                        merged_aliases.add(a.strip())
                 for ent in c.get("entities", []):
-                    merged_entities.add(ent)
+                    if ent.strip():
+                        merged_entities.add(ent.strip())
                 for sc in c.get("source_chunks", []):
-                    merged_chunks.add(sc)
+                    if sc.strip():
+                        merged_chunks.add(sc.strip())
+
                 if c.get("brief"):
                     briefs.append(c["brief"])
-                if c.get("description"):
-                    descriptions.append(c["description"])
+
+                # De-duplicate sentences across chunk descriptions
+                desc = c.get("description", "").strip()
+                if desc:
+                    for sent in re.split(r'(?<=[.!?])\s+', desc):
+                        s_clean = sent.strip()
+                        if s_clean and s_clean.lower() not in seen_sentences:
+                            seen_sentences.add(s_clean.lower())
+                            description_sentences.append(s_clean)
 
             merged_aliases.discard(chosen_title)
-            final_brief = briefs[0] if briefs else ""
-            final_desc = "\n\n".join(dict.fromkeys(descriptions))
+            # Pick longest / most complete brief
+            chosen_brief = max(briefs, key=len) if briefs else ""
+            fused_desc = " ".join(description_sentences)
+
+            # Collect raw outbound relations
+            raw_relations = []
+            for c in group:
+                raw_relations.extend(c.get("outbound_relations", []))
 
             final_concepts.append({
                 "title": chosen_title,
-                "brief": final_brief,
+                "brief": chosen_brief,
                 "aliases": sorted(list(merged_aliases)),
                 "entities": sorted(list(merged_entities)),
-                "description": final_desc,
+                "description": fused_desc,
                 "source_chunks": sorted(list(merged_chunks)),
-                "outbound_relations": group[0].get("outbound_relations", [])
+                "_raw_relations": raw_relations,
             })
+
+        # Canonical title lookup
+        concept_by_name = {c["title"].lower(): c for c in final_concepts}
+
+        # 5. Remap Outbound Relations & REMOVE SELF-LOOPS
+        print("Remapping relations and removing self-loops...")
+        for c in final_concepts:
+            current_title = c["title"]
+            fused_relations: Dict[str, Dict[str, Any]] = {}
+
+            for rel in c.get("_raw_relations", []):
+                tgt_raw = rel.get("target_concept", "").strip()
+                if not tgt_raw:
+                    continue
+                root_tgt = merge_uf.find(tgt_raw)
+                canonical_target = canonical_title_map.get(root_tgt, tgt_raw)
+
+                # FORBID SELF-LOOPS
+                if canonical_target.lower() == current_title.lower():
+                    continue
+
+                # FORBID PRUNED TARGETS
+                if canonical_target in pruned_titles or canonical_target.lower() not in concept_by_name:
+                    continue
+
+                if canonical_target not in fused_relations:
+                    fused_relations[canonical_target] = {
+                        "target_concept": canonical_target,
+                        "relation": rel.get("relation", ""),
+                        "jaccard_similarity": rel.get("jaccard_similarity"),
+                        "shared_entities": rel.get("shared_entities", []),
+                        "source_chunks": list(rel.get("source_chunks", []))
+                    }
+                else:
+                    # Merge relation text if complementary
+                    existing_text = fused_relations[canonical_target]["relation"]
+                    new_text = rel.get("relation", "")
+                    if new_text and new_text not in existing_text:
+                        fused_relations[canonical_target]["relation"] = f"{existing_text} {new_text}".strip()
+                    # Keep highest jaccard score
+                    j1 = fused_relations[canonical_target].get("jaccard_similarity") or 0.0
+                    j2 = rel.get("jaccard_similarity") or 0.0
+                    if j2 > j1:
+                        fused_relations[canonical_target]["jaccard_similarity"] = j2
+
+            c["outbound_relations"] = list(fused_relations.values())
+            del c["_raw_relations"]
+
+        # Apply Additional Verified Links
+        for t1, t2 in additional_links:
+            root1 = canonical_title_map.get(merge_uf.find(t1), t1)
+            root2 = canonical_title_map.get(merge_uf.find(t2), t2)
+            if root1.lower() != root2.lower() and root1.lower() in concept_by_name and root2.lower() in concept_by_name:
+                c1_obj = concept_by_name[root1.lower()]
+                c2_obj = concept_by_name[root2.lower()]
+                targets1 = {r["target_concept"].lower() for r in c1_obj["outbound_relations"]}
+                targets2 = {r["target_concept"].lower() for r in c2_obj["outbound_relations"]}
+
+                if root2.lower() not in targets1:
+                    c1_obj["outbound_relations"].append({
+                        "target_concept": root2,
+                        "relation": "Functionally related in technical domain context.",
+                        "jaccard_similarity": None,
+                        "shared_entities": [],
+                        "source_chunks": []
+                    })
+                if root1.lower() not in targets2:
+                    c2_obj["outbound_relations"].append({
+                        "target_concept": root1,
+                        "relation": "Functionally related in technical domain context.",
+                        "jaccard_similarity": None,
+                        "shared_entities": [],
+                        "source_chunks": []
+                    })
 
         print(f"Total surviving concepts after final merge & pruning: {len(final_concepts)}")
         atomic_write_json(self.global_concepts_file, {"concepts": final_concepts})
 
-        # 4. Island Health Audit (Connected Components & Giant Component)
+        # 6. Island Health Audit (Connected Components & Giant Component)
         print("Analyzing knowledge graph topology & islands...")
         G = nx.Graph()
         for c in final_concepts:
             G.add_node(c["title"])
             for rel in c.get("outbound_relations", []):
                 tgt = rel.get("target_concept", "").strip()
-                if tgt and tgt in canonical_title_map.values():
+                if tgt and tgt in [con["title"] for con in final_concepts]:
                     G.add_edge(c["title"], tgt)
 
         components = list(nx.connected_components(G))
@@ -330,7 +438,7 @@ class FinalConsolidationPipeline:
         }
         atomic_write_json(self.islands_file, islands_summary)
 
-        # 5. Compile and Export Markdown Wiki
+        # 7. Compile and Export Markdown Wiki
         print(f"Exporting Markdown Wiki to {self.md_dir}...")
         self.md_dir.mkdir(parents=True, exist_ok=True)
 
@@ -363,7 +471,7 @@ class FinalConsolidationPipeline:
                     tgt = rel.get("target_concept", "")
                     r_text = rel.get("relation", "")
                     jacc = rel.get("jaccard_similarity")
-                    jacc_str = f" *(Jaccard: {jacc})*" if jacc is not None else ""
+                    jacc_str = f" *(Jaccard similarity: {jacc})*" if jacc is not None else ""
                     md_content.append(f"- **[[{tgt}]]**: {r_text}{jacc_str}")
                 md_content.append("")
 
