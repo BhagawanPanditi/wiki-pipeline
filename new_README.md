@@ -42,6 +42,10 @@ flowchart TD
     DocConsolidate --> DocOut["consolidated/<doc>/concepts.json"]
     DocOut --> GlobalConsolidate["Stage 6: consolidate_global.py"]
     GlobalConsolidate --> GlobalOut["global_concepts.json & concepts/<title>.json"]
+    GlobalOut --> Stage7["Stage 7: write_briefs_and_entities.py"]
+    Stage7 --> Stage8["Stage 8: link_entities_jaccard.py"]
+    Stage8 --> Stage9["Stage 9: final_consolidation.py"]
+    Stage9 --> Wiki["concepts_md/*.md & concept_index.md"]
 ```
 
 ---
@@ -199,6 +203,33 @@ Fuses duplicate concepts **across the entire document corpus**.
 
 ---
 
+### Stage 7: Brief & Important Entities (`write_briefs_and_entities.py`)
+
+Generates a concise brief (<5 lines, ~40-60 words) and extracts domain-vital entities in **ONE** LLM call per concept:
+- **Brief**: Pure factual definition and primary technical mechanism.
+- **Important Entities**: Vital genes, proteins, chemicals, tools, algorithms, or diseases (generic nouns strictly excluded).
+- Uses pure XML `<brief>` and `<entities>`.
+
+---
+
+### Stage 8: Jaccard Semantic Linking (`link_entities_jaccard.py`)
+
+Establishes reciprocal bidirectional relations using Jaccard entity overlap:
+- Fast, 100% deterministic, zero LLM calls.
+- Calculates Jaccard similarity: `|E_A ∩ E_B| / |E_A ∪ E_B|`.
+- Records `jaccard_similarity` and `shared_entities` directly on each relation edge.
+
+---
+
+### Stage 9: Final Consolidation & Wiki Export (`final_consolidation.py`)
+
+Performs whole-graph synthesis, quality verification, and exports the final Wiki:
+- Alphabetical macro-scan for candidates + LLM deep verification (`MERGE`, `LINK`, `PRUNE`).
+- Calculates graph topology and island health, outputting `islands_report.json`.
+- Compiles the entire knowledge graph into clean Markdown pages (`concepts_md/*.md`) and `concept_index.md`.
+
+---
+
 ## 3. Configuration & Server Setup
 
 Execution parameters are defined in `config.json` at the repository root:
@@ -284,6 +315,29 @@ python3 consolidate_global.py \
   --disable_thinking
 ```
 
+### Step 7: Generate Briefs & Vital Entities (Stage 7)
+```bash
+python3 write_briefs_and_entities.py \
+  --wiki_path "/path/to/wiki/biology" \
+  --disable_thinking
+```
+
+### Step 8: Establish Semantic Links via Jaccard Overlap (Stage 8)
+```bash
+python3 link_entities_jaccard.py \
+  --wiki_path "/path/to/wiki/biology" \
+  --min_shared_entities 2 \
+  --min_jaccard 0.15 \
+  --max_links_per_node 4
+```
+
+### Step 9: Final Consolidation, Island Audit & Wiki Export (Stage 9)
+```bash
+python3 final_consolidation.py \
+  --wiki_path "/path/to/wiki/biology" \
+  --disable_thinking
+```
+
 ---
 
 ## 5. Resuming Interrupted Runs
@@ -296,4 +350,5 @@ python3 verify_extraction.py --wiki_path "/path/to/wiki/biology" --phase 1 --res
 python3 refine_concepts.py --wiki_path "/path/to/wiki/biology" --resume
 python3 verify_extraction.py --wiki_path "/path/to/wiki/biology" --phase 2 --resume
 python3 consolidate_documents.py --wiki_path "/path/to/wiki/biology" --resume
+python3 write_briefs_and_entities.py --wiki_path "/path/to/wiki/biology" --resume
 ```
