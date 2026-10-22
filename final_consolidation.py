@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 from utils.atomic_io import atomic_write_json, atomic_write_text, sanitize_filename
+from utils.checkpoint import load_json_log, save_log_sync
 from utils.citation_utils import clean_chunk_citations
 from utils.cli import build_parser, resolve_settings
 from utils.llm_pool import pool_for_stage
@@ -75,6 +76,108 @@ def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "
         bar = "█" * int(pct / 2)
         print(f"{label:<20} {c_count:<15} {pct:>5.1f}%   {bar}")
     print(f"============================================================\n")
+
+def format_yaml_frontmatter(title: str, brief: str, aliases: List[str], entities: List[str]) -> str:
+    """Format robust YAML frontmatter with title, brief, aliases, and key entities."""
+    lines = ["---"]
+    lines.append(f"title: {json.dumps(title, ensure_ascii=False)}")
+    lines.append(f"brief: {json.dumps(brief, ensure_ascii=False)}")
+    if aliases:
+        lines.append("aliases:")
+        for a in aliases:
+            lines.append(f"  - {json.dumps(a, ensure_ascii=False)}")
+    else:
+        lines.append("aliases: []")
+    if entities:
+        lines.append("key_entities:")
+        for e in entities:
+            lines.append(f"  - {json.dumps(e, ensure_ascii=False)}")
+    else:
+        lines.append("key_entities: []")
+    lines.append("---\n")
+    return "\n".join(lines)
+
+# ── XML System Prompt for Alphabet Macro Scan ─────────────────────────────────
+
+SYSTEM_PROMPT_MACRO_SCAN = """\
+You are an expert technical knowledge graph consolidator auditing concepts starting with a specific letter or group.
+You are provided with an indexed list of concept titles: "[ID] Title".
+
+TASK:
+Examine the list and identify:
+1. "merge_pairs": Pairs of IDs that represent the SAME concept or near-duplicates:
+   - Alternative spellings (e.g. diarrheal vs diarrhoeal).
+   - Formatting / hyphenation / spacing splits (e.g. cholodnywent vs cholodny went).
+   - High phrasing overlap or minor word variations (e.g. study authors vs study authorship).
+   - Generic methodology/demographics splits.
+2. "link_pairs": Pairs of IDs that are distinct topics or serialized parts, but MUST have direct reciprocal links:
+   - Serialized volumes or numbers (e.g. Vol 1 vs Vol 2, UVA I vs UVA II).
+   - Parent vs sub-category topics (e.g. Tooth Extraction vs Tooth Extraction Indications).
+3. "prune_ids": List of single IDs that are confirmed web scraping junk, site disclaimers, cookie notices, or completely out-of-domain fragments.
+
+OUTPUT FORMAT:
+<think>
+[Brief analysis]
+</think>
+<macro_candidates>
+  <merge_pairs>
+    <pair><id_a>1</id_a><id_b>5</id_b></pair>
+  </merge_pairs>
+  <link_pairs>
+    <pair><id_a>2</id_a><id_b>8</id_b></pair>
+  </link_pairs>
+  <prune_ids>
+    <id>15</id>
+  </prune_ids>
+</macro_candidates>
+"""
+
+class MacroScanResult(BaseModel):
+    merge_pairs: List[Tuple[int, int]] = []
+    link_pairs: List[Tuple[int, int]] = []
+    prune_ids: List[int] = []
+
+def parse_macro_scan(text: str) -> MacroScanResult:
+    if not text:
+        return MacroScanResult()
+
+    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
+    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
+
+    res = MacroScanResult()
+
+    mp_block = re.search(r"<merge_pairs>(.*?)</merge_pairs>", clean_text, re.DOTALL | re.IGNORECASE)
+    if mp_block:
+        for pair_m in re.finditer(r"<pair>\s*<id_a>(\d+)</id_a>\s*<id_b>(\d+)</id_b>\s*</pair>", mp_block.group(1), re.IGNORECASE):
+            res.merge_pairs.append((int(pair_m.group(1)), int(pair_m.group(2))))
+
+    lp_block = re.search(r"<link_pairs>(.*?)</link_pairs>", clean_text, re.DOTALL | re.IGNORECASE)
+    if lp_block:
+        for pair_m in re.finditer(r"<pair>\s*<id_a>(\d+)</id_a>\s*<id_b>(\d+)</id_b>\s*</pair>", lp_block.group(1), re.IGNORECASE):
+            res.link_pairs.append((int(pair_m.group(1)), int(pair_m.group(2))))
+
+    pr_block = re.search(r"<prune_ids>(.*?)</prune_ids>", clean_text, re.DOTALL | re.IGNORECASE)
+    if pr_block:
+        for id_m in re.finditer(r"<id>(\d+)</id>", pr_block.group(1), re.IGNORECASE):
+            res.prune_ids.append(int(id_m.group(1)))
+
+    if not res.merge_pairs and not res.link_pairs and not res.prune_ids and "{" in clean_text:
+        try:
+            m = re.search(r"\{.*\}", clean_text, re.DOTALL)
+            if m:
+                payload = json.loads(m.group(0))
+                for p in payload.get("merge_pairs", []):
+                    if len(p) == 2:
+                        res.merge_pairs.append((int(p[0]), int(p[1])))
+                for p in payload.get("link_pairs", []):
+                    if len(p) == 2:
+                        res.link_pairs.append((int(p[0]), int(p[1])))
+                for pid in payload.get("prune_ids", []):
+                    res.prune_ids.append(int(pid))
+        except Exception:
+            pass
+
+    return res
 
 # ── XML System Prompt for Deep Verification ───────────────────────────────────
 
@@ -173,9 +276,11 @@ class FinalConsolidationPipeline:
 
         self.wiki_path = Path(wiki_path)
         self.global_concepts_file = self.wiki_path / "global_concepts.json"
+        self.pre_consolidation_backup = self.wiki_path / "global_concepts_pre_consolidation.json"
         self.md_dir = self.wiki_path / "concepts_md"
         self.islands_file = self.wiki_path / "islands_report.json"
-        self.settings = resolve_settings(args, STAGE)
+        self.macro_settings = resolve_settings(args, STAGE)
+        self.deep_settings = resolve_settings(args, DEEP_STAGE)
 
         if not self.global_concepts_file.exists():
             raise FileNotFoundError(f"Missing {self.global_concepts_file}. Run Stage 7 & 8 first.")
@@ -191,7 +296,14 @@ class FinalConsolidationPipeline:
 
         print(f"Loaded {len(concepts)} concepts for final consolidation.")
 
-        # 1. Alphabetical Macro-Scan for candidates
+        # Safety backup of pre-consolidation graph
+        if not self.pre_consolidation_backup.exists():
+            print(f"Saving pre-consolidation safety backup to {self.pre_consolidation_backup}...")
+            atomic_write_json(self.pre_consolidation_backup, {"concepts": concepts})
+
+        concept_by_name = {c["title"].lower(): c for c in concepts}
+
+        # Alphabetical Partitioning
         alpha_buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for c in concepts:
             t = c.get("title", "").strip()
@@ -201,9 +313,11 @@ class FinalConsolidationPipeline:
             bucket_key = first_char if first_char.isalpha() else "#"
             alpha_buckets[bucket_key].append(c)
 
-        candidate_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-        seen_pairs: Set[Tuple[str, str]] = set()
+        # ── PASS 1: ALPHABETICAL MACRO SCAN ─────────────────────────────────
+        candidate_pair_keys: Set[Tuple[str, str]] = set()
+        prune_candidate_titles: Set[str] = set()
 
+        # A) In-memory word overlap candidates (guaranteed recall on high title overlap)
         for bucket, b_concepts in alpha_buckets.items():
             sorted_b = sorted(b_concepts, key=lambda x: x["title"].lower())
             for i in range(len(sorted_b) - 1):
@@ -213,73 +327,204 @@ class FinalConsolidationPipeline:
                 words2 = set(t2.split())
                 overlap = words1 & words2
                 if len(overlap) >= 1 and (len(overlap) / max(len(words1), len(words2))) >= 0.5:
-                    pk = tuple(sorted([c1["title"], c2["title"]]))
-                    if pk not in seen_pairs:
-                        seen_pairs.add(pk)
-                        candidate_pairs.append((c1, c2))
+                    candidate_pair_keys.add(tuple(sorted([c1["title"], c2["title"]])))
 
-        print(f"Alphabetical scan identified {len(candidate_pairs)} candidate pair(s) for deep verification.")
+        # B) LLM Alphabetical Macro Scan
+        if not getattr(self.args, "skip_macro_scan", False):
+            batches = []
+            for letter in sorted(alpha_buckets.keys()):
+                group = sorted(alpha_buckets[letter], key=lambda c: c["title"].lower().strip())
+                if len(group) <= 120:
+                    batches.append({"label": f"Letter '{letter}'", "concepts": group})
+                else:
+                    chunk_size = 100
+                    overlap = 20
+                    stride = chunk_size - overlap
+                    for part_idx, i in enumerate(range(0, len(group), stride), 1):
+                        sub_part = group[i:i + chunk_size]
+                        batches.append({"label": f"Letter '{letter}' (Part {part_idx})", "concepts": sub_part})
+                        if i + chunk_size >= len(group):
+                            break
 
-        # 2. Parallel LLM Decisions (Cluster Execution)
+            macro_log_file = self.wiki_path / "macro_scan_log.json"
+            macro_checkpoint = load_json_log(macro_log_file) if getattr(self.args, "resume", False) else {}
+            pending_batches = [b for b in batches if b["label"] not in macro_checkpoint]
+
+            print(f"\n[PASS 1: MACRO SCAN] {len(batches)} alphabetical batches | Pending LLM scan: {len(pending_batches)}")
+
+            if pending_batches:
+                macro_pool = pool_for_stage(self.args, self.macro_settings, STAGE)
+                log_lock = asyncio.Lock()
+
+                async def on_macro_result(item: Dict[str, Any], res: Dict[str, Any]):
+                    async with log_lock:
+                        macro_checkpoint[item["label"]] = res
+                        save_log_sync(macro_log_file, macro_checkpoint)
+
+                async def run_macro_batch(client: Any, item: Dict[str, Any], server_index: int) -> Dict[str, Any]:
+                    batch_c = item["concepts"]
+                    id_to_t = {idx + 1: c["title"] for idx, c in enumerate(batch_c)}
+                    indexed_str = "\n".join([f"[{idx + 1}] {c['title']}" for idx, c in enumerate(batch_c)])
+                    prompt = (
+                        f"AUDITING LETTER GROUP: {item['label']}\n\n"
+                        f"Indexed Titles:\n{indexed_str}\n"
+                    )
+                    extra_body: Dict[str, Any] = {}
+                    model_kwargs: Dict[str, Any] = {}
+                    if getattr(self.args, "disable_thinking", False):
+                        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+                        model_kwargs = {
+                            "temperature": 0.2,
+                            "top_p": 0.90,
+                            "extra_body": extra_body,
+                        }
+                    else:
+                        model_kwargs = {"temperature": 0.0}
+
+                    resp = await client.chat.completions.create(
+                        model=self.macro_settings.model_name,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT_MACRO_SCAN},
+                            {"role": "user", "content": prompt}
+                        ],
+                        max_tokens=self.macro_settings.max_tokens or 4096,
+                        **model_kwargs
+                    )
+                    raw_text = resp.choices[0].message.content or ""
+                    parsed = parse_macro_scan(raw_text)
+
+                    merge_pairs = []
+                    for ida, idb in parsed.merge_pairs:
+                        if ida in id_to_t and idb in id_to_t:
+                            merge_pairs.append([id_to_t[ida], id_to_t[idb]])
+                    link_pairs = []
+                    for ida, idb in parsed.link_pairs:
+                        if ida in id_to_t and idb in id_to_t:
+                            link_pairs.append([id_to_t[ida], id_to_t[idb]])
+                    prune_titles = [id_to_t[pid] for pid in parsed.prune_ids if pid in id_to_t]
+
+                    return {
+                        "merge_pairs": merge_pairs,
+                        "link_pairs": link_pairs,
+                        "prune_titles": prune_titles
+                    }
+
+                try:
+                    async with macro_pool:
+                        await macro_pool.map(
+                            pending_batches,
+                            run_macro_batch,
+                            attempts=self.macro_settings.attempts,
+                            desc="Macro Scanning Alphabetical Batches",
+                            key_fn=lambda b: b["label"],
+                            on_result=on_macro_result
+                        )
+                finally:
+                    save_log_sync(macro_log_file, macro_checkpoint)
+
+            # Ingest candidates from macro checkpoint
+            for b_label, res in macro_checkpoint.items():
+                for t1, t2 in res.get("merge_pairs", []):
+                    if t1.lower() in concept_by_name and t2.lower() in concept_by_name and t1.lower() != t2.lower():
+                        candidate_pair_keys.add(tuple(sorted([t1, t2])))
+                for t1, t2 in res.get("link_pairs", []):
+                    if t1.lower() in concept_by_name and t2.lower() in concept_by_name and t1.lower() != t2.lower():
+                        candidate_pair_keys.add(tuple(sorted([t1, t2])))
+                for pt in res.get("prune_titles", []):
+                    if pt.lower() in concept_by_name:
+                        prune_candidate_titles.add(pt)
+
+        # Build Candidate Pairs list
+        candidate_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for t1, t2 in candidate_pair_keys:
+            if t1.lower() in concept_by_name and t2.lower() in concept_by_name:
+                candidate_pairs.append((concept_by_name[t1.lower()], concept_by_name[t2.lower()]))
+
+        print(f"\nDiscovered {len(candidate_pairs)} candidate pair(s) and {len(prune_candidate_titles)} prune candidate(s) for deep verification.")
+
+        # ── PASS 2: DEEP VERIFICATION ─────────────────────────────────────────
         decisions: List[Tuple[Tuple[Dict[str, Any], Dict[str, Any]], FinalActionVerdict]] = []
 
         if candidate_pairs and not getattr(self.args, "skip_deep_verify", False):
-            pool = pool_for_stage(self.args, self.settings, DEEP_STAGE)
+            deep_log_file = self.wiki_path / "deep_verify_log.json"
+            deep_checkpoint = load_json_log(deep_log_file) if getattr(self.args, "resume", False) else {}
 
-            async def verify_pair(client: Any, pair: Tuple[Dict[str, Any], Dict[str, Any]], server_index: int) -> FinalActionVerdict:
-                c1, c2 = pair
-                c1_brief = c1.get("brief", "") or c1.get("description", "")[:200]
-                c2_brief = c2.get("brief", "") or c2.get("description", "")[:200]
-                c1_ents = ", ".join(c1.get("entities", [])[:6]) or "None"
-                c2_ents = ", ".join(c2.get("entities", [])[:6]) or "None"
+            pending_pairs = [
+                pair for pair in candidate_pairs
+                if ":::".join(sorted([pair[0]["title"], pair[1]["title"]])) not in deep_checkpoint
+            ]
 
-                prompt = (
-                    f"CONCEPT 1: \"{c1.get('title')}\"\n"
-                    f"  Brief: {c1_brief}\n"
-                    f"  Key Entities: {c1_ents}\n\n"
-                    f"CONCEPT 2: \"{c2.get('title')}\"\n"
-                    f"  Brief: {c2_brief}\n"
-                    f"  Key Entities: {c2_ents}\n"
-                )
+            print(f"[PASS 2: DEEP VERIFICATION] Total pairs: {len(candidate_pairs)} | Pending: {len(pending_pairs)}")
 
-                extra_body: Dict[str, Any] = {}
-                model_kwargs: Dict[str, Any] = {}
-                if getattr(self.args, "disable_thinking", False):
-                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-                    model_kwargs = {
-                        "temperature": 0.7,
-                        "top_p": 0.80,
-                        "presence_penalty": 1.5,
-                        "extra_body": extra_body,
-                    }
-                else:
-                    model_kwargs = {"temperature": 0.0}
+            if pending_pairs:
+                deep_pool = pool_for_stage(self.args, self.deep_settings, DEEP_STAGE)
+                deep_lock = asyncio.Lock()
 
-                response = await client.chat.completions.create(
-                    model=self.settings.model_name,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT_DEEP_VERIFY},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=self.settings.max_tokens or 1000,
-                    **model_kwargs
-                )
-                raw_text = response.choices[0].message.content or ""
-                return parse_xml_final_action(raw_text)
+                async def on_verdict(item: Tuple[Dict[str, Any], Dict[str, Any]], verdict: FinalActionVerdict):
+                    pk = ":::".join(sorted([item[0]["title"], item[1]["title"]]))
+                    async with deep_lock:
+                        deep_checkpoint[pk] = verdict.model_dump()
+                        save_log_sync(deep_log_file, deep_checkpoint)
 
-            async def on_verdict(pair: Tuple[Dict[str, Any], Dict[str, Any]], res: FinalActionVerdict):
-                decisions.append((pair, res))
+                async def verify_pair(client: Any, pair: Tuple[Dict[str, Any], Dict[str, Any]], server_index: int) -> FinalActionVerdict:
+                    c1, c2 = pair
+                    c1_brief = c1.get("brief", "") or c1.get("description", "")[:200]
+                    c2_brief = c2.get("brief", "") or c2.get("description", "")[:200]
+                    c1_ents = ", ".join(c1.get("entities", [])[:6]) or "None"
+                    c2_ents = ", ".join(c2.get("entities", [])[:6]) or "None"
 
-            async with pool:
-                await pool.map(
-                    candidate_pairs,
-                    verify_pair,
-                    attempts=self.settings.attempts,
-                    desc="Deep Verifying Candidate Pairs",
-                    budget=None,
-                    attempt_timeout=self.settings.profile.attempt_timeout,
-                    on_result=on_verdict,
-                )
+                    prompt = (
+                        f"CONCEPT 1: \"{c1.get('title')}\"\n"
+                        f"  Brief: {c1_brief}\n"
+                        f"  Key Entities: {c1_ents}\n\n"
+                        f"CONCEPT 2: \"{c2.get('title')}\"\n"
+                        f"  Brief: {c2_brief}\n"
+                        f"  Key Entities: {c2_ents}\n"
+                    )
+
+                    extra_body: Dict[str, Any] = {}
+                    model_kwargs: Dict[str, Any] = {}
+                    if getattr(self.args, "disable_thinking", False):
+                        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+                        model_kwargs = {
+                            "temperature": 0.7,
+                            "top_p": 0.80,
+                            "presence_penalty": 1.5,
+                            "extra_body": extra_body,
+                        }
+                    else:
+                        model_kwargs = {"temperature": 0.0}
+
+                    response = await client.chat.completions.create(
+                        model=self.deep_settings.model_name,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT_DEEP_VERIFY},
+                            {"role": "user", "content": prompt}
+                        ],
+                        max_tokens=self.deep_settings.max_tokens or 1000,
+                        **model_kwargs
+                    )
+                    raw_text = response.choices[0].message.content or ""
+                    return parse_xml_final_action(raw_text)
+
+                try:
+                    async with deep_pool:
+                        await deep_pool.map(
+                            pending_pairs,
+                            verify_pair,
+                            attempts=self.deep_settings.attempts,
+                            desc="Deep Verifying Candidate Pairs",
+                            key_fn=lambda p: f"{p[0].get('title')} vs {p[1].get('title')}",
+                            on_result=on_verdict,
+                        )
+                finally:
+                    save_log_sync(deep_log_file, deep_checkpoint)
+
+            # Reconstruct decisions list from deep_checkpoint
+            for pair in candidate_pairs:
+                pk = ":::".join(sorted([pair[0]["title"], pair[1]["title"]]))
+                if pk in deep_checkpoint:
+                    decisions.append((pair, FinalActionVerdict(**deep_checkpoint[pk])))
 
         # 3. Sequential Deterministic Application: PRUNE -> MERGE -> LINK
         pruned_titles: Set[str] = set()
@@ -551,13 +796,16 @@ class FinalConsolidationPipeline:
             safe_name = sanitize_filename(title) or "unnamed_concept"
             md_path = self.md_dir / f"{safe_name}.md"
 
-            md_content = [f"# {title}\n"]
-            if aliases:
-                md_content.append(f"**Aliases**: {aliases}\n")
+            frontmatter_str = format_yaml_frontmatter(
+                title=title,
+                brief=brief,
+                aliases=c.get("aliases", []),
+                entities=c.get("entities", [])[:15]
+            )
+
+            md_content = [frontmatter_str, f"# {title}\n"]
             if brief:
                 md_content.append(f"> **Overview**: {brief}\n")
-            if entities:
-                md_content.append(f"**Key Entities**: {entities}\n")
 
             md_content.append("## Description\n")
             md_content.append(f"{desc}\n")
@@ -604,6 +852,8 @@ class FinalConsolidationPipeline:
 
 def main():
     parser = build_parser(stage=STAGE, description="Final knowledge graph consolidation, island audit and markdown wiki export", include_resume=True)
+    parser.add_argument("--skip_macro_scan", action="store_true",
+                        help="Skip LLM alphabetical macro scan and use fast in-memory candidate scan.")
     parser.add_argument("--skip_deep_verify", action="store_true",
                         help="Skip LLM deep verification and export current graph.")
     parser.add_argument("--max_primary_links", type=int, default=15,
