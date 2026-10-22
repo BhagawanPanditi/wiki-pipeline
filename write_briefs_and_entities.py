@@ -134,7 +134,10 @@ class BriefAndEntitiesPipeline:
             )
 
         self.concepts_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint = load_bool_log(self.log_file, corrupt_message="Log corrupted. Initializing fresh.")
+        if getattr(args, "resume", False):
+            self.checkpoint = load_bool_log(self.log_file, corrupt_message="Log corrupted. Initializing fresh.")
+        else:
+            self.checkpoint = {}
         self.settings = resolve_settings(args, STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
         self.flush_count = 0
