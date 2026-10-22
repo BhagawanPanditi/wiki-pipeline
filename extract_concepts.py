@@ -71,18 +71,27 @@ Output each concept using XML tags matching this exact structure:
 <description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all raw quantitative metrics, parameter bounds, specific findings, and detailed statements from this chunk.</description>
 </concept>
 
-If no substantive concepts exist in the chunk, output nothing.
+STRICT OUTPUT DISCIPLINE:
+- Start your response IMMEDIATELY with the first `<concept>` tag.
+- Absolutely NO thinking, reasoning, chain-of-thought, drafting notes, scratchpads, preambles, or postambles.
+- Output ONLY pure `<concept>...</concept>` blocks and nothing else.
+- If no substantive concepts exist in the chunk, output nothing.
 """
 
 # ── XML Parsing Helper ────────────────────────────────────────────────────────
 
 def parse_xml_concepts(text: str) -> List[Concept]:
-    """Parse all completed <concept>...</concept> blocks from raw LLM output."""
+    """Parse all completed <concept>...</concept> blocks from raw LLM output, resilient to CoT/thinking artifacts."""
     if not text:
         return []
 
+    # 1. Strip thinking tags emitted by reasoning models
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL | re.IGNORECASE)
+
     concepts = []
-    blocks = re.findall(r"<concept>(.*?)</concept>", text, re.DOTALL | re.IGNORECASE)
+    # 2. Match non-nested <concept> blocks (ensures any outer scratchpad or drafting <concept> is skipped)
+    blocks = re.findall(r"<concept>((?:(?!<concept>).)*?)</concept>", text, re.DOTALL | re.IGNORECASE)
     for block in blocks:
         title_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
         if not title_m:
@@ -93,6 +102,13 @@ def parse_xml_concepts(text: str) -> List[Concept]:
 
         desc_m = re.search(r"<description>(.*?)</description>", block, re.DOTALL | re.IGNORECASE)
         description = desc_m.group(1).strip() if desc_m else ""
+
+        # 3. Clean up in case description contains residual nested tags
+        if "<concept>" in description or "<title>" in description:
+            inner_desc_m = re.findall(r"<description>(.*?)(?:</description>|$)", description, re.DOTALL | re.IGNORECASE)
+            if inner_desc_m:
+                description = inner_desc_m[-1].strip()
+            description = re.sub(r"<.*?>", "", description).strip()
 
         aliases = []
         aliases_m = re.search(r"<aliases>(.*?)</aliases>", block, re.DOTALL | re.IGNORECASE)
@@ -292,6 +308,8 @@ CURRENT CHUNK:
 
 CONTEXT AFTER:
 {chunk_data['context_after']}
+
+Extract the substantive concepts from CURRENT CHUNK now. Output pure XML starting immediately with <concept>. Do not output any thinking or commentary.
 """
         response = await client.chat.completions.create(
             model=self.settings.model_name,
@@ -334,7 +352,7 @@ ALREADY COMPLETED CONCEPTS:
 TASK:
 Continue extracting for the rest of the CURRENT CHUNK.
 Start by providing the complete <concept> block for {cut_off_desc}, then continue extracting any remaining concepts from the CURRENT CHUNK.
-Output in the exact same <concept>...</concept> XML format.
+Output in the exact same <concept>...</concept> XML format starting immediately with <concept>. Do not output any thinking or commentary.
 """
             # Valid prefix of prior response up to last completed concept
             assistant_content = raw_text[:last_close_idx + len("</concept>")] if last_close_idx != -1 else raw_text
