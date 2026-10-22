@@ -13,6 +13,7 @@ between concepts that share vital named entities:
 - Fast, 100% deterministic, zero LLM calls, zero debug logging.
 """
 
+import asyncio
 import json
 import re
 from collections import defaultdict
@@ -23,9 +24,40 @@ import networkx as nx
 from tqdm import tqdm
 
 from utils.atomic_io import atomic_write_json, sanitize_filename
-from utils.cli import build_parser
+from utils.checkpoint import load_json_log, save_log_sync
+from utils.cli import build_parser, resolve_settings
+from utils.llm_pool import pool_for_stage
 
 STAGE = "link-entities"
+
+SYSTEM_PROMPT_RELATION_SYNTHESIS = """\
+You are an expert technical knowledge graph specialist.
+Given two domain concepts with their titles, briefs, and key shared entities, explain their precise domain relationship in 1-2 dense, informative sentences.
+
+GUIDELINES:
+- Clearly explain how Concept 1 and Concept 2 functionally, structurally, or causally interact or relate in the domain.
+- Draw directly upon both concept briefs and their shared context.
+- Keep the description to 1-2 concise, high-density sentences.
+- Absolutely NO generic meta-phrases like "Concept 1 and Concept 2 are related because...". State the direct technical relationship.
+
+OUTPUT FORMAT:
+<think>
+[Brief reasoning]
+</think>
+<relation>
+Exact concise relationship description.
+</relation>
+"""
+
+def parse_xml_relation(text: str) -> str:
+    if not text:
+        return ""
+    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
+    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
+    rel_m = re.search(r"<relation>(.*?)</relation>", clean_text, re.DOTALL | re.IGNORECASE)
+    if rel_m:
+        return rel_m.group(1).strip()
+    return clean_text.strip().strip('"').strip("'")
 
 def normalize_entity(ent: str) -> str:
     """Normalize entity text with robust lemmatization for matching."""
@@ -81,7 +113,8 @@ def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "
         print(f"{label:<20} {c_count:<15} {pct:>5.1f}%   {bar}")
     print(f"============================================================\n")
 
-def enrich_graph_via_jaccard(
+async def enrich_graph_via_jaccard(
+    args: Any,
     wiki_path: Path,
     min_shared_entities: int = 1,
     min_jaccard: float = 0.05,
@@ -173,10 +206,6 @@ def enrich_graph_via_jaccard(
         union_len = len(set1 | set2)
         jaccard = len(shared) / union_len if union_len > 0 else 0.0
 
-        # Qualifying criteria:
-        # A) Multiple shared entities (>= min_shared_entities)
-        # B) High Jaccard similarity score (>= min_jaccard)
-        # C) Single shared entity IF the entity is domain-specific (frequency <= specific_entity_threshold)
         qualifies = False
         if len(shared) >= 2 or jaccard >= min_jaccard:
             qualifies = True
@@ -250,6 +279,117 @@ def enrich_graph_via_jaccard(
         )
         c["outbound_relations"] = existing_relations
 
+    # 3. LLM Relation Description Synthesis
+    pairs_to_synthesize: Dict[str, Dict[str, Any]] = {}
+    for c in concepts:
+        t1 = c["title"]
+        b1 = c.get("brief", "") or c.get("description", "")[:250]
+        for rel in c.get("outbound_relations", []):
+            t2 = rel.get("target_concept", "")
+            if not t2 or t2.lower() == t1.lower() or t2 not in concept_by_title:
+                continue
+            r_text = rel.get("relation", "")
+            if not r_text or "Functionally related via" in r_text or r_text.startswith("Functionally related"):
+                pk = ":::".join(sorted([t1, t2]))
+                if pk not in pairs_to_synthesize:
+                    b2 = concept_by_title[t2].get("brief", "") or concept_by_title[t2].get("description", "")[:250]
+                    pairs_to_synthesize[pk] = {
+                        "concept_1": t1,
+                        "brief_1": b1,
+                        "concept_2": t2,
+                        "brief_2": b2,
+                        "shared_entities": rel.get("shared_entities", []),
+                        "pair_key": pk
+                    }
+
+    if pairs_to_synthesize and not getattr(args, "skip_llm_descriptions", False):
+        log_file = wiki_path / "link_relations_log.json"
+        checkpoint: Dict[str, Any] = {}
+        if getattr(args, "resume", False):
+            checkpoint = load_json_log(log_file, corrupt_message="Link relations log corrupted. Initializing fresh.")
+
+        pending_pairs = [p for pk, p in pairs_to_synthesize.items() if pk not in checkpoint or not checkpoint[pk]]
+        print(f"\nIdentified {len(pairs_to_synthesize)} unique semantic relationship edge(s) across the graph.")
+        print(f"Pending LLM relation synthesis: {len(pending_pairs)} (already completed: {len(pairs_to_synthesize) - len(pending_pairs)})")
+
+        if pending_pairs:
+            settings = resolve_settings(args, STAGE)
+            print(f"Distributing across {len(settings.servers)} server(s) for LLM relationship synthesis...")
+            pool = pool_for_stage(args, settings, STAGE)
+
+            flush_counter = 0
+            log_lock = asyncio.Lock()
+
+            async def on_relation_result(item: Dict[str, Any], res: str):
+                nonlocal flush_counter
+                pk = item["pair_key"]
+                async with log_lock:
+                    checkpoint[pk] = res
+                    flush_counter += 1
+                    if flush_counter >= 20:
+                        save_log_sync(log_file, checkpoint)
+                        flush_counter = 0
+
+            async def generate_relation(client: Any, item: Dict[str, Any], server_index: int) -> str:
+                ents_str = ", ".join(item["shared_entities"][:8]) if item["shared_entities"] else "Domain context"
+                prompt = (
+                    f"CONCEPT 1: \"{item['concept_1']}\"\n"
+                    f"Brief: {item['brief_1']}\n\n"
+                    f"CONCEPT 2: \"{item['concept_2']}\"\n"
+                    f"Brief: {item['brief_2']}\n\n"
+                    f"SHARED KEY ENTITIES: {ents_str}\n"
+                )
+                extra_body: Dict[str, Any] = {}
+                model_kwargs: Dict[str, Any] = {}
+                if getattr(args, "disable_thinking", False):
+                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+                    model_kwargs = {
+                        "temperature": 0.7,
+                        "top_p": 0.80,
+                        "presence_penalty": 1.5,
+                        "extra_body": extra_body,
+                    }
+                else:
+                    model_kwargs = {"temperature": 0.0}
+
+                response = await client.chat.completions.create(
+                    model=settings.model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT_RELATION_SYNTHESIS},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=settings.max_tokens or 256,
+                    **model_kwargs
+                )
+                raw_text = response.choices[0].message.content or ""
+                parsed = parse_xml_relation(raw_text)
+                return parsed if parsed else f"Functionally related in context of {ents_str}."
+
+            try:
+                async with pool:
+                    await pool.map(
+                        pending_pairs,
+                        generate_relation,
+                        attempts=settings.attempts,
+                        desc="Synthesizing LLM Relations",
+                        key_fn=lambda p: p["pair_key"],
+                        on_result=on_relation_result,
+                    )
+            finally:
+                save_log_sync(log_file, checkpoint)
+
+        # Apply rich synthesized relations back to graph
+        applied_count = 0
+        for c in concepts:
+            t1 = c["title"]
+            for rel in c.get("outbound_relations", []):
+                t2 = rel.get("target_concept", "")
+                pk = ":::".join(sorted([t1, t2]))
+                if pk in checkpoint and checkpoint[pk]:
+                    rel["relation"] = checkpoint[pk]
+                    applied_count += 1
+        print(f"Applied LLM relationship descriptions to {applied_count} reciprocal directed relations.")
+
     # Final Link Distribution
     print_link_distribution(concepts, title_label="STAGE 8: AFTER JACCARD LINKING")
 
@@ -297,6 +437,8 @@ def main():
                         help="Max concepts sharing an entity before treating it as an ultra-generic hub.")
     parser.add_argument("--specific_entity_threshold", type=int, default=50,
                         help="Max concepts sharing an entity for 1 shared entity to trigger a link.")
+    parser.add_argument("--skip_llm_descriptions", action="store_true",
+                        help="Skip LLM relationship description generation and keep template text.")
     parser.add_argument("--dry_run", action="store_true",
                         help="Simulate without modifying files.")
 
@@ -305,14 +447,15 @@ def main():
     if not wiki_path:
         raise ValueError("Missing required --wiki_path argument.")
 
-    enrich_graph_via_jaccard(
+    asyncio.run(enrich_graph_via_jaccard(
+        args=args,
         wiki_path=Path(wiki_path),
         min_shared_entities=args.min_shared_entities,
         min_jaccard=args.min_jaccard,
         max_hub_threshold=args.max_hub_threshold,
         specific_entity_threshold=args.specific_entity_threshold,
         dry_run=args.dry_run
-    )
+    ))
 
 if __name__ == "__main__":
     main()
