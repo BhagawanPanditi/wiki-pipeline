@@ -236,9 +236,27 @@ class BriefAndEntitiesPipeline:
 
         save_log_sync(self.log_file, self.checkpoint)
 
+        # Merge in-memory concepts with individual files from concepts/ to ensure 100% data integrity
+        print(f"Assembling enriched concepts from {self.concepts_dir}...")
+        assembled_concepts = []
+        for c in concepts:
+            safe_name = sanitize_filename(c.get("title", "")) or "unnamed_concept"
+            c_file = self.concepts_dir / f"{safe_name}.json"
+            if c_file.exists():
+                try:
+                    with open(c_file, "r", encoding="utf-8") as cf:
+                        disk_data = json.load(cf)
+                        if "brief" in disk_data:
+                            c["brief"] = disk_data["brief"]
+                        if "entities" in disk_data:
+                            c["entities"] = disk_data["entities"]
+                except Exception:
+                    pass
+            assembled_concepts.append(c)
+
         # Overwrite global_concepts.json with enriched briefs and entities
         print(f"Updating {self.global_concepts_file} with briefs and entities...")
-        atomic_write_json(self.global_concepts_file, {"concepts": concepts})
+        atomic_write_json(self.global_concepts_file, {"concepts": assembled_concepts})
 
         print("\n============================================================")
         print("STAGE 7: BRIEF & IMPORTANT ENTITIES EXTRACTION COMPLETE")
