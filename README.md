@@ -212,21 +212,27 @@ Generates a concise brief (<5 lines, ~40-60 words) and extracts domain-vital ent
 
 ---
 
-### Stage 8: Jaccard Semantic Linking (`link_entities_jaccard.py`)
+### Stage 8: Jaccard Semantic Linking & LLM Relation Synthesis (`link_entities_jaccard.py`)
 
-Establishes reciprocal bidirectional relations using Jaccard entity overlap:
-- Fast, 100% deterministic, zero LLM calls.
-- Calculates Jaccard similarity: `|E_A ∩ E_B| / |E_A ∪ E_B|`.
-- Records `jaccard_similarity` and `shared_entities` directly on each relation edge.
+Establishes reciprocal bidirectional relations using Jaccard entity overlap and contextual relationship synthesis:
+- Calculates Jaccard entity similarity: `|E_A ∩ E_B| / |E_A ∪ E_B|`.
+- Contextual LLM Relation Synthesis: When candidate links are identified, cluster endpoints synthesize a concise 1-sentence technical explanation of *how* and *why* the concepts interact based on their concept briefs and shared entities.
+- Reciprocal Links: Guarantees 100% bidirectional symmetry (if A links to B, B links to A).
+- Records `jaccard_similarity`, `shared_entities`, and the LLM synthesized `relation` directly on each relation edge.
+- Visualizes connectivity via dynamic terminal histograms across link ranges.
 
 ---
 
-### Stage 9: Final Consolidation & Wiki Export (`final_consolidation.py`)
+### Stage 9: Final Consolidation & Hybrid Frontmatter Wiki Export (`final_consolidation.py`)
 
 Performs whole-graph synthesis, quality verification, and exports the final Wiki:
-- Alphabetical macro-scan for candidates + LLM deep verification (`MERGE`, `LINK`, `PRUNE`).
-- Calculates graph topology and island health, outputting `islands_report.json`.
-- Compiles the entire knowledge graph into clean Markdown pages (`concepts_md/*.md`) and `concept_index.md`.
+- **Two-Pass Architecture**:
+  - **Pass 1 (Macro Alphabetical Scan)**: High-throughput sliding-window LLM scan across lexicographically adjacent concepts to detect duplicate variants, misnomers, and semantic pairs.
+  - **Pass 2 (Deep Verification)**: Full context evaluation with concept briefs and key entities to produce definitive verdicts (`MERGE`, `LINK`, `PRUNE`).
+- **Graph Topology & Health**: Audits island components, graph connectivity, and exports `islands_report.json`.
+- **Hybrid YAML Frontmatter Wiki Export**:
+  - Generates rich Markdown documents with structured metadata in YAML frontmatter (`title`, `brief`, `aliases`, `key_entities`) followed by human/agent-readable narrative markdown (`# Title`, `> **Overview**:`, `## Description`, `## Related Concepts`).
+  - Perfect for agentic embedding-based workflows, quick metadata retrieval, and graph traversal.
 
 ---
 
