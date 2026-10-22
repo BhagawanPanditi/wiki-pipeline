@@ -17,6 +17,7 @@ is down.
 """
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
@@ -354,24 +355,7 @@ class ServerPool:
                     is attached. ``retry_async`` decides whether that is retryable."""
                 self._served[server_index] += 1
                 attempts_made["n"] += 1
-                # Publish the item identity so the wrapped client can attribute
-                # this request without the handler threading it through.
-                token = CURRENT_CALL.set({
-                    "item": key, "index": index, "server": url,
-                    "server_index": server_index, "attempt": attempts_made["n"],
-                })
-                try:
-                    return await handler(client, item, server_index)
-                except Exception as exc:
-                    # The transport may have succeeded while the stage rejected
-                    # the body (bad JSON, schema mismatch, truncation). Record
-                    # that separately, or --llm_log errors would stay silent
-                    # about the most common failure in this pipeline.
-                    if self.llm_log is not None:
-                        self.llm_log.rejection(server=url, error=exc)
-                    raise
-                finally:
-                    CURRENT_CALL.reset(token)
+                return await handler(client, item, server_index)
 
             try:
                 value = await retry_async(
