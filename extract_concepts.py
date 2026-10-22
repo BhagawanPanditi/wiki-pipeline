@@ -415,6 +415,7 @@ Output in the exact same <concept>...</concept> XML format.
         all_chunks = self.prepare_chunks()
         pending_chunks = [c for c in all_chunks if not self.chunk_is_complete(c)]
 
+        settings = self.settings
         pool = ServerPool(
             settings.servers,
             concurrency_per_server=settings.concurrency_per_server,
