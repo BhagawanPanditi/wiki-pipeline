@@ -34,23 +34,6 @@ from typing import Any, Dict, List, Tuple
 
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 
-DEFAULT_SERVERS = [
-    "http://cn27-a40:8000/v1",
-    "http://cn30-a40:8001/v1",
-    "http://cn31-a40:8002/v1"
-]
-# Fallback only. Every stage resolves its own default from STAGE_PROFILES,
-# because sustainable fan-out depends on that stage's max_tokens.
-DEFAULT_CONCURRENCY = 50
-DEFAULT_MODEL = "Qwen/Qwen3.8-27B"
-
-# Where runs are written and where legacy corpora are read when the command line
-# does not say otherwise. These are the cluster locations. On any other machine,
-# pass --wiki-base-dir and --data-dir, or set WIKI_BASE_DIR and DATA_DIR for
-# run_pipeline.sh.
-DEFAULT_WIKI_BASE_DIR = "/home/compiling-ganesh/24m0829/long_document/wiki"
-DEFAULT_DATA_DIR = "/home/compiling-ganesh/24m0829/long_document/data/long_documents"
-
 
 def _read_config() -> Dict[str, Any]:
     """Return the parsed config.json, or an empty mapping when there is no file.
@@ -82,25 +65,18 @@ _warned_config_keys: set = set()
 
 
 def load_global_config() -> Tuple[List[str], str]:
-    """Return the server list and model name that every stage uses.
-
-    Each value comes from config.json when the file sets it, and from the built-in
-    default otherwise. A top-level ``concurrency_per_server`` is not read: each
-    stage's concurrency comes from its profile and from ``stage_concurrency``. When
-    that key is present, a warning is printed once so that it is not ignored silently.
+    """Return the server list and model name from config.json.
 
     Returns:
-        ``(servers, model_name)``.
+        (servers, model_name) loaded from config.json.
 
     Raises:
-        ValueError: If config.json exists but cannot be parsed (see ``_read_config``).
+        ValueError: If config.json is missing or unreadable.
     """
     data = _read_config()
-    if "concurrency_per_server" in data and "concurrency_per_server" not in _warned_config_keys:
-        _warned_config_keys.add("concurrency_per_server")
-        print("WARNING: config.json 'concurrency_per_server' is no longer used. Set "
-              "'stage_concurrency' per stage instead (see the README).", file=sys.stderr)
-    return data.get("servers", DEFAULT_SERVERS), data.get("model_name", DEFAULT_MODEL)
+    servers = data.get("servers") or []
+    model = data.get("model_name") or data.get("model") or ""
+    return servers, model
 
 
 def load_stage_overrides() -> Dict[str, Any]:

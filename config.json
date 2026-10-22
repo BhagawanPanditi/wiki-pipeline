@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "http://cn13-dgx:8000/v1": 64,
+    "http://cn43-l40:8005/v1": 32,
+    "http://cn35-a40:8002/v1": 24,
+    "http://cn26-a40:8000/v1": 20,
+    "http://cn26-a40:8001/v1": 20
+  },
+  "model_name": "Qwen/Qwen3.8-27B",
+  "concurrency_per_server": 32,
+  "max_tokens": 16000,
+  "request_timeout": 2400.0
+}

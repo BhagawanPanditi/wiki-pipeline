@@ -8,7 +8,7 @@
 set -eo pipefail
 
 DOMAIN="robotics"
-SERVER_URL="${1:-http://cn17-dgx:8001/v1}"
+SERVERS=("http://cn12-dgx:8001/v1" "http://cn14-dgx:8000/v1" "http://cn15-dgx:8002/v1" "http://cn41-l40:8002/v1" "http://cn41-l40:8003/v1" "http://cn43-l40:8001/v1" "http://cn45-l40:8000/v1")
 CONCURRENCY=16
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WIKI_BASE_DIR="/home/compiling-ganesh/24m0829/long_document/wiki"
@@ -27,7 +27,6 @@ echo ">>> [1/5] Running Pass 1 Extraction for robotics..."
 python3 "$SCRIPT_DIR/extract_concepts.py" \
   --domain "$DOMAIN" \
   --wiki_base_dir "$WIKI_BASE_DIR" \
-  --servers "$SERVER_URL" \
   --concurrency_per_server "$CONCURRENCY" \
   --max_tokens 16000 \
   --no_failover \
@@ -40,7 +39,6 @@ python3 "$SCRIPT_DIR/verify_extraction.py" \
   --domain "$DOMAIN" \
   --wiki_base_dir "$WIKI_BASE_DIR" \
   --phase 1 \
-  --servers "$SERVER_URL" \
   --concurrency_per_server "$CONCURRENCY" \
   --max_tokens 16000 \
   --no_failover \
@@ -52,9 +50,8 @@ echo ">>> [3/5] Running Pass 2 Refinement for robotics..."
 python3 "$SCRIPT_DIR/refine_concepts.py" \
   --domain "$DOMAIN" \
   --wiki_base_dir "$WIKI_BASE_DIR" \
-  --servers "$SERVER_URL" \
   --concurrency_per_server "$CONCURRENCY" \
-  --max_tokens 16000 \
+  --max_tokens 32000 \
   --stage_budget_minutes 300 \
   --no_failover \
   --resume
@@ -66,7 +63,6 @@ python3 "$SCRIPT_DIR/verify_extraction.py" \
   --domain "$DOMAIN" \
   --wiki_base_dir "$WIKI_BASE_DIR" \
   --phase 2 \
-  --servers "$SERVER_URL" \
   --concurrency_per_server "$CONCURRENCY" \
   --max_tokens 16000 \
   --no_failover \
@@ -78,7 +74,6 @@ echo ">>> [5/5] Running Intra-Document Consolidation for robotics..."
 python3 "$SCRIPT_DIR/consolidate_documents.py" \
   --domain "$DOMAIN" \
   --wiki_base_dir "$WIKI_BASE_DIR" \
-  --servers "$SERVER_URL" \
   --concurrency_per_server "$CONCURRENCY" \
   --max_tokens 16000 \
   --no_failover \

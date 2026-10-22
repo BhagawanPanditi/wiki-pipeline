@@ -31,8 +31,8 @@ ID_FIELDS = ("id", "doc_id", "document_id")
 
 # Chunking defaults. These are part of the cache fingerprint, so changing them
 # invalidates a cached chunking run rather than silently mixing window sizes.
-DEFAULT_CHUNK_SIZE = 4500
-DEFAULT_CHUNK_OVERLAP = 400
+DEFAULT_CHUNK_SIZE = 5000
+DEFAULT_CHUNK_OVERLAP = 500
 
 # Used as the output directory name when no domain hint is supplied.
 DEFAULT_RUN_NAME = "default"
@@ -378,8 +378,10 @@ def build_units(canon_docs: Dict[str, str], tokenizer: Optional[Any], *,
     if chunking and tokenizer is None:
         raise ValueError("Chunking requires a tokenizer; pass one or disable chunking.")
 
+    from tqdm import tqdm
     units: List[Dict[str, Any]] = []
-    for doc_id, content in canon_docs.items():
+    desc = "Tokenizing & chunking documents" if chunking else "Preparing document units"
+    for doc_id, content in tqdm(canon_docs.items(), desc=desc):
         if chunking:
             units.extend(chunk_document(doc_id, content, tokenizer,
                                         chunk_size=chunk_size, overlap=overlap))
@@ -418,44 +420,25 @@ def cache_manifest(source_path: Path, *, tokenizer_name: Optional[str],
 
 
 def resolve_corpus_path(args: Any) -> Path:
-    """Work out which corpus file a stage should read.
-
-    ``--corpus`` wins. Otherwise the historical BRIGHT layout is used:
-    ``<data_dir>/<domain>.jsonl``.
+    """Work out which corpus file a stage should read from --input_path.
 
     Args:
-        args: Parsed CLI namespace, expected to carry ``corpus`` and optionally
-            ``data_dir`` and ``domain``.
+        args: Parsed CLI namespace.
 
     Returns:
         The resolved corpus path.
 
     Raises:
-        CorpusError: If neither an explicit corpus nor a derivable legacy path
-            is available.
+        CorpusError: If --input_path is missing or not a file.
     """
-    corpus = getattr(args, "corpus", None)
-    if corpus:
-        path = Path(corpus)
+    input_path = getattr(args, "input_path", None)
+    if input_path:
+        path = Path(input_path)
         if not path.is_file():
             raise CorpusError(f"Corpus file not found: {path}")
         return path
 
-    data_dir = getattr(args, "data_dir", None)
-    # ``domain_label`` is the hint exactly as supplied. ``args.domain`` cannot be
-    # used here: StageArgumentParser normalises it to "default" when omitted, so
-    # it would silently resolve to a non-existent <data_dir>/default.jsonl
-    # instead of telling the caller what to pass.
-    domain = getattr(args, "domain_label", None) or getattr(args, "domain", None)
-    legacy = Path(data_dir) / f"{domain}.jsonl" if data_dir and domain else None
-    if legacy is not None and legacy.is_file():
-        return legacy
-
-    attempted = f" (also tried {legacy})" if legacy is not None else ""
-    raise CorpusError(
-        "No corpus specified. Pass --corpus /path/to/documents.json (or .jsonl), "
-        "or --data_dir together with --domain for the legacy "
-        f"<data_dir>/<domain>.jsonl layout{attempted}.")
+    raise CorpusError("No corpus specified. Pass --input_path /path/to/documents.json (or .jsonl).")
 
 
 # ── Run configuration ────────────────────────────────────────────────────────

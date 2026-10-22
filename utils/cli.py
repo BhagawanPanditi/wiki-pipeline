@@ -23,8 +23,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from config import (DEFAULT_CONCURRENCY, DEFAULT_DATA_DIR, DEFAULT_WIKI_BASE_DIR,
-                    load_global_config, load_stage_overrides)
+from config import _read_config
 
 from .corpus import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, DEFAULT_RUN_NAME
 
@@ -53,13 +52,13 @@ class StageProfile:
 STAGE_PROFILES: Dict[str, StageProfile] = {
     # ── extraction & refinement (structured concept generation) ────────
     # max_tokens set to 16000, timeouts increased for large chunk batches
-    "extract-concepts":       StageProfile("extract-concepts", 64, 1200.0, 50.0, 16000),
-    "verify-pass1":           StageProfile("verify-pass1", 12, 800.0, 50.0, 16000),
-    "refine-concepts":        StageProfile("refine-concepts", 8, 1200.0, 50.0, 16000),
-    "verify-pass2":           StageProfile("verify-pass2", 12, 800.0, 50.0, 16000),
+    "extract-concepts":       StageProfile("extract-concepts", 64, 2400.0, 50.0, 16000),
+    "verify-pass1":           StageProfile("verify-pass1", 12, 2400.0, 50.0, 16000),
+    "refine-concepts":        StageProfile("refine-concepts", 8, 2400.0, 50.0, 16000),
+    "verify-pass2":           StageProfile("verify-pass2", 12, 2400.0, 50.0, 16000),
 
     # ── document & global consolidation ─────────────────────────────────
-    "consolidate-documents":  StageProfile("consolidate-documents", 8, 1800.0, 30.0, 16000),
+    "consolidate-documents":  StageProfile("consolidate-documents", 8, 4500.0, 30.0, 32000),
     "consolidate-global":     StageProfile("consolidate-global", 8, 800.0, 30.0, 8192),
 
 
@@ -180,67 +179,81 @@ def _warn_unknown_stage_overrides() -> None:
 
 
 def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
-    """Merge the stage profile with config.json overrides and CLI flags.
+    """Resolve runtime settings ONLY from CLI flags or config.json.
 
-    Precedence: explicit CLI flag > config.json stage override > profile
-    default. ``--concurrency_per_server 0`` means "use the stage default",
-    which keeps the flag meaningful now that defaults differ per stage.
+    Precedence: CLI flag > config.json (stage-specific or top-level).
+    There are NO hardcoded python fallbacks; all settings must be explicitly defined.
     """
-    profile = get_profile(stage)
-    _warn_unknown_stage_overrides()
-    stage_override = _stage_override(stage)
-    servers_default, model_default = load_global_config()
+    from config import _read_config
+    cfg = _read_config()
+    stage_cfg = cfg.get("stage_concurrency", {}).get(stage, {}) if isinstance(cfg.get("stage_concurrency"), dict) else {}
+    if not isinstance(stage_cfg, dict):
+        stage_cfg = {"concurrency_per_server": int(stage_cfg)}
 
-    def pick(cli_value: Any, override_key: str, default: Any) -> Any:
-        """Resolve one tunable by precedence.
-
-        Args:
-            cli_value: The value from the command line. ``None`` and ``0`` both mean
-                "not specified", which is what makes ``--concurrency_per_server 0``
-                usable as "give me the stage default".
-            override_key: Key to look for in this stage's ``config.json`` override.
-            default: The profile's built-in value.
-
-        Returns:
-            The first of the three that was actually specified: CLI, then config.json,
-            then the profile default."""
-        if cli_value not in (None, 0):
-            return cli_value
-        if isinstance(stage_override, dict) and override_key in stage_override:
-            return stage_override[override_key]
-        return default
-
-    concurrency = int(pick(getattr(args, "concurrency_per_server", 0),
-                           "concurrency_per_server", profile.concurrency_per_server))
-    attempts = int(pick(getattr(args, "max_attempts", 0), "attempts", profile.attempts))
-    budget = getattr(args, "stage_budget_minutes", None)
-    if budget in (None, 0):
-        budget = stage_override.get("budget_minutes", profile.budget_minutes) if isinstance(
-            stage_override, dict) else profile.budget_minutes
-    max_tokens = getattr(args, "max_tokens", None)
-    if max_tokens in (None, 0):
-        max_tokens = profile.max_tokens
-
-    timeout = float(pick(getattr(args, "request_timeout", 0.0),
-                          "request_timeout", profile.request_timeout))
-    if timeout != profile.request_timeout:
-        profile = StageProfile(
-            key=profile.key,
-            concurrency_per_server=profile.concurrency_per_server,
-            request_timeout=timeout,
-            connect_timeout=profile.connect_timeout,
-            max_tokens=profile.max_tokens,
-            attempts=profile.attempts,
-            budget_minutes=profile.budget_minutes,
+    def get_setting(cli_val: Any, key: str, err_name: str) -> Any:
+        if cli_val not in (None, 0, 0.0, ""):
+            return cli_val
+        if key in stage_cfg:
+            return stage_cfg[key]
+        if key in cfg:
+            return cfg[key]
+        raise ValueError(
+            f"Missing required parameter '{err_name}'! "
+            f"Specify via CLI argument or set '{key}' in config.json."
         )
+
+    # 1. Servers
+    servers = getattr(args, "servers", None) or cfg.get("servers")
+    if not servers:
+        raise ValueError("Missing 'servers'! Specify via --servers or set 'servers' in config.json.")
+
+    # 2. Model
+    model = getattr(args, "model", None) or cfg.get("model_name") or cfg.get("model")
+    if not model:
+        raise ValueError("Missing 'model'! Specify via --model or set 'model_name' in config.json.")
+
+    # 3. Concurrency
+    concurrency = int(get_setting(
+        getattr(args, "concurrency_per_server", None),
+        "concurrency_per_server",
+        "--concurrency_per_server"
+    ))
+
+    # 4. Max Tokens
+    max_tokens = int(get_setting(
+        getattr(args, "max_tokens", None),
+        "max_tokens",
+        "--max_tokens"
+    ))
+
+    # 5. Request Timeout
+    timeout = float(get_setting(
+        getattr(args, "request_timeout", None),
+        "request_timeout",
+        "--request_timeout"
+    ))
+
+    # Optional / Tuning parameters (attempts & budget)
+    attempts = getattr(args, "max_attempts", 0) or stage_cfg.get("attempts") or cfg.get("attempts") or 4
+    budget = getattr(args, "stage_budget_minutes", 0.0) or stage_cfg.get("budget_minutes") or cfg.get("budget_minutes") or 300.0
+
+    profile = StageProfile(
+        key=stage,
+        concurrency_per_server=concurrency,
+        request_timeout=timeout,
+        connect_timeout=30.0,
+        max_tokens=max_tokens,
+        attempts=int(attempts),
+        budget_minutes=float(budget),
+    )
 
     return StageSettings(
         profile=profile,
-        servers=getattr(args, "servers", None) or servers_default,
+        servers=servers,
         concurrency_per_server=max(1, concurrency),
-        model_name=getattr(args, "model_name", None) or model_default,
+        model_name=model,
         max_tokens=max_tokens,
-        attempts=max(1, attempts),
+        attempts=max(1, int(attempts)),
         budget_minutes=float(budget) if budget else None,
     )
 
@@ -256,95 +269,52 @@ def add_common_args(
     include_model: bool = True,
     include_corpus: bool = False,
 ) -> argparse.ArgumentParser:
-    """Attach the argument block shared by every stage script.
-
-    Args:
-        parser: Parser to extend; mutated in place and returned.
-        stage: Stage profile key, used to look up concurrency defaults.
-        description: Shown in ``--help``.
-        include_data_dir: Add the legacy ``--data_dir`` flag.
-        include_max_tokens: Add ``--max_tokens`` (off for stages whose output
-            length is fixed by the prompt).
-        include_resume: Add ``--resume``.
-        include_model: Add ``--model_name`` with a ``--model`` alias.
-        include_corpus: Add ``--corpus`` plus the chunking flags, for the stage
-            that reads the source documents.
-
-    Returns:
-        The same parser, with all requested arguments attached.
-    """
+    """Attach the argument block shared by every stage script."""
     profile = get_profile(stage)
 
-    parser.add_argument("--domain", type=str, default=None,
-                        help="Optional domain hint (e.g. biology, robotics). Names the "
-                             "output folder and, when given, focuses the LLM prompts. "
-                             f"Omit it for an undeclared corpus: outputs go to "
-                             f"'{DEFAULT_RUN_NAME}/' and prompts skip the domain clause.")
-    parser.add_argument("--wiki_base_dir", type=str, default=DEFAULT_WIKI_BASE_DIR,
-                        help="Folder that holds every run. This run writes to "
-                             "<wiki_base_dir>/<domain or 'default'>/. Default: "
-                             f"{DEFAULT_WIKI_BASE_DIR} (the cluster location; on another "
-                             "machine pass your own path).")
+    parser.add_argument("--wiki_path", type=str, default=None,
+                        help="Output folder where wiki data is stored. "
+                             "Directory is created automatically if it does not exist.")
+    parser.add_argument("--input_path", type=str, default=None,
+                        help="Path to input corpus file (.json or .jsonl).")
     parser.add_argument("--llm_log", type=str, choices=("full", "compact", "errors"),
                         default="compact",
                         help="How much of each LLM call to keep in log/<stage>.llm.jsonl. "
-                             "'compact' (default) cuts each prompt message and each reply "
-                             "to 2000 characters and records the true length. 'full' keeps "
-                             "every character. 'errors' keeps failed calls only. Failure "
-                             "details in the debug log are always complete.")
+                             "'compact' (default), 'full', or 'errors'.")
     if include_corpus:
-        parser.add_argument("--corpus", type=str, default=None,
-                            help="Corpus of {id, contents} records: one JSON array (.json) "
-                                 "or one object per line (.jsonl). Replaces the legacy "
-                                 "--data_dir/--domain lookup.")
         chunk_group = parser.add_mutually_exclusive_group()
         chunk_group.add_argument("--chunking", dest="chunking", action="store_true",
                                  default=True,
-                                 help="Split long documents into overlapping token windows "
-                                      "(default). Needs a tokenizer.")
+                                 help="Split long documents into overlapping token windows (default).")
         chunk_group.add_argument("--no-chunking", dest="chunking", action="store_false",
-                                 help="Treat each document as one unit. No tokenizer is "
-                                      "loaded and per-document chunk consolidation becomes "
-                                      "a pass-through.")
+                                 help="Treat each document as one unit.")
         parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE,
-                            help=f"Chunk window in tokens (default {DEFAULT_CHUNK_SIZE}); "
-                                 "ignored with --no-chunking.")
+                            help=f"Chunk window in tokens (default {DEFAULT_CHUNK_SIZE}).")
         parser.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP,
-                            help=f"Overlap/context in tokens (default "
-                                 f"{DEFAULT_CHUNK_OVERLAP}); ignored with --no-chunking.")
-    if include_data_dir:
-        parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR,
-                            help="Folder that holds <domain>.jsonl corpus files for the "
-                                 "legacy layout. Used only when --corpus is not given. "
-                                 f"Default: {DEFAULT_DATA_DIR} (the cluster location).")
+                            help=f"Overlap/context in tokens (default {DEFAULT_CHUNK_OVERLAP}).")
     if include_model:
-        parser.add_argument("--model_name", "--model", dest="model_name", type=str,
-                            default=load_global_config()[1],
-                            help="Model name served by the vLLM endpoints.")
-    parser.add_argument("--servers", nargs="+", default=load_global_config()[0],
-                        help="vLLM OpenAI-compatible base URLs; work is spread evenly across them.")
+        parser.add_argument("--model", dest="model", type=str, default=None,
+                            help="Model name (e.g. Qwen/Qwen3.8-27B). Overrides config.json.")
+        parser.add_argument("--tokenizer", dest="tokenizer", type=str, default=None,
+                            help="Optional tokenizer path or HuggingFace repo name.")
+    parser.add_argument("--servers", nargs="+", default=None,
+                        help="vLLM OpenAI-compatible base URLs; overrides config.json.")
     parser.add_argument("--concurrency_per_server", type=int, default=0,
-                        help=f"In-flight requests per server. 0 = stage default "
-                             f"({profile.concurrency_per_server} for {stage}).")
+                        help="In-flight requests per server. Overrides config.json.")
     if include_max_tokens:
         parser.add_argument("--max_tokens", type=int, default=0,
-                            help=f"Max generation length. 0 = stage default "
-                                 f"({profile.max_tokens} for {stage}).")
+                            help="Max generation length in tokens. Overrides config.json.")
     parser.add_argument("--max_attempts", type=int, default=0,
-                        help=f"Retries per item for transient errors. 0 = default "
-                             f"({profile.attempts}). Permanent errors never retry.")
+                        help="Retries per item for transient errors. Overrides config.json.")
     parser.add_argument("--stage_budget_minutes", type=float, default=0.0,
-                        help=f"Wall-clock ceiling for this stage. 0 = default "
-                             f"({profile.budget_minutes:g} min). Stops backoff from "
-                             f"running indefinitely; checkpoints stay resumable.")
+                        help="Wall-clock ceiling for this stage. Overrides config.json.")
     parser.add_argument("--request_timeout", type=float, default=0.0,
-                        help=f"Per-attempt request timeout in seconds. 0 = stage default "
-                             f"({profile.request_timeout:g}s).")
+                        help="Per-attempt request timeout in seconds. Overrides config.json.")
     parser.add_argument("--no_failover", action="store_true",
                         help="Do not move work off a server that stops responding.")
     if include_resume:
         parser.add_argument("--resume", action="store_true",
-                            help="Clear incomplete marks and continue from the checkpoint.")
+                            help="Clear incomplete marks and continue from checkpoint.")
     return parser
 
 

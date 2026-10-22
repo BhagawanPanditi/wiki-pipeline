@@ -117,23 +117,46 @@ class ServerPool:
         Raises:
             RuntimeError: If no usable server URL was supplied.
             ValueError: If ``concurrency_per_server`` is below 1."""
-        cleaned = [s for s in servers if isinstance(s, str) and s.strip()]
-        if not cleaned:
-            raise RuntimeError(f"{label}: no usable LLM servers configured.")
-        if concurrency_per_server < 1:
-            raise ValueError(f"{label}: concurrency_per_server must be at least 1.")
+        parsed_servers: List[str] = []
+        parsed_concurrencies: List[int] = []
 
-        self.servers = cleaned
-        self.concurrency_per_server = int(concurrency_per_server)
+        if isinstance(servers, dict):
+            for s_url, s_conc in servers.items():
+                if isinstance(s_url, str) and s_url.strip():
+                    parsed_servers.append(s_url.strip())
+                    parsed_concurrencies.append(max(1, int(s_conc)))
+        else:
+            default_conc = int(concurrency_per_server) if isinstance(concurrency_per_server, (int, float)) and concurrency_per_server > 0 else 32
+            for s in servers:
+                if not isinstance(s, str) or not s.strip():
+                    continue
+                s_str = s.strip()
+                # Check for inline concurrency URL:CONCURRENCY (e.g. http://host:8000/v1:64)
+                m = re.search(r':(\d+)$', s_str)
+                if m and not s_str.endswith('/v1'):
+                    conc = int(m.group(1))
+                    url = s_str[:m.start()]
+                elif isinstance(concurrency_per_server, dict):
+                    url = s_str
+                    conc = int(concurrency_per_server.get(url, default_conc))
+                else:
+                    url = s_str
+                    conc = default_conc
+                parsed_servers.append(url)
+                parsed_concurrencies.append(max(1, conc))
+
+        if not parsed_servers:
+            raise RuntimeError(f"{label}: no usable LLM servers configured.")
+
+        self.servers = parsed_servers
+        self.server_concurrencies = parsed_concurrencies
+        self.concurrency_per_server = max(parsed_concurrencies)  # For legacy property access
         self.request_timeout = float(request_timeout)
         self.connect_timeout = connect_timeout
         self.max_connections_slack = max_connections_slack
         self.label = label
         self.failover = failover
         self.unhealthy_threshold = max(1, unhealthy_threshold)
-        # When supplied, every request these clients issue is appended to this
-        # log. Wrapping happens in _build_clients, below the stage, so a stage
-        # cannot forget to record a call.
         self.llm_log = llm_log
 
         self._http: List[httpx.AsyncClient] = []
@@ -146,20 +169,11 @@ class ServerPool:
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def _build_clients(self) -> None:
-        """Create one httpx client and one SDK client per server.
-
-        Called on entering the async context, not in ``__init__``, because building an
-        ``httpx.AsyncClient`` binds it to the running event loop. Also resets the
-        per-server health and request counters, so a pool reused for a second ``map``
-        starts from a clean slate.
-
-        Returns:
-            None. Populates ``_http``, ``_clients``, ``_healthy``, ``_served`` and
-            ``_consecutive_failures``."""
+        """Create one httpx client and one SDK client per server with per-server limits."""
         timeout = (httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
                    if self.connect_timeout else httpx.Timeout(self.request_timeout))
-        limits = httpx.Limits(max_connections=self.concurrency_per_server + self.max_connections_slack)
-        for url in self.servers:
+        for url, conc in zip(self.servers, self.server_concurrencies):
+            limits = httpx.Limits(max_connections=conc + self.max_connections_slack)
             http_client = httpx.AsyncClient(limits=limits, timeout=timeout)
             self._http.append(http_client)
             client = AsyncOpenAI(base_url=url, api_key="EMPTY",
@@ -414,7 +428,7 @@ class ServerPool:
 
         workers = [asyncio.create_task(worker(s))
                    for s in range(server_count)
-                   for _ in range(self.concurrency_per_server)]
+                   for _ in range(self.server_concurrencies[s])]
         try:
             await asyncio.gather(*workers)
         finally:

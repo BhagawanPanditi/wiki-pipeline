@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import asyncio
 import json
-import time
+import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -11,109 +11,129 @@ from utils.atomic_io import atomic_write_json
 from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
 from utils.cli import build_parser, resolve_settings
 from utils.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
-                                 build_units, cache_manifest, deduplicate,
-                                 load_corpus, resolve_corpus_path,
-                                 save_run_config)
-from utils.attempts import AttemptHistory
-from utils.event_log import EventLog
-from utils.layout import log_path
+                          build_units, cache_manifest, deduplicate,
+                          load_corpus, resolve_corpus_path,
+                          save_run_config)
 from utils.errors import PermanentFailure, StageBudget
-from utils.json_repair import clean_json_string
-from utils.llm_pool import pool_for_stage
+from utils.llm_pool import ServerPool
 
 STAGE = "extract-concepts"
 
-# ── Pydantic Data Schemas for Extraction ──────────────────────────────────────
+# ── Data Schemas ─────────────────────────────────────────────────────────────
 
 class OutboundRelation(BaseModel):
-    target_concept: str = Field(description="Exact title of the target canonical concept.")
-    relation: str = Field(description="1 sentence describing how this concept affects/relates outward to Target Concept.")
+    target_concept: str = Field(description="Exact canonical title of target concept.")
+    relation: str = Field(description="1 concise sentence describing the relationship.")
 
 class Concept(BaseModel):
     title: str = Field(description="Exact canonical title (1-6 words, singular).")
-    aliases: List[str] = Field(default_factory=list, description="Explicit acronyms or 'also known as' names.")
-    description: str = Field(description="Single dense factual paragraph with all metrics, parameters, and details.")
-    entities: List[str] = Field(default_factory=list, description="Always empty in Pass 1 extraction; entities are extracted during dedicated enrichment.")
+    aliases: List[str] = Field(default_factory=list, description="Acronyms or alternate names.")
+    description: str = Field(description="Single dense factual paragraph.")
     outbound_relations: List[OutboundRelation] = Field(default_factory=list)
 
 class ChunkExtractionSchema(BaseModel):
     concepts: List[Concept] = Field(default_factory=list)
 
-# ── Helper Utilities ─────────────────────────────────────────────────────────
-# short_hash, chunk_document and the rest of the corpus contract live in
-# utils/corpus.py so that every stage agrees on document ids, chunk ids
-# and citation keys.
+# ── System Prompt (XML Format) ────────────────────────────────────────────────
 
-# ── System Prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
-You are an expert technical knowledge extractor building an LLM Wiki Knowledge Graph. 
-Analyze the CURRENT CHUNK and extract its core thematic concepts, dense factual descriptions, and outbound relationships.
+You are building a knowledge graph from documents in any domain. Read the CURRENT CHUNK and extract its concepts, each with a fact-dense description and outbound relations.
 
-INPUT & NOISE CLEANING:
-- The text is raw and uncleaned. SILENTLY IGNORE all HTML tags, scraping artifacts, navigation links, headers, footers, cookie notices, and promotional clutter. Focus ONLY on substantive informational text.
-- If the CURRENT CHUNK contains no substantive core concepts (e.g., solely bibliographies, navigational boilerplate, or non-informative text), return an empty list: {"concepts": []}.
+SOURCE RULES:
+- Facts come ONLY from the CURRENT CHUNK. Use CONTEXT BEFORE/AFTER solely to resolve pronouns, acronyms, and full names. Never extract facts that appear only in the context, and never add outside knowledge.
+- Silently ignore HTML, scraping artifacts, navigation, headers/footers, ads, cookie notices, and bibliographies. If nothing substantive remains, return an empty response.
 
-CONTEXT BOUNDARIES:
-- CURRENT CHUNK is your ONLY source for facts.
-- Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g., "this architecture", "they") or acronyms to find full canonical names.
-- DO NOT extract facts, numbers, or statements that appear exclusively in CONTEXT BEFORE or CONTEXT AFTER.
+WHAT IS A CONCEPT:
+- A distinct subject the chunk explains in meaningful detail: an idea, method, algorithm, mechanism, entity, system, event, rule, condition, parameter, etc.
+- Extract every such concept; there is no cap. Skip passing mentions that have no detail.
+- Do not create concepts from structural labels ("Introduction", "Results", "Example") or a summary of the whole chunk.
 
-EXHAUSTIVE CONCEPT COVERAGE (UNCAPPED):
-- Extract ALL distinct concepts, core thematic subjects, major sub-topics, conditions, pathways, systems, or technical components discussed in this chunk.
-- Do NOT artificially restrict concept counts. Extract EVERY substantive sub-topic that has meaningful explanatory detail in the text.
+TITLES AND ALIASES:
+- Title: 1-6 words, Title Case, standard canonical name (expand acronyms), singular unless plural by definition.
+- Aliases: Semicolon-separated list of acronyms or alternate names appearing in text. If none, leave empty.
 
-DESCRIPTIONS HOLD ALL FACTS:
-- Write a single, dense, factual paragraph for each concept. ALL quantitative metrics, ranges, parameters, statistical findings, experimental conditions, tool mentions, and procedural details MUST be written in full complete sentences inside `description`.
-- DO NOT extract named entities into a separate list at this stage (set "entities": []). Dedicated entity extraction runs in a later pipeline stage.
+DESCRIPTIONS:
+- One self-contained paragraph: name the subject explicitly, no "this" or "the above". Start with what it is, then the details.
+- Preserve all specifics in full sentences: numbers, units, ranges, thresholds, formulas, parameters, complexity, constraints, conditions, steps, dates, locations, and attributions.
 
-EXHAUSTIVE FACTUAL RETENTION MANDATE:
-Descriptions MUST retain exact detail rather than abstracting away technical facts. You MUST preserve in sentence form:
-1. QUANTITATIVE METRICS & BOUNDS: Exact numbers, statistical findings, percentages, measurements, ranges, and parameter limits.
-2. FORMAL ENTITIES & NAMED TERMS: Specific algorithms, software/tool versions, taxonomies, codes, benchmarks, locations, or formal classifications.
-3. CONDITIONS & SPECIFICATIONS: Specific operational bounds, environmental constraints, experimental conditions, procedural steps, and dates/years.
-4. CREDITED ATTRIBUTIONS: Specific expert, study, or author attributions when linked to explicit technical claims.
-
-OUTBOUND RELATIONSHIPS:
-- List OUTBOUND relationships to other target concepts mentioned in the chunk.
-- The concept being extracted is ALWAYS the source/subject (Concept A). Describe how Concept A affects, utilizes, replaces, leads to, or relates to Target Concept B in 1 concise sentence.
-- Ensure `target_concept` matches the canonical title of the target concept as defined in the chunk or context.
-- If a concept has no outbound relations to other concepts in this chunk, set "outbound_relations": [].
+OUTBOUND RELATIONS:
+- The concept being described is always the subject. In one sentence, state how it affects, uses, causes, is part of, replaces, or contrasts with the target.
+- Target must be named in the chunk or context. No self-relations.
+- Format each relation on a new line: Target Concept :: 1 sentence relation.
 
 OUTPUT FORMAT:
-Return ONLY valid JSON matching this exact structure:
-{
-  "concepts": [
-    {
-      "title": "Exact Canonical Title",
-      "aliases": ["Acronym or Alt Name"],
-      "description": "A single comprehensive paragraph detailing what the concept is along with all raw quantitative metrics, parameter bounds, specific findings, and detailed statements from this chunk.",
-      "entities": [],
-      "outbound_relations": [
-        {
-          "target_concept": "Target Concept Title",
-          "relation": "1 sentence: How THIS concept affects or relates outward to Target Concept."
-        }
-      ]
-    }
-  ]
-}
+Output each concept using XML tags matching this exact structure:
+<concept>
+<title>Exact Canonical Title</title>
+<aliases>Acronym; Alternative Name</aliases>
+<description>A single comprehensive paragraph detailing what the concept is along with all raw quantitative metrics, parameter bounds, specific findings, and detailed statements from this chunk.</description>
+<relations>
+Target Concept A :: How this concept relates to Target Concept A.
+Target Concept B :: How this concept relates to Target Concept B.
+</relations>
+</concept>
+
+If no concepts exist in the chunk, output nothing.
 """
+
+# ── XML Parsing Helper ────────────────────────────────────────────────────────
+
+def parse_xml_concepts(text: str) -> List[Concept]:
+    """Parse all completed <concept>...</concept> blocks from raw LLM output."""
+    if not text:
+        return []
+
+    concepts = []
+    blocks = re.findall(r"<concept>(.*?)</concept>", text, re.DOTALL | re.IGNORECASE)
+    for block in blocks:
+        title_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
+        if not title_m:
+            continue
+        title = title_m.group(1).strip()
+        if not title:
+            continue
+
+        desc_m = re.search(r"<description>(.*?)</description>", block, re.DOTALL | re.IGNORECASE)
+        description = desc_m.group(1).strip() if desc_m else ""
+
+        aliases = []
+        aliases_m = re.search(r"<aliases>(.*?)</aliases>", block, re.DOTALL | re.IGNORECASE)
+        if aliases_m:
+            raw_aliases = aliases_m.group(1).strip()
+            aliases = [a.strip() for a in re.split(r"[;,]", raw_aliases) if a.strip()]
+
+        relations = []
+        rel_m = re.search(r"<relations>(.*?)</relations>", block, re.DOTALL | re.IGNORECASE)
+        if rel_m:
+            for line in rel_m.group(1).strip().splitlines():
+                line = line.strip()
+                if "::" in line:
+                    parts = line.split("::", 1)
+                    tgt = parts[0].strip()
+                    desc = parts[1].strip()
+                    if tgt and desc:
+                        relations.append(OutboundRelation(target_concept=tgt, relation=desc))
+
+        concepts.append(Concept(
+            title=title,
+            aliases=aliases,
+            description=description,
+            outbound_relations=relations
+        ))
+
+    return concepts
 
 # ── Pipeline Implementation ──────────────────────────────────────────────────
 
 class WikiExtractorPipeline:
     def __init__(self, args):
-        """Prepare Pass 1 extraction, creating the staging and cache folders.
-
-        Args:
-            args: Parsed CLI namespace.
-
-        Sets:
-            Paths for staging, cache and ``extraction_log.json``, and the extraction
-            checkpoint loaded from that file."""
         self.args = args
-        self.domain = args.domain
-        self.base_wiki_dir = Path(args.wiki_base_dir) / self.domain
+        wiki_path = getattr(args, "wiki_path", None)
+        if not wiki_path:
+            raise ValueError("Missing required --wiki_path argument. Specify where to save wiki outputs.")
+
+        self.base_wiki_dir = Path(wiki_path)
+        self.base_wiki_dir.mkdir(parents=True, exist_ok=True)
         self.staging_dir = self.base_wiki_dir / "staging"
         self.cache_dir = self.base_wiki_dir / "cache"
         self.log_file = self.base_wiki_dir / "extraction_log.json"
@@ -126,23 +146,21 @@ class WikiExtractorPipeline:
             corrupt_message="Log file corrupted. Initializing fresh extraction log.")
 
     def cleanup_incomplete_states(self):
-        """Remove partial concept output for failed chunks but preserve debug evidence."""
-        print("Sanitizing incomplete extraction states...")
+        """Remove partial concept files for incomplete chunks."""
         purged = 0
         for key, completed in list(self.extraction_log.items()):
             if not completed:
                 doc_id, chunk_id = key.split("::", 1)
-                target_subfolder = self.staging_dir / doc_id / chunk_id
-                partial_concepts = target_subfolder / "concepts.json"
+                partial_concepts = self.staging_dir / doc_id / chunk_id / "concepts.json"
                 if partial_concepts.exists():
                     partial_concepts.unlink()
                     purged += 1
                 del self.extraction_log[key]
         save_log_sync(self.log_file, self.extraction_log)
-        print(f"Cleared {purged} partial concept files; preserved per-chunk debug logs.")
+        if purged > 0:
+            print(f"Cleared {purged} partial concept files.")
 
     def chunk_is_complete(self, chunk: Dict[str, Any]) -> bool:
-        """Trust a completion-log entry only when its extracted JSON is readable."""
         key = f"{chunk['doc_id']}::{chunk['chunk_id']}"
         if not self.extraction_log.get(key, False):
             return False
@@ -157,33 +175,6 @@ class WikiExtractorPipeline:
             return False
 
     def prepare_chunks(self) -> List[Dict[str, Any]]:
-        """Load the corpus, deduplicate it, and build this stage's work units.
-
-        The corpus may be a single JSON array or JSON Lines, and may be given
-        with ``--corpus`` or resolved from the legacy ``--data_dir``/``--domain``
-        layout. Documents with identical content are collapsed into one
-        canonical document; the original ids are written to
-        ``doc_mapping.json`` in the run directory so citations can be traced back to
-        the source.
-
-        Chunking is optional. With ``--no-chunking`` each document becomes a
-        single unit and no tokenizer is loaded, so ``transformers`` and an
-        offline HuggingFace model are not required.
-
-        A previously built ``cache/chunks_cache.json`` is reused only when its
-        manifest matches today's corpus digest, tokenizer and chunking
-        parameters exactly; otherwise it is rebuilt.
-
-        Returns:
-            A list of unit dicts with keys ``doc_id``, ``chunk_id``,
-            ``current_chunk``, ``context_before`` and ``context_after``.
-
-        Raises:
-            CorpusError: If no corpus was specified, the file is missing, or a
-                record has no usable content.
-            ValueError: If ``--chunk_overlap`` is not smaller than
-                ``--chunk_size``.
-        """
         chunks_cache_file = self.cache_dir / "chunks_cache.json"
         cache_manifest_file = self.cache_dir / "chunks_cache_manifest.json"
         mapping_file = self.base_wiki_dir / "doc_mapping.json"
@@ -193,12 +184,9 @@ class WikiExtractorPipeline:
         chunk_size = int(getattr(self.args, "chunk_size", DEFAULT_CHUNK_SIZE))
         overlap = int(getattr(self.args, "chunk_overlap", DEFAULT_CHUNK_OVERLAP))
 
-        # A pre-existing chunks_cache.json is not sufficient evidence that its
-        # chunks describe today's input. Hash the source and bind the cache to
-        # the tokenizer name and chunking parameters before reusing it.
         expected_manifest = cache_manifest(
             corpus_path,
-            tokenizer_name=self.args.model_name if chunking else None,
+            tokenizer_name=self.settings.model_name if chunking else None,
             chunking=chunking,
             chunk_size=chunk_size,
             overlap=overlap)
@@ -221,29 +209,21 @@ class WikiExtractorPipeline:
                     return cached_chunks
             except (OSError, json.JSONDecodeError, TypeError):
                 pass
-            print("Cached chunks are stale or invalid; rebuilding them from the current input.")
-        elif chunks_cache_file.exists():
-            print("Cached chunks are missing required metadata; rebuilding them for safety.")
+            print("Cached chunks are stale or invalid; rebuilding them from current input.")
 
         print(f"Loading corpus from {corpus_path}...")
         docs = load_corpus(corpus_path)
 
         print("Deduplicating documents based on content hash...")
         canon_docs, doc_mapping = deduplicate(docs)
-        # Refresh the mapping whenever the source signature changes, rather than
-        # retaining mappings that may belong to an older version of the corpus.
         atomic_write_json(mapping_file, doc_mapping)
         print(f"Deduplicated {len(docs)} docs down to {len(canon_docs)} unique canonical docs.")
 
-        # Record how this run was prepared so later stages (notably
-        # per-document consolidation) can tell whether chunking was on without
-        # being told again on their command line.
         save_run_config(self.base_wiki_dir, {
             "corpus": str(corpus_path),
             "corpus_sha256": expected_manifest["source_sha256"],
-            "domain": self.args.domain_label,
-            "run_name": self.domain,
-            "model_name": self.args.model_name,
+            "wiki_path": str(self.base_wiki_dir),
+            "model_name": self.settings.model_name,
             "chunking": chunking,
             "chunk_size": chunk_size if chunking else None,
             "chunk_overlap": overlap if chunking else None,
@@ -253,14 +233,58 @@ class WikiExtractorPipeline:
 
         tokenizer = None
         if chunking:
-            # Imported lazily: an unchunked corpus needs no tokenizer, so the
-            # pipeline runs without transformers installed.
-            from transformers import AutoTokenizer
+            tok_arg = getattr(self.args, "tokenizer", None)
+            if tok_arg in ("tiktoken", "cl100k_base", "o200k_base"):
+                enc_name = "o200k_base" if tok_arg == "o200k_base" else "cl100k_base"
+                print(f"Using instant offline tiktoken ({enc_name})...")
+                import tiktoken
+                enc = tiktoken.get_encoding(enc_name)
+                class TiktokenWrapper:
+                    def encode(self, text: str) -> list:
+                        return enc.encode(text, disallowed_special=())
+                    def decode(self, tokens: list, skip_special_tokens: bool = True) -> str:
+                        return enc.decode(tokens)
+                tokenizer = TiktokenWrapper()
+            else:
+                from transformers import AutoTokenizer
+                print(f"Loading tokenizer for chunking ({chunk_size} tokens, {overlap} overlap)...")
+                tok_candidates = []
+                if tok_arg:
+                    tok_candidates.append(tok_arg)
+                tok_candidates.extend([
+                    self.settings.model_name,
+                    "Qwen/Qwen2.5-32B-Instruct",
+                    "Qwen/Qwen2.5-14B-Instruct",
+                    "Qwen/Qwen2.5-7B-Instruct",
+                    "Qwen/Qwen2-7B-Instruct",
+                ])
 
-            print(f"Tokenizing and creating chunks "
-                  f"({chunk_size} token window, {overlap} overlap)...")
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.args.model_name, trust_remote_code=True, local_files_only=True)
+                # Try local cache first for all candidates to avoid network hangs
+                for name in tok_candidates:
+                    try:
+                        tokenizer = AutoTokenizer.from_pretrained(
+                            name, trust_remote_code=True, local_files_only=True)
+                        print(f"Successfully loaded local tokenizer: {name}")
+                        break
+                    except Exception:
+                        continue
+
+                # Fallback to tiktoken if no local transformers model found
+                if tokenizer is None:
+                    try:
+                        print("Local HuggingFace tokenizer not found; falling back to instant tiktoken (cl100k_base)...")
+                        import tiktoken
+                        enc = tiktoken.get_encoding("cl100k_base")
+                        class TiktokenWrapper:
+                            def encode(self, text: str) -> list:
+                                return enc.encode(text, disallowed_special=())
+                            def decode(self, tokens: list, skip_special_tokens: bool = True) -> str:
+                                return enc.decode(tokens)
+                        tokenizer = TiktokenWrapper()
+                    except ImportError:
+                        primary = tok_candidates[0]
+                        print(f"Downloading/loading tokenizer: {primary}...")
+                        tokenizer = AutoTokenizer.from_pretrained(primary, trust_remote_code=True)
         else:
             print("Chunking disabled: treating each document as a single unit.")
 
@@ -269,76 +293,100 @@ class WikiExtractorPipeline:
 
         atomic_write_json(chunks_cache_file, all_chunks)
         atomic_write_json(cache_manifest_file, expected_manifest)
-
         print(f"Cached {len(all_chunks)} unit(s) to disk.")
         return all_chunks
 
-    async def extract_chunk(self, client, chunk_data: Dict[str, Any], server_index: int):
-        """Performs one LLM call and validates the response via Pydantic.
-
-        Raises on any unusable response so ServerPool can classify it and apply
-        the retry ladder. Token-limit truncation is still fail-fast: it is raised
-        as a permanent error and never retried.
-        """
+    async def extract_chunk(self, client, chunk_data: Dict[str, Any], server_index: int) -> ChunkExtractionSchema:
         key = f"{chunk_data['doc_id']}::{chunk_data['chunk_id']}"
         user_prompt = f"""\
-    CONTEXT BEFORE:
-    {chunk_data['context_before']}
+CONTEXT BEFORE:
+{chunk_data['context_before']}
 
-    CURRENT CHUNK:
-    {chunk_data['current_chunk']}
+CURRENT CHUNK:
+{chunk_data['current_chunk']}
 
-    CONTEXT AFTER:
-    {chunk_data['context_after']}
-    """
-        raw_text = None
-        finish_reason = None
-        try:
-            response = await client.chat.completions.create(
-                model=self.settings.model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.1,
-                max_tokens=self.settings.max_tokens,
-                response_format={"type": "json_object"}
-            )
+CONTEXT AFTER:
+{chunk_data['context_after']}
+"""
+        response = await client.chat.completions.create(
+            model=self.settings.model_name,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=self.settings.max_tokens,
+        )
 
-            choice = response.choices[0]
-            finish_reason = choice.finish_reason
-            raw_text = choice.message.content
+        choice = response.choices[0]
+        raw_text = choice.message.content or ""
+        finish_reason = choice.finish_reason
 
-            if finish_reason == "length":
-                # Try to salvage valid concepts from truncated JSON using clean_json_string
-                try:
-                    cleaned_json = clean_json_string(raw_text)
-                    salvaged = ChunkExtractionSchema.model_validate_json(cleaned_json)
-                    if salvaged.concepts:
-                        return salvaged
-                except Exception:
-                    pass
-                # FAIL FAST: Do not retry if we hit the token limit and cannot salvage
-                self.attempts.record(key, finish_reason=finish_reason, raw_text=raw_text,
-                                     error_type="TokenLimitExceeded",
-                                     error_message="Response truncated: Hit max_tokens limit.")
-                raise PermanentFailure(
-                    f"{key}: response truncated, hit max_tokens limit",
-                    cause=ValueError("Response truncated: Hit max_tokens limit."))
+        completed_concepts = parse_xml_concepts(raw_text)
 
-            cleaned_json = clean_json_string(raw_text)
-            return ChunkExtractionSchema.model_validate_json(cleaned_json)
+        # ── Truncation Handling via Continuation ──────────────────────────────
+        if finish_reason == "length":
+            # Detect unclosed concept block
+            last_open_idx = raw_text.rfind("<concept>")
+            last_close_idx = raw_text.rfind("</concept>")
+            incomplete_title = None
 
-        except PermanentFailure:
-            raise
-        except Exception as exc:
-            self.attempts.record(key, finish_reason=finish_reason, raw_text=raw_text,
-                                 error_type=type(exc).__name__, error_message=str(exc))
-            raise
+            if last_open_idx > last_close_idx:
+                unclosed_block = raw_text[last_open_idx:]
+                title_m = re.search(r"<title>(.*?)(?:</title>|\n|$)", unclosed_block, re.DOTALL | re.IGNORECASE)
+                if title_m and title_m.group(1).strip():
+                    incomplete_title = title_m.group(1).strip()
 
-    async def persist_extraction(self, chunk_data: Dict[str, Any],
-                                 extracted: ChunkExtractionSchema) -> None:
-        """SUCCESS: stream concepts.json to disk and advance the checkpoint."""
+            already_titles = [c.title for c in completed_concepts]
+            cut_off_desc = f"'{incomplete_title}'" if incomplete_title else "the last incomplete concept"
+
+            continuation_prompt = f"""\
+You were extracting concepts from the CURRENT CHUNK, but hit the token limit.
+
+ALREADY COMPLETED CONCEPTS:
+{', '.join(already_titles) if already_titles else 'None'}
+
+TASK:
+Continue extracting for the rest of the CURRENT CHUNK.
+Start by providing the complete <concept> block for {cut_off_desc}, then continue extracting any remaining concepts from the CURRENT CHUNK.
+Output in the exact same <concept>...</concept> XML format.
+"""
+            # Valid prefix of prior response up to last completed concept
+            assistant_content = raw_text[:last_close_idx + len("</concept>")] if last_close_idx != -1 else raw_text
+
+            try:
+                cont_response = await client.chat.completions.create(
+                    model=self.settings.model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                        {"role": "assistant", "content": assistant_content},
+                        {"role": "user", "content": continuation_prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=self.settings.max_tokens,
+                )
+                cont_text = cont_response.choices[0].message.content or ""
+                continued_concepts = parse_xml_concepts(cont_text)
+
+                # Merge and deduplicate by canonical title
+                merged_concepts = list(completed_concepts)
+                seen_titles = {c.title.lower() for c in completed_concepts}
+                for cc in continued_concepts:
+                    if cc.title.lower() not in seen_titles:
+                        seen_titles.add(cc.title.lower())
+                        merged_concepts.append(cc)
+
+                return ChunkExtractionSchema(concepts=merged_concepts)
+            except Exception:
+                # If continuation fails, return the completed concepts salvaged so far
+                if completed_concepts:
+                    return ChunkExtractionSchema(concepts=completed_concepts)
+                raise PermanentFailure(f"{key}: response truncated and continuation failed.")
+
+        return ChunkExtractionSchema(concepts=completed_concepts)
+
+    async def persist_extraction(self, chunk_data: Dict[str, Any], extracted: ChunkExtractionSchema) -> None:
         doc_id = chunk_data["doc_id"]
         chunk_id = chunk_data["chunk_id"]
         key = f"{doc_id}::{chunk_id}"
@@ -350,71 +398,15 @@ class WikiExtractorPipeline:
         json_payload = extracted.model_dump_json(indent=2)
         await asyncio.to_thread(concepts_file.write_text, json_payload, encoding="utf-8")
 
-        # Clean up any stale debug.json if it existed
-        debug_file = subfolder / "debug.json"
-        if debug_file.exists():
-            try:
-                debug_file.unlink()
-            except Exception:
-                pass
-
         self.extraction_log[key] = True
         self.flush_count += 1
         if self.flush_count >= 50:
             await save_log_async(self.log_file, self.extraction_log)
             self.flush_count = 0
 
-    async def write_failure_debug(self, chunk_data: Dict[str, Any],
-                                  failure: Dict[str, Any]) -> None:
-        """FAILURE: save debug.json with every attempt, untruncated."""
-        doc_id = chunk_data["doc_id"]
-        chunk_id = chunk_data["chunk_id"]
-        key = f"{doc_id}::{chunk_id}"
-
-        subfolder = self.staging_dir / doc_id / chunk_id
-        await asyncio.to_thread(subfolder.mkdir, parents=True, exist_ok=True)
-
-        error_logs = self.attempts.get(key)
-        debug_data = {
-            "doc_id": doc_id,
-            "chunk_id": chunk_id,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "total_attempts": len(error_logs),
-            "chunk_metadata": {
-                "context_before_chars": len(chunk_data.get("context_before", "")),
-                "current_chunk_chars": len(chunk_data.get("current_chunk", "")),
-                "context_after_chars": len(chunk_data.get("context_after", "")),
-            },
-            "attempts": error_logs,
-            "final_error": failure.get("error"),
-            "final_classification": failure.get("classification"),
-            "last_server": failure.get("server"),
-        }
-        debug_payload = json.dumps(debug_data, indent=2)
-        await asyncio.to_thread((subfolder / "debug.json").write_text,
-                                debug_payload, encoding="utf-8")
-
     async def run(self):
-        """Extract concepts from every unit of the corpus and persist each result.
-
-        Units come from :meth:`prepare_chunks`, which reuses a validated chunk cache when
-        one matches. Units already recorded as complete are skipped. The rest go through
-        the server pool, and each unit's ``concepts.json`` is written as it finishes. The
-        checkpoint is flushed periodically, so an interrupted run resumes where it
-        stopped.
-
-        Returns:
-            None. Results are in ``staging/<doc>/<chunk>/concepts.json``.
-
-        Raises:
-            RuntimeError: If any unit is still incomplete after retries.
-            StageBudgetExceeded: If the stage's wall-clock budget runs out. The
-                checkpoint is kept, so the run is resumable."""
         self.settings = resolve_settings(self.args, STAGE)
-        self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
-                                 label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
-        self.attempts = AttemptHistory()
         self.flush_count = 0
 
         if self.args.resume:
@@ -423,47 +415,43 @@ class WikiExtractorPipeline:
         all_chunks = self.prepare_chunks()
         pending_chunks = [c for c in all_chunks if not self.chunk_is_complete(c)]
 
-        total_pending = len(pending_chunks)
-        settings = self.settings
-        print(f"Total chunks: {len(all_chunks)} | Pending chunks: {total_pending}")
-        print(f"Spreading work across {len(settings.servers)} server(s) at "
-              f"{settings.concurrency_per_server} concurrent request(s) each "
-              f"(item i -> server i % N).")
-        print(f"Total Active Concurrency Limit: "
-              f"{len(settings.servers) * settings.concurrency_per_server} in flight.")
-        print(f"Per-item attempts: {settings.attempts} | Stage budget: "
-              f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
+        pool = ServerPool(
+            settings.servers,
+            concurrency_per_server=settings.concurrency_per_server,
+            request_timeout=settings.profile.request_timeout,
+            connect_timeout=settings.profile.connect_timeout,
+            label=STAGE,
+            llm_log=None,
+            failover=not getattr(self.args, "no_failover", False),
+        )
+
+        total_in_flight = sum(pool.server_concurrencies)
+        print(f"Total chunks: {len(all_chunks)} | Pending chunks: {len(pending_chunks)}")
+        print(f"Active Server Pool ({len(pool.servers)} servers, {total_in_flight} total concurrency):")
+        for url, conc in zip(pool.servers, pool.server_concurrencies):
+            print(f"  {url:<38} -> {conc} concurrent workers")
 
         if not pending_chunks:
             print("All chunks are already processed!")
             return
 
-        # Mark every pending chunk in-progress, as the old worker did under a lock,
-        # so --resume can purge anything left half-written.
         for chunk in pending_chunks:
             key = f"{chunk['doc_id']}::{chunk['chunk_id']}"
             self.extraction_log.setdefault(key, False)
+        async with pool:
+            result = await pool.map(
+                pending_chunks,
+                self.extract_chunk,
+                attempts=settings.attempts,
+                desc=f"Extracting [{self.base_wiki_dir.name}]",
+                key_fn=lambda c: f"{c['doc_id']}::{c['chunk_id']}",
+                budget=self.budget,
+                debug=None,
+                attempt_timeout=settings.profile.attempt_timeout,
+                on_result=self.persist_extraction,
+            )
 
-        pool = pool_for_stage(self.args, settings, STAGE)
-        try:
-            async with pool:
-                result = await pool.map(
-                    pending_chunks,
-                    self.extract_chunk,
-                    attempts=settings.attempts,
-                    desc=f"Extracting [{self.domain}]",
-                    key_fn=lambda c: f"{c['doc_id']}::{c['chunk_id']}",
-                    budget=self.budget,
-                    debug=self.debug,
-                    attempt_timeout=settings.profile.attempt_timeout,
-                    on_result=self.persist_extraction,
-                )
-        finally:
-            await save_log_async(self.log_file, self.extraction_log)
-            self.debug.close()
-
-        for failure in result.failures:
-            await self.write_failure_debug(pending_chunks[failure["index"]], failure)
+        await save_log_async(self.log_file, self.extraction_log)
 
         print("Requests served per server:")
         for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
@@ -472,32 +460,17 @@ class WikiExtractorPipeline:
         failed_chunks = [c for c in all_chunks if not self.chunk_is_complete(c)]
         if failed_chunks:
             failed_keys = [f"{c['doc_id']}::{c['chunk_id']}" for c in failed_chunks]
-            print(f"[ERROR] {len(failed_chunks)} chunk(s) are incomplete after retries. Examples: {failed_keys[:10]}")
-            raise RuntimeError(
-                f"Pass 1 left {len(failed_chunks)} chunk(s) incomplete; rerun with --resume after checking server health."
-            )
+            print(f"[ERROR] {len(failed_chunks)} chunk(s) incomplete after retries. Examples: {failed_keys[:10]}")
+            raise RuntimeError(f"Pass 1 left {len(failed_chunks)} chunk(s) incomplete; rerun with --resume.")
 
-        print(f"\nSuccessfully finished extraction loop for domain: {self.domain}! All {len(all_chunks)} chunks are valid.")
+        print(f"\nSuccessfully finished extraction for: {self.base_wiki_dir.name}! All {len(all_chunks)} chunks are valid.")
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Parse arguments and run Pass 1 concept extraction to completion.
-
-    Reads the corpus given by ``--corpus`` (or the legacy
-    ``--data_dir``/``--domain`` pair), extracts concepts from every unit through
-    the server pool, and writes per-chunk results under ``staging/`` plus the
-    citation mapping under ``doc_mapping.json``. Resumes from
-    ``extraction_log.json`` unless ``--resume`` is omitted.
-
-    Returns:
-        None. Exits non-zero if a stage budget expires or the pool reports
-        unresolved failures.
-    """
     parser = build_parser(
         stage=STAGE,
         description="High-throughput concept extractor: corpus -> per-chunk concepts",
-        include_data_dir=True,
         include_corpus=True,
         include_resume=True)
     args = parser.parse_args()

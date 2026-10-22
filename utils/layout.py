@@ -30,13 +30,17 @@ def run_dir_for(args: Any) -> Path:
     """Return the output directory for the run described by parsed CLI args.
 
     Args:
-        args: Parsed namespace carrying ``wiki_base_dir`` and ``domain``. The
-            parser already maps an omitted domain to ``"default"``.
+        args: Parsed namespace carrying ``wiki_path`` (or legacy ``wiki_base_dir`` and ``domain``).
 
     Returns:
-        ``<wiki_base_dir>/<domain>``. Not created here.
+        The resolved Path to the wiki directory.
     """
-    return Path(args.wiki_base_dir) / args.domain
+    wiki_path = getattr(args, "wiki_path", None)
+    if wiki_path:
+        return Path(wiki_path)
+    base = getattr(args, "wiki_base_dir", None) or "."
+    domain = getattr(args, "domain", None) or "default"
+    return Path(base) / domain
 
 
 def log_path(run_dir: Path, stage: str, kind: str) -> Path:
