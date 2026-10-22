@@ -272,11 +272,15 @@ def add_common_args(
     """Attach the argument block shared by every stage script."""
     profile = get_profile(stage)
 
-    parser.add_argument("--wiki_path", type=str, default=None,
+    parser.add_argument("--wiki_path", "--wiki_dir", dest="wiki_path", type=str, default=None,
                         help="Output folder where wiki data is stored. "
                              "Directory is created automatically if it does not exist.")
     parser.add_argument("--input_path", type=str, default=None,
                         help="Path to input corpus file (.json or .jsonl).")
+    parser.add_argument("--disable_thinking", action="store_true", default=False,
+                        help="Disable Qwen3.8-27B thinking mode (Instruct mode with enable_thinking=False).")
+    parser.add_argument("--enable_thinking", action="store_true", default=False,
+                        help="Explicitly enable Qwen3.8-27B thinking mode.")
     parser.add_argument("--llm_log", type=str, choices=("full", "compact", "errors"),
                         default="compact",
                         help="How much of each LLM call to keep in log/<stage>.llm.jsonl. "

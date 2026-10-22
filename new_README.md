@@ -4,174 +4,207 @@ This repository provides an end-to-end, high-throughput pipeline to convert unst
 
 ---
 
-## 1. Stage 1: Concept Extraction (`extract_concepts.py`)
+## 1. Core Architectural Philosophy
 
-Stage 1 splits documents into overlapping token windows and uses an LLM with high-density XML formatting to extract concepts and directional relationships.
-
-### What is Extracted and Stored?
-
-For each substantive concept identified in a chunk, the LLM outputs:
-1. **`title`**: Exact canonical concept title (1–6 words, singular).
-2. **`aliases`**: Explicit acronyms, alternate spellings, or abbreviations.
-3. **`description`**: A dense, factual paragraph retaining all raw quantitative metrics, numerical bounds, parameter ranges, formulas, and technical details from the chunk.
-4. **`outbound_relations`**: A list of directed outbound relationships pointing to other concepts mentioned in the chunk:
-   ```json
-   {
-     "target_concept": "Target Concept Title",
-     "relation": "1 concise sentence describing how this concept affects, extends, utilizes, or relates outward to the target concept."
-   }
-   ```
-5. **`source_chunks`**: Exact chunk IDs tracking provenance back to the source document.
-
-*(Note: Named entities are omitted during extraction to maximize output token budget for dense definitions and graph edges. Dedicated entity synthesis runs during post-consolidation enrichment).*
+1. **Pure XML Formatting (No JSON Generation)**:
+   - Prompts and outputs across all stages use strict XML tags (`<concept>`, `<verification>`, `<new_concept>`, `<update_concept>`).
+   - Completely eliminates JSON quote escaping breakage (especially prevalent in code, math, formulas, and multi-line text).
+   - Reduces token overhead by 20–30% compared to JSON.
+2. **Strict Concept Schema: Only `title`, `aliases`, and `description`**:
+   - Concepts consist strictly of:
+     - **`title`**: 1–6 words, Title Case, canonical name (singular).
+     - **`aliases`**: Explicit acronyms or alternate names found in the text.
+     - **`description`**: A comprehensive, fact-dense paragraph (100–250+ words).
+   - Outbound relations and entity lists are excluded during extraction and refinement. This focuses 100% of LLM output capacity on squeezing the chunk factually dry so the original chunk can be discarded without loss.
+3. **Sandboxed Reasoning (`<think>...</think>`) & Speed Optimization**:
+   - Models like Qwen3.8-27B or DeepSeek-R1 reason inside `<think>...</think>` blocks, which are automatically stripped before parsing.
+   - **Instruct / Non-Thinking Mode (`--disable_thinking`)**: Turns off thinking via `"chat_template_kwargs": {"enable_thinking": False}` with tuned sampling parameters, reducing extraction runtime from **4 hours down to 12 minutes (~20x speedup)**.
+4. **Strict Two-Tier Parameter Resolution (Zero Hardcoded Python Defaults)**:
+   - Parameters are resolved strictly in order: **CLI Flags > `config.json`**.
+   - If a required parameter is missing from both, the script immediately raises an informative error.
 
 ---
 
-## 2. XML Extraction Format
+## 2. Pipeline Stages
 
-To prevent JSON quote escaping issues (common in code snippets and math equations) and to save 20–30% of generation tokens, extraction outputs compact XML tags:
+```mermaid
+flowchart TD
+    Corpus["Input Corpus (.jsonl / .json)"] --> Pass1["Stage 1: extract_concepts.py (Pass 1)"]
+    Pass1 --> Staging1["staging/<doc>/<chunk>/concepts.json"]
+    Staging1 --> Verify1["Stage 2: verify_extraction.py --phase 1"]
+    Verify1 --> Report1["verification.json (Audit Findings)"]
+    Report1 --> Refine["Stage 3: refine_concepts.py (Pass 2)"]
+    Staging1 --> Refine
+    Refine --> Staging2["Refined concepts.json (Backed up Pass 1)"]
+    Staging2 --> Verify2["Stage 4: verify_extraction.py --phase 2"]
+    Verify2 --> Summary["verification_summary.json (Quality Improvement Table)"]
+```
 
+---
+
+### Stage 1: Concept Extraction (`extract_concepts.py`)
+
+Extracts solid, fact-dense concepts from overlapping token chunks.
+
+#### XML Output Format:
 ```xml
+<think>
+[Optional sandboxed analysis or concept boundary planning]
+</think>
 <concept>
-<title>Two Pointers</title>
-<aliases>Two-Pointer Technique; Dual Pointer</aliases>
-<description>Two Pointers is an algorithmic technique that utilizes two indices to traverse a data structure concurrently, commonly employed to optimize search time from O(N^2) to O(N) in sorted arrays or linked lists.</description>
-<relations>
-Sliding Window :: Is a special case of this technique where both pointers move in the same direction.
-Binary Search :: Shares the idea of shrinking a sorted search range.
-</relations>
+<title>Left-handedness</title>
+<aliases>Left Handedness; Sinistrality</aliases>
+<description>Left-handedness is a handedness trait characterized by preferential use of the left hand for manual tasks, occurring in approximately 10.6% of the general human population. Twin studies demonstrate a cross-dominance rate of 19% to 21% among monozygotic and dizygotic pairs...</description>
 </concept>
 ```
 
-### Automatic Truncation Recovery via Continuation
-If a long chunk produces extensive output and hits `finish_reason == "length"`:
-1. All completed `<concept>...</concept>` blocks are salvaged immediately.
-2. The extractor identifies the cut-off / incomplete concept.
-3. It automatically issues a targeted continuation prompt with the already-generated prefix.
-4. The remaining concepts are extracted, parsed, and merged seamlessly.
+#### Truncation Recovery via Continuation:
+If a chunk hits the token ceiling (`finish_reason == "length"`), the extractor salvages all completed `<concept>` blocks, detects the cut-off title, and issues an automatic continuation request to complete the rest of the chunk.
 
 ---
 
-## 3. Chunking & Context Boundaries
+### Stage 2: Audit Verification (`verify_extraction.py --phase 1`)
 
-Long documents are tokenized and chunked into sliding windows:
+Audits the raw extracted concepts against the original source chunk to evaluate coverage and find omissions.
 
-| Parameter | Default Value | CLI Flag | Description |
-| :--- | :--- | :--- | :--- |
-| **Chunk Size** | **5,000 tokens** | `--chunk_size` | Primary evaluated window (`current_chunk`). |
-| **Chunk Overlap** | **500 tokens** | `--chunk_overlap` | Stride between consecutive windows (`step = 4,500` tokens). |
-| **Context Before** | Up to **500 tokens** | Automatic | Tokens immediately preceding the chunk. Empty for the first chunk. Used **strictly** for pronoun/acronym resolution. |
-| **Context After** | Up to **500 tokens** | Automatic | Tokens immediately following the chunk. Empty for the last chunk. Used **strictly** for reference resolution. |
+#### XML Output Format:
+```xml
+<think>
+[Auditor comparison between source chunk and extracted concepts]
+</think>
+<verification>
+<coverage_score>0.92</coverage_score>
+<is_sufficient>true</is_sufficient>
+<missing_concepts>
+- Monozygotic Twins
+</missing_concepts>
+<missing_facts>
+- Twin cross-dominance rate of 19% in specific cohorts
+</missing_facts>
+<hallucinations>
+- None
+</hallucinations>
+<critique>Extraction retains the core handedness prevalence metrics but omits detailed twin breakdown.</critique>
+</verification>
+```
 
-> **Strict Boundary Constraint**: Facts, definitions, and metrics are extracted **exclusively from `current_chunk`**. `context_before` and `context_after` are strictly used to resolve pronouns (e.g. *"this algorithm"*) and expand abbreviations into canonical names.
+The output is saved as `staging/<doc>/<chunk>/verification.json` for consumption by the refinement pass.
 
 ---
 
-## 4. Input & Output Structure
+### Stage 3: Second-Pass Refinement (`refine_concepts.py`)
 
-The pipeline operates on direct input and output paths without requiring domain names:
+Consumes the raw chunk, Pass 1 concepts, and audit verification feedback to patch omissions.
+- Creates brand-new concepts via `<new_concept>`.
+- Patches existing concepts with newly discovered facts via `<update_concept>`.
+- Backs up original Pass 1 output to `concepts_pass1_backup.json`.
 
-- **`--input_path`**: Path to the source corpus (`.json` or `.jsonl`).
-- **`--wiki_path`**: Destination folder where all wiki outputs, staging chunks, cache, and logs are stored. Automatically created (`mkdir -p`) if it does not exist.
+#### XML Patch Format:
+```xml
+<think>
+[Refinement planning addressing audit feedback]
+</think>
+<new_concept>
+<title>Monozygotic Twins</title>
+<aliases>Identical Twins</aliases>
+<description>Monozygotic twins develop from a single fertilized ovum that splits into two embryos...</description>
+</new_concept>
 
-### Input File Format
-Supports either:
-1. **JSON array** (`.json`):
-   ```json
-   [
-     {"id": "doc_01", "content": "...document text..."},
-     {"id": "doc_02", "content": "...document text..."}
-   ]
-   ```
-2. **JSON Lines** (`.jsonl`):
-   ```json
-   {"id": "doc_01", "content": "...document text..."}
-   {"id": "doc_02", "content": "...document text..."}
-   ```
-
-### Output Directory Structure
-Running `extract_concepts.py` creates:
-```text
-<wiki_path>/
-├── staging/
-│   └── canon_<hash>/
-│       └── chunk_000/
-│           └── concepts.json         # Extracted concepts for this chunk
-├── cache/
-│   ├── chunks_cache.json             # Tokenized chunk objects
-│   └── chunks_cache_manifest.json    # Cache fingerprint bound to corpus & tokenizer
-├── doc_mapping.json                  # Source doc ID -> canonical hash mapping
-└── extraction_log.json               # Progress log tracking completed chunks
+<update_concept>
+<title>Left-handedness</title>
+<additional_aliases>Sinistrality</additional_aliases>
+<additional_description>Cross-dominance was recorded at 19% among twin cohorts under controlled phenotypic evaluation.</additional_description>
+</update_concept>
 ```
 
 ---
 
-## 5. Configuration: Strict Two-Tier Resolution (Zero Python Hardcoding)
+### Stage 4: Second-Pass Verification (`verify_extraction.py --phase 2`)
 
-There are **NO hardcoded fallback values in Python code**. Every execution parameter must be explicitly supplied either via the Command Line or in `config.json`:
+Re-audits the refined chunks and writes `verification_summary.json`, displaying an automated before/after quality improvement report.
 
-| Setting | CLI Flag | `config.json` Key | Description |
-| :--- | :--- | :--- | :--- |
-| **Model** | `--model <name>` | `"model_name"` | Name of model served on vLLM. |
-| **Servers** | `--servers <urls...>` | `"servers"` | List of vLLM endpoint URLs. |
-| **Concurrency** | `--concurrency_per_server <N>` | `"concurrency_per_server"` | Concurrent in-flight requests per server. |
-| **Max Tokens** | `--max_tokens <N>` | `"max_tokens"` | Maximum output tokens per request (e.g. 16000). |
-| **Timeout** | `--request_timeout <seconds>` | `"request_timeout"` | Per-attempt HTTP timeout in seconds (e.g. 2400.0). |
+---
 
-If any required parameter is missing from both the CLI and `config.json`, the script immediately exits with an informative error.
+## 3. Configuration & Server Setup
 
-### Example `config.json` with Per-Server Concurrency:
-You can specify custom concurrency per server as a dictionary (e.g. 64 for DGX nodes, 20 for A40 nodes):
+Execution parameters are defined in `config.json` at the repository root:
+
 ```json
 {
   "servers": {
     "http://cn13-dgx:8000/v1": 64,
     "http://cn43-l40:8005/v1": 32,
-    "http://cn35-a40:8002/v1": 32,
+    "http://cn35-a40:8002/v1": 24,
     "http://cn26-a40:8000/v1": 20,
     "http://cn26-a40:8001/v1": 20
   },
   "model_name": "Qwen/Qwen3.8-27B",
   "concurrency_per_server": 32,
   "max_tokens": 16000,
-  "request_timeout": 2400.0
+  "request_timeout": 2400.0,
+  "enable_thinking": false
 }
 ```
 
-Or pass them inline via CLI:
+### Parameter Reference:
+
+| Parameter | CLI Flag | `config.json` Key | Description |
+| :--- | :--- | :--- | :--- |
+| **Wiki Path** | `--wiki_path` (or `--wiki_dir`) | — | Output folder path (e.g. `/path/to/wiki/biology`). |
+| **Input Path** | `--input_path` | — | Input corpus file (`.jsonl` or `.json`). |
+| **Model** | `--model <name>` | `"model_name"` | Model name served on vLLM. |
+| **Servers** | `--servers <urls...>` | `"servers"` | Server list or dictionary of `URL: concurrency`. |
+| **Concurrency** | `--concurrency_per_server <N>` | `"concurrency_per_server"` | Fallback in-flight requests per server. |
+| **Max Tokens** | `--max_tokens <N>` | `"max_tokens"` | Max output tokens per request. |
+| **Timeout** | `--request_timeout <seconds>` | `"request_timeout"` | Per-attempt HTTP timeout. |
+| **Disable Thinking** | `--disable_thinking` | `"enable_thinking": false` | Disables thinking mode for massive speedup. |
+| **Enable Thinking** | `--enable_thinking` | `"enable_thinking": true` | Allows full `<think>...</think>` sandboxed reasoning. |
+| **Resume** | `--resume` | — | Clears incomplete states and resumes from checkpoint. |
+
+---
+
+## 4. End-to-End Execution Guide
+
+### Step 1: Run Concept Extraction (Pass 1)
 ```bash
---servers http://cn13-dgx:8000/v1:64 http://cn26-a40:8000/v1:20 http://cn35-a40:8002/v1:32
+python3 extract_concepts.py \
+  --input_path "/path/to/data/biology.jsonl" \
+  --wiki_path "/path/to/wiki/biology" \
+  --disable_thinking
+```
+
+### Step 2: Audit Pass 1 (Verification Phase 1)
+```bash
+python3 verify_extraction.py \
+  --wiki_path "/path/to/wiki/biology" \
+  --phase 1 \
+  --disable_thinking
+```
+
+### Step 3: Refine Concepts (Pass 2)
+```bash
+python3 refine_concepts.py \
+  --wiki_path "/path/to/wiki/biology" \
+  --disable_thinking
+```
+
+### Step 4: Re-Audit & Measure Improvement (Verification Phase 2)
+```bash
+python3 verify_extraction.py \
+  --wiki_path "/path/to/wiki/biology" \
+  --phase 2 \
+  --disable_thinking
 ```
 
 ---
 
-## 6. Execution Examples
+## 5. Resuming Interrupted Runs
 
-### Basic Execution (Using `config.json`)
-```bash
-python3 extract_concepts.py \
-  --input_path /path/to/corpus.jsonl \
-  --wiki_path /path/to/my_wiki
-```
+If any stage is stopped or interrupted, append `--resume` to continue immediately without repeating already-completed items:
 
-### Overriding Settings via CLI
 ```bash
-python3 extract_concepts.py \
-  --input_path /path/to/corpus.jsonl \
-  --wiki_path /path/to/my_wiki \
-  --model Qwen/Qwen3.8-27B \
-  --servers http://cn12-dgx:8000/v1 http://cn13-dgx:8001/v1 \
-  --concurrency_per_server 32 \
-  --chunk_size 5000 \
-  --chunk_overlap 500
+python3 extract_concepts.py --wiki_path "/path/to/wiki/biology" --input_path "/path/to/data/biology.jsonl" --resume
+python3 verify_extraction.py --wiki_path "/path/to/wiki/biology" --phase 1 --resume
+python3 refine_concepts.py --wiki_path "/path/to/wiki/biology" --resume
+python3 verify_extraction.py --wiki_path "/path/to/wiki/biology" --phase 2 --resume
 ```
-
-### Resuming an Interrupted Run
-If an extraction run was stopped mid-way, add `--resume` to continue:
-```bash
-python3 extract_concepts.py \
-  --input_path /path/to/corpus.jsonl \
-  --wiki_path /path/to/my_wiki \
-  --resume
-```
-It reads `extraction_log.json`, removes any incomplete chunks, and picks up immediately where it left off.

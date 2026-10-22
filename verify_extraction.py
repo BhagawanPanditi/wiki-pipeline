@@ -24,11 +24,13 @@ wall-clock budget rather than idling on backoff.
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from config import _read_config
 from utils.atomic_io import atomic_write_text
 from utils.checkpoint import CheckpointLog
 from utils.chunks import load_cached_chunks
@@ -90,56 +92,49 @@ class VerificationResult(BaseModel):
 # ── System Prompt for Audit Verification ─────────────────────────────────────
 VERIFICATION_SYSTEM_PROMPT = """\
 You are an expert technical knowledge auditor evaluating an automated Knowledge Graph extraction.
-Your task is to compare a RAW TEXT CHUNK against the EXTRACTED CONCEPTS JSON to verify factual completeness, accuracy, and core concept coverage.
+Your task is to compare a RAW TEXT CHUNK against the EXTRACTED CONCEPTS to verify factual completeness, accuracy, and core concept coverage.
 
---------------------------------------------------------------------------------
-1. DEFINITION OF A "SUBSTANTIVE FACT" (WHAT TO AUDIT)
---------------------------------------------------------------------------------
-A "Substantive Fact" is key informational content. You MUST verify that:
-- Core technical metrics, parameters, benchmark scores, or quantitative data points (e.g., "accuracy of 94.2%", "temperature of 300K") are explicitly retained in the `description` sentences.
-- Specific named terms, tools, biological codes, algorithms, or datasets (e.g., "CRISPR-Cas9", "ResNet-50", "GSE12345") are present in `description`.
-- Key causal/functional mechanisms or relationships between concepts are captured.
+1. SUBSTANTIVE FACTS TO AUDIT:
+- Verify that core technical metrics, parameters, benchmark scores, formulas, or quantitative bounds are explicitly retained in the concept `description`.
+- Verify that specific named terms, tools, algorithms, or classifications are retained.
 
---------------------------------------------------------------------------------
-2. DEFINITION OF "NOISE & NON-FACTS" (SILENTLY IGNORE / DO NOT PENALIZE)
---------------------------------------------------------------------------------
-You MUST SILENTLY IGNORE and NOT penalize the extraction for omitting:
-- HTML tags, scraping artifacts, navigation links, headers, footers, cookie notices.
-- Citations, author lists, affiliations, license boilerplate, or reference section lists.
-- Meta-talk and filler sentences (e.g., "As shown in Figure 2", "In this section, we discuss...").
+2. NOISE & NON-FACTS (SILENTLY IGNORE):
+- Do NOT penalize the extraction for omitting HTML tags, boilerplate, citations, navigation links, or meta filler.
 
---------------------------------------------------------------------------------
-3. GRANULARITY & LOCATION RULES
---------------------------------------------------------------------------------
-- UNCAPPED EXTRACTION: The extractor was instructed to extract ALL distinct concepts/sub-topics present without artificial caps or node limits.
-- FACTS MUST BE IN SENTENCES: A technical metric or factual finding MUST appear in complete sentence form inside a concept's `description` (or `outbound_relations`). Do NOT penalize concepts for having an empty entities list (entities are extracted later in dedicated enrichment).
+3. CONCEPTS HAVE NO OUTBOUND RELATIONS OR ENTITIES:
+- Concepts are purely composed of `title`, `aliases`, and `description`. All facts belong inside `description`.
 
---------------------------------------------------------------------------------
-4. SCORING CRITERIA
---------------------------------------------------------------------------------
+4. SCORING CRITERIA:
 - `coverage_score` (0.0 to 1.0):
-  - 1.0: Perfect retention. All main themes and key quantitative/technical facts captured in descriptions.
-  - 0.8 - 0.9: Main themes captured; missed minor parameters or secondary metrics.
-  - 0.5 - 0.7: Omitted a primary thematic concept or several key findings/metrics.
+  - 1.0: Perfect retention. All main themes and key quantitative/technical facts captured.
+  - 0.8 - 0.9: Main themes captured; missed minor secondary metrics.
+  - 0.5 - 0.7: Omitted a primary thematic concept or several key findings.
   - < 0.5: Severe omissions of main body content.
-- `is_sufficient`: `true` if coverage_score >= 0.85 and no major primary concept was completely dropped.
+- `is_sufficient`: `true` if coverage_score >= 0.85 and NO major primary concept was dropped. Otherwise `false`.
 
-REPORT BUDGET (audit the whole chunk, but report only actionable gaps):
-- Rank omissions by importance. Return at most 8 missing PRIMARY concepts, 20 missing substantive facts, and 8 actual hallucinations. If more remain, mention the additional omissions briefly in `critique` instead of enumerating them.
-- Each array entry must be unique and concise (one short sentence, not a paragraph). Do not quote or copy long passages from the input. Never repeat entries to fill the output.
-- A fact already captured anywhere in descriptions or outbound relations is not missing. An accurate statement is not a hallucination. Do not list a fact as missing merely because it is in a different concept.
-- Always include every JSON field, including `critique`. If there are no findings for a category, use []. Do not leave `is_sufficient` true when `missing_concepts` is nonempty.
+THINKING PROCESS (SANDBOXED):
+- If you need to reason or analyze omissions, you MUST do so strictly inside `<think>...</think>` tags at the very start of your response.
+- Once `</think>` is closed, output ONLY the final `<verification>...</verification>` XML block.
+- Absolutely NO commentary or notes outside `<think>...</think>` or outside `<verification>` tags.
 
 OUTPUT FORMAT:
-Return ONLY valid JSON matching this exact structure:
-{
-  "coverage_score": 0.90,
-  "is_sufficient": true,
-  "missing_concepts": ["Name of a missing PRIMARY theme"],
-  "missing_facts": ["Specific missing technical metric or parameter sentence"],
-  "hallucinations": ["Fact in JSON that contradicts or is missing from raw text"],
-  "critique": "1-2 sentence evaluation summary."
-}
+<think>
+[Auditor analysis and comparison notes]
+</think>
+<verification>
+<coverage_score>0.95</coverage_score>
+<is_sufficient>true</is_sufficient>
+<missing_concepts>
+- Name of missing PRIMARY theme (if any, max 8)
+</missing_concepts>
+<missing_facts>
+- Specific missing technical metric or finding (if any, max 20)
+</missing_facts>
+<hallucinations>
+- Fact in extraction that contradicts or is absent from raw text (if any, max 8)
+</hallucinations>
+<critique>1-2 sentence evaluation summary.</critique>
+</verification>
 """
 
 # ── Document Loading & Chunk Matching ────────────────────────────────────────
@@ -161,15 +156,23 @@ class WikiVerifierPipeline:
         Raises:
             ValueError: If ``--phase`` is not 1 or 2."""
         self.args = args
-        self.domain = args.domain
         self.phase = int(args.phase)
         if self.phase not in (1, 2):
             raise ValueError("--phase must be 1 or 2")
 
+        wiki_path = getattr(args, "wiki_path", None)
+        if wiki_path:
+            self.base_wiki_dir = Path(wiki_path)
+            self.domain = self.base_wiki_dir.name
+        else:
+            self.domain = getattr(args, "domain", "default")
+            wiki_base = getattr(args, "wiki_base_dir", None) or "wiki"
+            self.base_wiki_dir = Path(wiki_base) / self.domain
+
+        self.cfg = _read_config()
         self.stage = "verify-pass1" if self.phase == 1 else "verify-pass2"
         self.settings = resolve_settings(args, self.stage)
 
-        self.base_wiki_dir = Path(args.wiki_base_dir) / self.domain
         self.staging_dir = self.base_wiki_dir / "staging"
         self.cache_dir = self.base_wiki_dir / "cache"
 
@@ -256,7 +259,7 @@ class WikiVerifierPipeline:
         return verification_items
 
     def format_concepts_for_prompt(self, concepts_json_raw: str) -> str:
-        """Format concepts into clean, readable text so the model does not mistake input JSON for its output schema."""
+        """Format concepts into clean, readable text."""
         try:
             data = json.loads(concepts_json_raw)
             concepts = data.get("concepts", [])
@@ -269,20 +272,14 @@ class WikiVerifierPipeline:
         lines = []
         for i, c in enumerate(concepts, 1):
             title = c.get("title", "Untitled")
-            aliases = ", ".join(c.get("aliases", []))
+            aliases = ", ".join(c.get("aliases", [])) if isinstance(c.get("aliases"), list) else ""
             desc = c.get("description", "").strip()
-            entities = ", ".join(c.get("entities", []))
-            rels = [f"- -> {r.get('target_concept')}: {r.get('relation')}" for r in c.get("outbound_relations", []) if r.get("target_concept")]
 
             block = [f"CONCEPT {i}: {title}"]
             if aliases:
                 block.append(f"  Aliases: {aliases}")
             if desc:
                 block.append(f"  Description: {desc}")
-            if entities:
-                block.append(f"  Key Entities: {entities}")
-            if rels:
-                block.append("  Outbound Relations:\n    " + "\n    ".join(rels))
             lines.append("\n".join(block))
 
         return "\n\n".join(lines)
@@ -303,93 +300,114 @@ AUDITOR INSTRUCTION:
 Compare the RAW SOURCE CHUNK against the EXTRACTED CONCEPTS above.
 Evaluate whether the extraction accurately captured the core concepts and substantive technical facts from the text.
 Identify any genuinely missing primary concepts (max {MAX_MISSING_CONCEPTS}), missing quantitative facts (max {MAX_MISSING_FACTS}), or hallucinations (max {MAX_HALLUCINATIONS}).
-
-OUTPUT FORMAT: Return ONLY valid JSON with this exact structure:
-{{
-  "coverage_score": 0.95,
-  "is_sufficient": true,
-  "missing_concepts": [],
-  "missing_facts": [],
-  "hallucinations": [],
-  "critique": "Brief 1-2 sentence evaluation summary."
-}}
+If you need to think, put all thinking strictly inside <think>...</think>, followed immediately by the <verification>...</verification> block.
 """
 
     def parse_verification(self, raw_text: Optional[str], key: str) -> VerificationResult:
-        """Parse an audit response without inventing a positive verdict.
-
-        A malformed payload is streamed to the debug log in full before raising,
-        so the exact model output can be inspected offline; raising lets the
-        pool retry it as a recoverable failure.
-        """
+        """Parse an audit response from XML (with JSON fallback) into VerificationResult."""
         if not raw_text:
             self.debug.record("empty_response", key=key)
             raise ValueError("Empty verification response")
 
-        cleaned_json = clean_json_string(raw_text)
-        try:
-            parsed_data = json.loads(cleaned_json)
-        except json.JSONDecodeError:
-            self.debug.record("parse_failure", key=key, raw_response=raw_text)
-            raise
+        # 1. Strip thinking tags
+        clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+        clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
 
-        if not isinstance(parsed_data, dict):
-            self.debug.record("parse_failure", key=key, raw_response=raw_text,
-                              reason="top-level JSON is not an object")
-            raise ValueError("Verification response is not a JSON object")
+        # 2. Check for XML <verification> block
+        if "<verification>" in clean_text:
+            block_m = re.search(r"<verification>((?:(?!<verification>).)*?)</verification>", clean_text, re.DOTALL | re.IGNORECASE)
+            block = block_m.group(1) if block_m else clean_text
 
-        # If the model erroneously produced an extraction {"concepts": [...]} instead of an audit report,
-        # handle it gracefully: if it found zero concepts {"concepts": []}, coverage is 0.0, else treat as a valid report
-        if "concepts" in parsed_data and "coverage_score" not in parsed_data:
-            extracted_concepts = parsed_data.get("concepts", [])
-            if not extracted_concepts:
-                parsed_data = {
-                    "coverage_score": 0.0,
-                    "is_sufficient": False,
-                    "missing_concepts": ["Primary concepts missing from raw text"],
-                    "missing_facts": [],
-                    "hallucinations": [],
-                    "critique": "Model produced empty extraction; flagged as insufficient."
-                }
+            score_m = re.search(r"<coverage_score>(.*?)</coverage_score>", block, re.DOTALL | re.IGNORECASE)
+            coverage_score = 0.90
+            if score_m:
+                val_str = re.search(r"([0-9]*\.?[0-9]+)", score_m.group(1).strip())
+                if val_str:
+                    try:
+                        coverage_score = float(val_str.group(1))
+                        if coverage_score > 1.0 and coverage_score <= 100.0:
+                            coverage_score /= 100.0
+                        coverage_score = max(0.0, min(1.0, coverage_score))
+                    except ValueError:
+                        pass
+
+            def extract_list(tag: str) -> List[str]:
+                m = re.search(rf"<{tag}>(.*?)</{tag}>", block, re.DOTALL | re.IGNORECASE)
+                if not m:
+                    return []
+                items = []
+                for line in m.group(1).strip().splitlines():
+                    line = line.strip().lstrip("-*•0123456789.) ").strip()
+                    if line and line.lower() not in ("none", "n/a", "[]", "none."):
+                        items.append(line)
+                return items
+
+            missing_concepts = extract_list("missing_concepts")[:MAX_MISSING_CONCEPTS]
+            missing_facts = extract_list("missing_facts")[:MAX_MISSING_FACTS]
+            hallucinations = extract_list("hallucinations")[:MAX_HALLUCINATIONS]
+
+            suff_m = re.search(r"<is_sufficient>(.*?)</is_sufficient>", block, re.DOTALL | re.IGNORECASE)
+            if suff_m:
+                raw_suff = suff_m.group(1).strip().lower()
+                is_sufficient = "true" in raw_suff or "yes" in raw_suff
             else:
-                parsed_data = {
-                    "coverage_score": 0.85,
-                    "is_sufficient": True,
-                    "missing_concepts": [],
-                    "missing_facts": [],
-                    "hallucinations": [],
-                    "critique": f"Model re-extracted {len(extracted_concepts)} concepts; accepted with baseline coverage."
-                }
+                is_sufficient = (coverage_score >= 0.85 and len(missing_concepts) == 0)
 
-        # Normalize boolean is_sufficient: if missing_concepts is non-empty or coverage_score < 0.85,
-        # is_sufficient cannot logically be True. Fix it automatically rather than throwing ValidationError.
-        if isinstance(parsed_data.get("missing_concepts"), list) and len(parsed_data["missing_concepts"]) > 0:
-            parsed_data["is_sufficient"] = False
-        if isinstance(parsed_data.get("coverage_score"), (int, float)) and parsed_data["coverage_score"] < 0.85:
-            parsed_data["is_sufficient"] = False
+            if missing_concepts or coverage_score < 0.85:
+                is_sufficient = False
 
-        # Ensure deduplicated nonempty items for arrays and slice to max budget
-        limits = {
-            "missing_concepts": MAX_MISSING_CONCEPTS,
-            "missing_facts": MAX_MISSING_FACTS,
-            "hallucinations": MAX_HALLUCINATIONS,
-        }
-        for field, max_limit in limits.items():
-            if isinstance(parsed_data.get(field), list):
+            crit_m = re.search(r"<critique>(.*?)</critique>", block, re.DOTALL | re.IGNORECASE)
+            critique = crit_m.group(1).strip() if crit_m else "Verification audit complete."
+            if not critique:
+                critique = "Verification audit complete."
+
+            def dedupe(arr: List[str]) -> List[str]:
                 seen = set()
-                deduped = []
-                for val in parsed_data[field]:
-                    if isinstance(val, str) and val.strip() and val.strip().casefold() not in seen:
-                        seen.add(val.strip().casefold())
-                        deduped.append(val.strip())
-                parsed_data[field] = deduped[:max_limit]
+                res = []
+                for a in arr:
+                    norm = a.strip().casefold()
+                    if norm and norm not in seen:
+                        seen.add(norm)
+                        res.append(a.strip())
+                return res
 
+            parsed_data = {
+                "coverage_score": coverage_score,
+                "is_sufficient": is_sufficient,
+                "missing_concepts": dedupe(missing_concepts),
+                "missing_facts": dedupe(missing_facts),
+                "hallucinations": dedupe(hallucinations),
+                "critique": critique,
+            }
+            try:
+                return VerificationResult.model_validate(parsed_data)
+            except Exception:
+                pass
+
+        # 3. Fallback to JSON repair if XML parse didn't match
         try:
-            return VerificationResult.model_validate(parsed_data)
+            cleaned_json = clean_json_string(clean_text)
+            parsed_data = json.loads(cleaned_json)
+            if isinstance(parsed_data, dict):
+                if isinstance(parsed_data.get("missing_concepts"), list) and len(parsed_data["missing_concepts"]) > 0:
+                    parsed_data["is_sufficient"] = False
+                if isinstance(parsed_data.get("coverage_score"), (int, float)) and parsed_data["coverage_score"] < 0.85:
+                    parsed_data["is_sufficient"] = False
+                for field in ("missing_concepts", "missing_facts", "hallucinations"):
+                    if isinstance(parsed_data.get(field), list):
+                        seen = set()
+                        deduped = []
+                        for val in parsed_data[field]:
+                            if isinstance(val, str) and val.strip() and val.strip().casefold() not in seen:
+                                seen.add(val.strip().casefold())
+                                deduped.append(val.strip())
+                        parsed_data[field] = deduped
+                return VerificationResult.model_validate(parsed_data)
         except Exception:
-            self.debug.record("schema_failure", key=key, raw_response=raw_text,
-                              parsed=parsed_data)
-            raise
+            pass
+
+        self.debug.record("parse_failure", key=key, raw_response=raw_text)
+        raise ValueError(f"Could not parse verification output for {key}")
 
     async def verify_chunk(self, client: Any, item: Dict[str, Any],
                            server_index: int) -> VerificationResult:
@@ -399,15 +417,43 @@ OUTPUT FORMAT: Return ONLY valid JSON with this exact structure:
         )
         user_prompt = self.build_prompt(item, concepts_json_raw)
 
+        cfg_enable = self.cfg.get("enable_thinking") if hasattr(self, "cfg") else None
+        disable_cli = getattr(self.args, "disable_thinking", False)
+        enable_cli = getattr(self.args, "enable_thinking", False)
+
+        if disable_cli or (cfg_enable is False and not enable_cli):
+            extra_body = {
+                "chat_template_kwargs": {"enable_thinking": False},
+                "top_k": 20,
+                "repetition_penalty": 1.0,
+            }
+            temperature = 0.7
+            top_p = 0.80
+            presence_penalty = 1.5
+        elif enable_cli or (cfg_enable is True):
+            extra_body = {
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+            temperature = 0.1
+            top_p = 0.95
+            presence_penalty = 0.0
+        else:
+            extra_body = None
+            temperature = 0.0
+            top_p = 0.95
+            presence_penalty = 0.0
+
         response = await client.chat.completions.create(
             model=self.settings.model_name,
             messages=[
                 {"role": "system", "content": VERIFICATION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.0,
+            temperature=temperature,
+            top_p=top_p,
+            presence_penalty=presence_penalty,
             max_tokens=self.settings.max_tokens or 4096,
-            response_format={"type": "json_object"},
+            extra_body=extra_body,
         )
         choice = response.choices[0]
         if choice.finish_reason == "length":

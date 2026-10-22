@@ -516,10 +516,6 @@ def main() -> None:
         description="High-throughput concept extractor: corpus -> per-chunk concepts",
         include_corpus=True,
         include_resume=True)
-    parser.add_argument("--disable_thinking", action="store_true", default=False,
-                        help="Disable Qwen3.8-27B thinking mode (Instruct mode with enable_thinking=False)")
-    parser.add_argument("--enable_thinking", action="store_true", default=False,
-                        help="Explicitly enable Qwen3.8-27B thinking mode")
     args = parser.parse_args()
     pipeline = WikiExtractorPipeline(args)
     asyncio.run(pipeline.run())

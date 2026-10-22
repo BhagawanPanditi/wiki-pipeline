@@ -8,13 +8,15 @@ Refinement Pass 2: Second-Pass Knowledge Graph Concept Extraction & Patching
 import asyncio
 import functools
 import json
+import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from pydantic import BaseModel, Field
 
+from config import _read_config
 from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
 from utils.chunks import load_cached_chunks
 from utils.cli import build_parser, resolve_settings
@@ -32,39 +34,21 @@ STAGE = "refine-concepts"
 
 # ── Pydantic Data Schemas for Second Pass ─────────────────────────────────────
 
-class OutboundRelation(BaseModel):
-    target_concept: str = Field(description="Exact canonical title of the target concept.")
-    relation: str = Field(description="1 sentence describing how this concept affects/relates outward to Target Concept.")
-
 class ConceptUpdate(BaseModel):
     title: str = Field(description="Exact title of the EXISTING concept being updated.")
     additional_aliases: List[str] = Field(
         default_factory=list, 
         description="New acronyms or alternative canonical names to add."
     )
-    additional_description_sentences: List[str] = Field(
-        default_factory=list,
-        description="Dense factual sentences containing newly extracted facts/metrics to append to the existing description paragraph."
-    )
-    additional_entities: List[str] = Field(
-        default_factory=list, 
-        description="New minor named terms, tool versions, biological codes, or dataset identifiers to add to entities."
-    )
-    additional_outbound_relations: List[OutboundRelation] = Field(
-        default_factory=list, 
-        description="New outbound relations to add."
-    )
-    relations_to_remove: List[str] = Field(
-        default_factory=list,
-        description="List of target_concept titles of outbound relations that are inaccurate, obsolete, or should be removed."
+    additional_description: str = Field(
+        default="",
+        description="Dense factual sentences to append to existing description paragraph."
     )
 
 class Concept(BaseModel):
     title: str = Field(description="Exact canonical title (1-6 words, singular).")
     aliases: List[str] = Field(default_factory=list, description="Explicit acronyms or alternative names.")
     description: str = Field(description="Single dense factual paragraph with all raw metrics, parameters, and details.")
-    entities: List[str] = Field(default_factory=list, description="Flat list of minor named entities, tools, biological terms, dates, parameters.")
-    outbound_relations: List[OutboundRelation] = Field(default_factory=list)
 
 class Pass2ExtractionSchema(BaseModel):
     new_concepts: List[Concept] = Field(
@@ -76,8 +60,6 @@ class Pass2ExtractionSchema(BaseModel):
         description="Updates and factual patches for concepts extracted in Pass 1."
     )
 
-# ── Helper Utilities ─────────────────────────────────────────────────────────
-
 # ── Second-Pass System Prompt ────────────────────────────────────────────────
 
 SYSTEM_PROMPT_PASS2 = """\
@@ -85,58 +67,130 @@ You are an expert technical knowledge auditor performing a SECOND-PASS EXTRACTIO
 
 YOUR MISSION:
 Perform an exhaustive comparison between the RAW CHUNK text and the EXISTING EXTRACTED CONCEPTS (from Pass 1).
-Identify any missing concepts, omitted technical metrics, parameters, or relationships, and generate patch updates.
+Identify any missing concepts, omitted technical metrics, parameters, or factual details, and generate XML patch updates.
 
 CRITICAL RULES:
-1. NO CONCEPT LIMITS: Do NOT artificially restrict concept counts. Extract EVERY substantive concept or sub-topic that has factual explanations in the chunk.
-2. FACTS ARE SENTENCES:
-   - ALL technical facts, numbers, bounds, statistical parameters, tool mentions, and procedural details MUST be written as complete sentences inside concept descriptions (`description` or `additional_description_sentences`).
-   - Do NOT extract named entities into an entities list at this stage (leave entities empty). Dedicated entity extraction runs in a later pipeline stage.
-3. AUDIT FEEDBACK HINTS:
+1. ONLY SOLID CONCEPTS:
+   - Extract major, solid, well-developed subjects. Minor details and properties must be absorbed into the comprehensive description of their primary concept.
+2. NO RELATIONS OR ENTITIES:
+   - Concepts are strictly composed of `title`, `aliases`, and `description`. Do not extract relations or separate entities.
+3. FACTS ARE COMPLETE SENTENCES:
+   - ALL technical facts, numbers, bounds, parameters, tool mentions, and findings MUST be complete sentences inside concept descriptions.
+4. AUDIT FEEDBACK HINTS:
    - If AUDIT FEEDBACK is provided below, prioritize extracting all missing concepts and missing facts listed in that audit.
-4. OUTBOUND RELATIONS REFINEMENT:
-   - If an existing relation between Concept A and Concept B is imprecise or redundant, specify its `target_concept` in `relations_to_remove` so it can be pruned.
-   - Add new high-value outbound relations in `additional_outbound_relations`. Each outbound relation MUST have a concise 1-sentence description explaining how this concept affects or relates outward to Target Concept.
+
+THINKING PROCESS (SANDBOXED):
+- If you need to analyze the text, plan missing concepts, or deliberate on updates, you MUST do so strictly inside `<think>...</think>` tags at the very beginning of your response.
+- Once `</think>` is closed, output ONLY the final XML update blocks.
+- Absolutely NO commentary or notes outside `<think>...</think>`.
 
 OUTPUT FORMAT:
-Return ONLY valid JSON matching this exact structure:
-{
-  "new_concepts": [
-    {
-      "title": "Exact Title of Missed Concept",
-      "aliases": ["Acronym or Alt Name"],
-      "description": "Dense factual paragraph with all quantitative metrics and findings from this chunk.",
-      "entities": [],
-      "outbound_relations": [
-        {
-          "target_concept": "Target Title",
-          "relation": "1 sentence describing relationship."
-        }
-      ]
-    }
-  ],
-  "concept_updates": [
-    {
-      "title": "Exact Title of Existing Concept to Update",
-      "additional_aliases": ["New Acronym"],
-      "additional_description_sentences": [
-        "First sentence containing specific metric or finding missed in Pass 1.",
-        "Second sentence describing experimental parameter or condition."
-      ],
-      "additional_entities": [],
-      "additional_outbound_relations": [
-        {
-          "target_concept": "Target Title",
-          "relation": "1 sentence describing newly identified outbound relation."
-        }
-      ],
-      "relations_to_remove": [
-        "Title of Target Concept whose relation should be deleted"
-      ]
-    }
-  ]
-}
+Output brand-new concepts using <new_concept>...</new_concept> blocks:
+<new_concept>
+<title>Exact Canonical Title</title>
+<aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
+<description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all raw quantitative metrics and findings from this chunk.</description>
+</new_concept>
+
+Output factual updates to existing Pass 1 concepts using <update_concept>...</update_concept> blocks:
+<update_concept>
+<title>Exact Canonical Title of Existing Concept</title>
+<additional_aliases>New Alt Name 1; New Alt Name 2</additional_aliases>
+<additional_description>Dense factual sentences containing newly extracted facts/metrics to append to the existing description.</additional_description>
+</update_concept>
+
+If the existing extraction is already complete and no updates or new concepts are needed, output nothing.
 """
+
+# ── XML Parsing Helper for Refinement ────────────────────────────────────────
+
+def parse_xml_refinement(text: str) -> Pass2ExtractionSchema:
+    if not text:
+        return Pass2ExtractionSchema()
+
+    # 1. Strip thinking tags
+    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
+    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
+
+    new_concepts: List[Concept] = []
+    # Match <new_concept> or <concept>
+    new_blocks = re.findall(
+        r"<(?:new_concept|concept)>((?:(?!<(?:new_concept|concept)>).)*?)</(?:new_concept|concept)>",
+        clean_text, re.DOTALL | re.IGNORECASE
+    )
+    for block in new_blocks:
+        title_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
+        if not title_m or not title_m.group(1).strip():
+            continue
+        title = title_m.group(1).strip()
+
+        desc_m = re.search(r"<description>(.*?)</description>", block, re.DOTALL | re.IGNORECASE)
+        description = desc_m.group(1).strip() if desc_m else ""
+
+        aliases = []
+        aliases_m = re.search(r"<aliases>(.*?)</aliases>", block, re.DOTALL | re.IGNORECASE)
+        if aliases_m:
+            raw_aliases = aliases_m.group(1).strip()
+            aliases = [a.strip() for a in re.split(r"[;,]", raw_aliases) if a.strip()]
+
+        new_concepts.append(Concept(title=title, aliases=aliases, description=description))
+
+    concept_updates: List[ConceptUpdate] = []
+    # Match <update_concept>
+    update_blocks = re.findall(
+        r"<update_concept>((?:(?!<update_concept>).)*?)</update_concept>",
+        clean_text, re.DOTALL | re.IGNORECASE
+    )
+    for block in update_blocks:
+        title_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
+        if not title_m or not title_m.group(1).strip():
+            continue
+        title = title_m.group(1).strip()
+
+        desc_m = re.search(r"<(?:additional_description|description)>(.*?)</(?:additional_description|description)>", block, re.DOTALL | re.IGNORECASE)
+        additional_desc = desc_m.group(1).strip() if desc_m else ""
+
+        aliases = []
+        aliases_m = re.search(r"<(?:additional_aliases|aliases)>(.*?)</(?:additional_aliases|aliases)>", block, re.DOTALL | re.IGNORECASE)
+        if aliases_m:
+            raw_aliases = aliases_m.group(1).strip()
+            aliases = [a.strip() for a in re.split(r"[;,]", raw_aliases) if a.strip()]
+
+        concept_updates.append(ConceptUpdate(
+            title=title,
+            additional_aliases=aliases,
+            additional_description=additional_desc
+        ))
+
+    # Fallback to JSON repair if no XML tags found
+    if not new_concepts and not concept_updates and "{" in clean_text:
+        try:
+            cleaned_json = clean_json_string(clean_text)
+            parsed = json.loads(cleaned_json)
+            if isinstance(parsed, dict):
+                nc_list = []
+                for c in parsed.get("new_concepts", []):
+                    if isinstance(c, dict) and c.get("title"):
+                        nc_list.append(Concept(
+                            title=c["title"],
+                            aliases=c.get("aliases", []),
+                            description=c.get("description", "")
+                        ))
+                cu_list = []
+                for u in parsed.get("concept_updates", []):
+                    if isinstance(u, dict) and u.get("title"):
+                        sentences = u.get("additional_description_sentences", [])
+                        add_desc = " ".join(sentences) if isinstance(sentences, list) else str(u.get("additional_description", ""))
+                        cu_list.append(ConceptUpdate(
+                            title=u["title"],
+                            additional_aliases=u.get("additional_aliases", []),
+                            additional_description=add_desc
+                        ))
+                return Pass2ExtractionSchema(new_concepts=nc_list, concept_updates=cu_list)
+        except Exception:
+            pass
+
+    return Pass2ExtractionSchema(new_concepts=new_concepts, concept_updates=concept_updates)
 
 # ── Pipeline Implementation ──────────────────────────────────────────────────
 
@@ -150,8 +204,16 @@ class WikiSecondPassPipeline:
         Raises:
             FileNotFoundError: If the staging folder from Pass 1 is missing."""
         self.args = args
-        self.domain = args.domain
-        self.base_wiki_dir = Path(args.wiki_base_dir) / self.domain
+        wiki_path = getattr(args, "wiki_path", None)
+        if wiki_path:
+            self.base_wiki_dir = Path(wiki_path)
+            self.domain = self.base_wiki_dir.name
+        else:
+            self.domain = getattr(args, "domain", "default")
+            wiki_base = getattr(args, "wiki_base_dir", None) or "wiki"
+            self.base_wiki_dir = Path(wiki_base) / self.domain
+
+        self.cfg = _read_config()
         self.staging_dir = self.base_wiki_dir / "staging"
         self.cache_dir = self.base_wiki_dir / "cache"
         self.pass2_log_file = self.base_wiki_dir / "pass2_log.json"
@@ -296,13 +358,6 @@ AUDIT FEEDBACK (PREVIOUS VERIFICATION FOUND OMISSIONS):
                     block.append(f"  Aliases: {aliases}")
                 if desc:
                     block.append(f"  Description: {desc}")
-                rels = [
-                    f"- -> {r.get('target_concept')}: {r.get('relation')}"
-                    for r in c.get("outbound_relations", [])
-                    if isinstance(r, dict) and r.get("target_concept")
-                ]
-                if rels:
-                    block.append("  Outbound Relations:\n    " + "\n    ".join(rels))
                 pass1_lines.append("\n".join(block))
 
         pass1_text = "\n\n".join(pass1_lines) if pass1_lines else "None (empty extraction)"
@@ -320,43 +375,61 @@ CONTEXT AFTER:
 EXISTING EXTRACTED CONCEPTS (PASS 1):
 {pass1_text}
 {audit_str}
+
+Output refinement patch updates in XML format using <new_concept> and <update_concept>. If you need to think, do so strictly inside <think>...</think>.
 """
         raw_text = None
         finish_reason = None
         try:
+            cfg_enable = self.cfg.get("enable_thinking") if hasattr(self, "cfg") else None
+            disable_cli = getattr(self.args, "disable_thinking", False)
+            enable_cli = getattr(self.args, "enable_thinking", False)
+
+            if disable_cli or (cfg_enable is False and not enable_cli):
+                extra_body = {
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "top_k": 20,
+                    "repetition_penalty": 1.0,
+                }
+                temperature = 0.7
+                top_p = 0.80
+                presence_penalty = 1.5
+            elif enable_cli or (cfg_enable is True):
+                extra_body = {
+                    "chat_template_kwargs": {"enable_thinking": True},
+                }
+                temperature = 0.1
+                top_p = 0.95
+                presence_penalty = 0.0
+            else:
+                extra_body = None
+                temperature = 0.1
+                top_p = 0.95
+                presence_penalty = 0.0
+
             response = await client.chat.completions.create(
                 model=self.settings.model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_PASS2},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.1,
+                temperature=temperature,
+                top_p=top_p,
+                presence_penalty=presence_penalty,
                 max_tokens=self.settings.max_tokens,
-                response_format={"type": "json_object"}
+                extra_body=extra_body,
             )
 
             choice = response.choices[0]
             finish_reason = choice.finish_reason
             raw_text = choice.message.content or ""
 
-            if finish_reason == "length":
-                # Try to salvage valid concepts from truncated JSON using clean_json_string
-                try:
-                    cleaned_json = clean_json_string(raw_text)
-                    salvaged = Pass2ExtractionSchema.model_validate_json(cleaned_json)
-                    if salvaged.new_concepts or salvaged.concept_updates:
-                        return salvaged
-                except Exception:
-                    pass
-                raise ValueError(f"Response truncated: Hit max_tokens ({self.settings.max_tokens}).")
-
-            cleaned_json = clean_json_string(raw_text)
-            return Pass2ExtractionSchema.model_validate_json(cleaned_json)
+            return parse_xml_refinement(raw_text)
 
         except Exception as exc:
             self.attempts.record(key, server=str(client.base_url), finish_reason=finish_reason,
-                                     raw_text=raw_text, error_type=type(exc).__name__,
-                                     error_message=str(exc))
+                                 raw_text=raw_text, error_type=type(exc).__name__,
+                                 error_message=str(exc))
             raise
 
     async def persist_refinement(self, item: Dict[str, Any],
@@ -382,8 +455,9 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
         self.decisions.record(
             "concept_refined", chunk=key,
             concepts_updated=[{"title": u.title, "aliases_added": list(u.additional_aliases),
-                               "sentences_added": len(u.additional_description_sentences)}
-                              for u in delta.concept_updates])
+                               "has_desc": bool(u.additional_description)}
+                              for u in delta.concept_updates],
+            new_concepts_added=[c.title for c in delta.new_concepts])
         merged_payload = json.dumps(merged_data, indent=2)
         await asyncio.to_thread(concepts_file.write_text, merged_payload, encoding="utf-8")
 
@@ -435,43 +509,40 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
                         existing_aliases.add(alias)
 
                 # Append factual sentences to description
-                if update.additional_description_sentences:
-                    new_text = " ".join(update.additional_description_sentences)
-                    c["description"] = f"{c.get('description', '').strip()} {new_text.strip()}".strip()
-
-                # Append entities (deduplicated)
-                existing_entities = set(c.get("entities", []))
-                for ent in update.additional_entities:
-                    if ent not in existing_entities:
-                        c.setdefault("entities", []).append(ent)
-                        existing_entities.add(ent)
-
-                # Prune specified relations
-                if update.relations_to_remove:
-                    remove_targets = {r.strip().lower() for r in update.relations_to_remove}
-                    c["outbound_relations"] = [
-                        rel for rel in c.get("outbound_relations", [])
-                        if rel.get("target_concept", "").strip().lower() not in remove_targets
-                    ]
-
-                # Append new outbound relations
-                existing_rel_targets = {
-                    rel.get("target_concept", "").strip().lower() 
-                    for rel in c.get("outbound_relations", [])
-                }
-                for new_rel in update.additional_outbound_relations:
-                    rel_dict = new_rel.model_dump()
-                    if rel_dict["target_concept"].strip().lower() not in existing_rel_targets:
-                        c.setdefault("outbound_relations", []).append(rel_dict)
-                        existing_rel_targets.add(rel_dict["target_concept"].strip().lower())
+                if update.additional_description.strip():
+                    existing_desc = c.get("description", "").strip()
+                    c["description"] = f"{existing_desc} {update.additional_description.strip()}".strip()
+            else:
+                if update.additional_description.strip():
+                    new_item = {
+                        "title": update.title,
+                        "aliases": update.additional_aliases,
+                        "description": update.additional_description.strip(),
+                    }
+                    concepts_list.append(new_item)
+                    concept_map[target_key] = new_item
 
         # 2. Add brand-new concepts
         for new_c in pass2_delta.new_concepts:
             new_key = new_c.title.strip().lower()
             if new_key not in concept_map:
-                c_dict = new_c.model_dump()
+                c_dict = {
+                    "title": new_c.title,
+                    "aliases": new_c.aliases,
+                    "description": new_c.description,
+                }
                 concepts_list.append(c_dict)
                 concept_map[new_key] = c_dict
+            else:
+                c = concept_map[new_key]
+                existing_aliases = set(c.get("aliases", []))
+                for a in new_c.aliases:
+                    if a not in existing_aliases:
+                        c.setdefault("aliases", []).append(a)
+                        existing_aliases.add(a)
+                if new_c.description.strip():
+                    existing_desc = c.get("description", "").strip()
+                    c["description"] = f"{existing_desc} {new_c.description.strip()}".strip()
 
         return {"concepts": concepts_list}
 
