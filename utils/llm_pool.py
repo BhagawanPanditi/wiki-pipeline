@@ -96,7 +96,7 @@ class ServerPool:
         label: str = "stage",
         failover: bool = True,
         unhealthy_threshold: int = 3,
-        llm_log: Optional[LLMCallLog] = None,
+        llm_log: Optional[Any] = None,
     ):
         """Configure a pool; no connection is opened yet.
 
@@ -271,7 +271,7 @@ class ServerPool:
         desc: Optional[str] = None,
         key_fn: Optional[Callable[[Any], str]] = None,
         budget: Optional[StageBudget] = None,
-        debug: Optional[EventLog] = None,
+        debug: Optional[Any] = None,
         attempt_timeout: Optional[float] = None,
         on_result: Optional[Callable[[Any, Any], Awaitable[None]]] = None,
         show_progress: bool = True,
