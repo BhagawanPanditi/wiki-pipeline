@@ -287,7 +287,7 @@ class FinalConsolidationPipeline:
         for c in concepts:
             merge_uf.find(c["title"])
 
-        additional_links: List[Tuple[str, str]] = []
+        additional_links: List[Tuple[str, str, str]] = []
 
         # (A) Collect PRUNE
         for (c1, c2), verdict in decisions:
@@ -306,7 +306,8 @@ class FinalConsolidationPipeline:
         # (C) Collect LINK
         for (c1, c2), verdict in decisions:
             if verdict.action == "LINK" and c1["title"] not in pruned_titles and c2["title"] not in pruned_titles:
-                additional_links.append((c1["title"], c2["title"]))
+                reason = verdict.reason.strip() if verdict.reason else ""
+                additional_links.append((c1["title"], c2["title"], reason))
 
         print(f"Decisions collected: {len(pruned_titles)} pruned, {verified_merges} merged, {len(additional_links)} linked.")
 
@@ -425,7 +426,7 @@ class FinalConsolidationPipeline:
             del c["_raw_relations"]
 
         # Apply Additional Verified Links
-        for t1, t2 in additional_links:
+        for t1, t2, reason in additional_links:
             root1 = canonical_title_map.get(merge_uf.find(t1), t1)
             root2 = canonical_title_map.get(merge_uf.find(t2), t2)
             if root1.lower() != root2.lower() and root1.lower() in concept_by_name and root2.lower() in concept_by_name:
@@ -434,22 +435,55 @@ class FinalConsolidationPipeline:
                 targets1 = {r["target_concept"].lower() for r in c1_obj["outbound_relations"]}
                 targets2 = {r["target_concept"].lower() for r in c2_obj["outbound_relations"]}
 
+                ents1 = set(c1_obj.get("entities", []))
+                ents2 = set(c2_obj.get("entities", []))
+                shared_ents = sorted(list(ents1 & ents2))
+                union_len = len(ents1 | ents2)
+                calc_jacc = round(len(shared_ents) / union_len, 3) if union_len > 0 else 0.0
+
+                rel_text = f"Verified related: {reason}" if reason else "Functionally related in technical domain context."
+
                 if root2.lower() not in targets1:
                     c1_obj["outbound_relations"].append({
                         "target_concept": root2,
-                        "relation": "Functionally related in technical domain context.",
-                        "jaccard_similarity": None,
-                        "shared_entities": [],
-                        "source_chunks": []
+                        "relation": rel_text,
+                        "jaccard_similarity": calc_jacc,
+                        "shared_entities": shared_ents,
+                        "source_chunks": [],
+                        "verified_by_llm": True
                     })
+                else:
+                    for r in c1_obj["outbound_relations"]:
+                        if r["target_concept"].lower() == root2.lower():
+                            r["verified_by_llm"] = True
+                            if reason and reason not in r.get("relation", ""):
+                                r["relation"] = f"{r.get('relation', '')} (Verified: {reason})".strip()
+
                 if root1.lower() not in targets2:
                     c2_obj["outbound_relations"].append({
                         "target_concept": root1,
-                        "relation": "Functionally related in technical domain context.",
-                        "jaccard_similarity": None,
-                        "shared_entities": [],
-                        "source_chunks": []
+                        "relation": rel_text,
+                        "jaccard_similarity": calc_jacc,
+                        "shared_entities": shared_ents,
+                        "source_chunks": [],
+                        "verified_by_llm": True
                     })
+                else:
+                    for r in c2_obj["outbound_relations"]:
+                        if r["target_concept"].lower() == root1.lower():
+                            r["verified_by_llm"] = True
+                            if reason and reason not in r.get("relation", ""):
+                                r["relation"] = f"{r.get('relation', '')} (Verified: {reason})".strip()
+
+        # Sort all outbound relations: LLM-verified links first, then highest Jaccard similarity descending
+        for c in final_concepts:
+            c["outbound_relations"].sort(
+                key=lambda r: (
+                    1 if r.get("verified_by_llm") else 0,
+                    r.get("jaccard_similarity") if r.get("jaccard_similarity") is not None else 0.0
+                ),
+                reverse=True
+            )
 
         print(f"Total surviving concepts after final merge & pruning: {len(final_concepts)}")
         atomic_write_json(self.global_concepts_file, {"concepts": final_concepts})
