@@ -136,6 +136,16 @@ class BriefAndEntitiesPipeline:
         self.concepts_dir.mkdir(parents=True, exist_ok=True)
         if getattr(args, "resume", False):
             self.checkpoint = load_bool_log(self.log_file, corrupt_message="Log corrupted. Initializing fresh.")
+            # Also populate checkpoint from disk if concepts/ already has enriched files
+            for c_file in self.concepts_dir.glob("*.json"):
+                try:
+                    with open(c_file, "r", encoding="utf-8") as cf:
+                        disk_data = json.load(cf)
+                        t = disk_data.get("title")
+                        if t and disk_data.get("brief") and "entities" in disk_data:
+                            self.checkpoint[t] = True
+                except Exception:
+                    pass
         else:
             self.checkpoint = {}
         self.settings = resolve_settings(args, STAGE)
@@ -208,38 +218,8 @@ class BriefAndEntitiesPipeline:
                 save_log_sync(self.log_file, self.checkpoint)
                 self.flush_count = 0
 
-    async def run(self):
-        print(f"Loading concepts from {self.global_concepts_file}...")
-        with open(self.global_concepts_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            concepts = data.get("concepts", [])
-
-        total = len(concepts)
-        pending = [c for c in concepts if not self.checkpoint.get(c.get("title", ""), False)]
-
-        print(f"Total concepts: {total} | Pending brief & entity extraction: {len(pending)}")
-        settings = self.settings
-
-        if pending:
-            print(f"Distributing across {len(settings.servers)} server(s).")
-            print(f"Per-item attempts: {settings.attempts} | Stage budget: {settings.budget_minutes:g} min")
-
-            pool = pool_for_stage(self.args, settings, STAGE)
-            async with pool:
-                await pool.map(
-                    pending,
-                    self.generate_brief_and_entities,
-                    attempts=settings.attempts,
-                    desc="Generating Briefs & Entities",
-                    key_fn=lambda c: c.get("title", ""),
-                    budget=self.budget,
-                    attempt_timeout=settings.profile.attempt_timeout,
-                    on_result=self.persist_concept_brief,
-                )
-
-        save_log_sync(self.log_file, self.checkpoint)
-
-        # Merge in-memory concepts with individual files from concepts/ to ensure 100% data integrity
+    def assemble_and_save(self, concepts: List[Dict[str, Any]]):
+        """Assemble enriched concepts from disk and update global_concepts.json atomically."""
         print(f"Assembling enriched concepts from {self.concepts_dir}...")
         assembled_concepts = []
         for c in concepts:
@@ -255,11 +235,51 @@ class BriefAndEntitiesPipeline:
                             c["entities"] = disk_data["entities"]
                 except Exception:
                     pass
+            # Fallback if brief is still missing: derive from first 2 sentences
+            if not c.get("brief"):
+                sentences = re.split(r'(?<=[.!?])\s+', c.get("description", "").strip())
+                c["brief"] = " ".join(sentences[:2])
+            if "entities" not in c:
+                c["entities"] = []
             assembled_concepts.append(c)
 
-        # Overwrite global_concepts.json with enriched briefs and entities
         print(f"Updating {self.global_concepts_file} with briefs and entities...")
         atomic_write_json(self.global_concepts_file, {"concepts": assembled_concepts})
+
+    async def run(self):
+        print(f"Loading concepts from {self.global_concepts_file}...")
+        with open(self.global_concepts_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            concepts = data.get("concepts", [])
+
+        total = len(concepts)
+        pending = [c for c in concepts if not self.checkpoint.get(c.get("title", ""), False)]
+
+        print(f"Total concepts: {total} | Pending brief & entity extraction: {len(pending)}")
+        settings = self.settings
+
+        try:
+            if pending:
+                print(f"Distributing across {len(settings.servers)} server(s).")
+                print(f"Per-item attempts: {settings.attempts} | Stage budget: {settings.budget_minutes:g} min")
+
+                pool = pool_for_stage(self.args, settings, STAGE)
+                async with pool:
+                    await pool.map(
+                        pending,
+                        self.generate_brief_and_entities,
+                        attempts=settings.attempts,
+                        desc="Generating Briefs & Entities",
+                        key_fn=lambda c: c.get("title", ""),
+                        budget=self.budget,
+                        attempt_timeout=settings.profile.attempt_timeout,
+                        on_result=self.persist_concept_brief,
+                    )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print("\nInterrupted! Flushing progress and assembling enriched concepts...")
+        finally:
+            save_log_sync(self.log_file, self.checkpoint)
+            self.assemble_and_save(concepts)
 
         print("\n============================================================")
         print("STAGE 7: BRIEF & IMPORTANT ENTITIES EXTRACTION COMPLETE")

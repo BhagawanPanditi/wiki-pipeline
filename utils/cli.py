@@ -70,7 +70,7 @@ STAGE_PROFILES: Dict[str, StageProfile] = {
 
     # ── graph enrichment & links (lightweight output payloads) ──────────
     # Concurrency 8 per server prevents TCP connection queue saturation on vLLM
-    "write-briefs":           StageProfile("write-briefs", 32, 240.0, 60.0, 1536),
+    "write-briefs":           StageProfile("write-briefs", 32, 90.0, 30.0, 1536),
     "audit-islands":          StageProfile("audit-islands", 16, 360.0, 20.0, 3072),
     "add-reverse-links":      StageProfile("add-reverse-links", 32, 240.0, 60.0, 1536),
 
