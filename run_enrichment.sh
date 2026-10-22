@@ -29,12 +29,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SERVERS=()
 
+MIN_WORDS=30
+START_STAGE=1
+RESUME_FLAG=0
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --wiki_base_dir|--wiki-base-dir)
             WIKI_BASE_DIR="$2"; shift 2 ;;
         --concurrency)
             CONCURRENCY="$2"; shift 2 ;;
+        --min_concept_words|--min-concept-words)
+            MIN_WORDS="$2"; shift 2 ;;
+        --from_stage|--from-stage|--start_stage|--start-stage)
+            START_STAGE="$2"; shift 2 ;;
+        --resume)
+            RESUME_FLAG=1; shift ;;
         --servers)
             shift
             while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
@@ -73,56 +83,81 @@ run_stage() {
 echo "Starting Full Enrichment Pipeline for Domain: ${DOMAIN}"
 echo "Base Wiki Dir: ${WIKI_BASE_DIR}"
 echo "Concurrency:   ${CONCURRENCY} req/server"
+echo "Starting Stage: ${START_STAGE}"
 
 # 1. Exact Global Consolidation
+if (( START_STAGE <= 1 )); then
 run_stage "1. Consolidate Global Exact" \
     python3 "$SCRIPT_DIR/consolidate_global_exact.py" \
     --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+fi
 
 # 2. Re-synthesize Clean Entities (<= 10 per concept)
+if (( START_STAGE <= 2 )); then
 run_stage "2. Resynthesize Entities" \
     python3 "$SCRIPT_DIR/resynthesize_entities.py" \
     "${COMMON_ARGS[@]}"
+fi
 
 # 3. Resolve Outbound Mention Stubs
+if (( START_STAGE <= 3 )); then
 run_stage "3. Resolve Stubs" \
     python3 "$SCRIPT_DIR/resolve_stubs.py" \
     "${COMMON_ARGS[@]}"
+fi
 
 # 4. Fold Thin Concepts
+if (( START_STAGE <= 4 )); then
+EXTRA_FOLD_ARGS=()
+if (( RESUME_FLAG == 1 )); then
+    EXTRA_FOLD_ARGS+=(--resume)
+fi
 run_stage "4. Fold Thin Concepts" \
     python3 "$SCRIPT_DIR/fold_thin_concepts.py" \
-    "${COMMON_ARGS[@]}"
+    "${COMMON_ARGS[@]}" --min_concept_words "$MIN_WORDS" "${EXTRA_FOLD_ARGS[@]}"
+fi
 
 # 5. Write Concept Briefs
+if (( START_STAGE <= 5 )); then
 run_stage "5. Write Briefs" \
     python3 "$SCRIPT_DIR/write_briefs.py" \
     "${COMMON_ARGS[@]}"
+fi
 
 # 6. Link Entities (No LLM, Instant)
+if (( START_STAGE <= 6 )); then
 run_stage "6. Link Entities" \
     python3 "$SCRIPT_DIR/link_entities.py" \
     --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR" --min_shared_entities 2
+fi
 
 # 7. Audit Small Graph Islands
+if (( START_STAGE <= 7 )); then
 run_stage "7. Audit Islands" \
     python3 "$SCRIPT_DIR/audit_islands.py" \
     "${COMMON_ARGS[@]}" --max_island_size 5
+fi
 
 # 8. Add Reciprocal Reverse Links (Instant)
+if (( START_STAGE <= 8 )); then
 run_stage "8. Add Reverse Links" \
     python3 "$SCRIPT_DIR/add_reverse_links.py" \
     --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+fi
 
 # 9. Final Alphabet Macro-Scan & Markdown Export
+if (( START_STAGE <= 9 )); then
 run_stage "9. Final Alphabet Macro-Scan & Markdown Export" \
     python3 "$SCRIPT_DIR/final_consolidation.py" \
     "${COMMON_ARGS[@]}"
+fi
 
 # 10. Generate Final Island Report
+if (( START_STAGE <= 10 )); then
 run_stage "10. Island Report" \
     python3 "$SCRIPT_DIR/island_report.py" \
     --domain "$DOMAIN" --wiki_base_dir "$WIKI_BASE_DIR"
+fi
 
 echo ""
 echo "========================================================================"

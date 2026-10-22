@@ -84,6 +84,7 @@ class ThinConceptHandler:
         self.decisions = EventLog(log_path(self.domain_dir, STAGE, "decisions"), label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
         self.min_words = args.min_concept_words
+        self.resume = getattr(args, "resume", False)
 
         self.concepts: List[Dict[str, Any]] = []
         self.title_map: Dict[str, Dict[str, Any]] = {}
@@ -204,19 +205,76 @@ CANDIDATE HOST CONCEPTS:
             for sc in c.get("source_chunks", []):
                 if sc.strip(): chunk_index.setdefault(sc.strip(), []).append(c)
 
+        folded_titles: Set[str] = set()
+        pruned_titles: Set[str] = set()
+        processed_titles: Set[str] = set()
+
+        # If resume is requested and decisions log exists, preload past evaluations & folds
+        if self.resume and self.decisions.path.exists():
+            print(f"Loading existing decisions from {self.decisions.path} to resume...")
+            try:
+                with open(self.decisions.path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                            thin_name = record.get("thin_concept")
+                            if not thin_name:
+                                continue
+                            thin_lower = thin_name.strip().lower()
+                            processed_titles.add(thin_lower)
+
+                            if record.get("event") == "concept_folded":
+                                host_name = record.get("host")
+                                if host_name:
+                                    target_host = self.title_map.get(host_name.strip().lower())
+                                    thin_c = self.title_map.get(thin_lower)
+                                    if target_host and thin_c and target_host["title"].lower() not in folded_titles:
+                                        synth_desc = record.get("synthesized_description")
+                                        if synth_desc:
+                                            target_host["description"] = synth_desc
+                                        elif thin_c.get("description"):
+                                            # Append if full synthesized paragraph was not cached
+                                            target_host["description"] = f"{target_host.get('description', '').strip()}\n\n{thin_c.get('description', '').strip()}"
+
+                                        if thin_c["title"] not in target_host.get("entities", []):
+                                            target_host.setdefault("entities", []).append(thin_c["title"])
+                                            target_host["entities"].sort()
+
+                                        for alias in thin_c.get("aliases", []):
+                                            if alias not in target_host.get("aliases", []) and alias.lower() != target_host["title"].lower():
+                                                target_host.setdefault("aliases", []).append(alias)
+
+                                        host_chunks = set(target_host.get("source_chunks", []))
+                                        host_chunks.update(thin_c.get("source_chunks", []))
+                                        target_host["source_chunks"] = sorted(list(host_chunks))
+
+                                        target_host["outbound_relations"] = [
+                                            r for r in target_host.get("outbound_relations", [])
+                                            if r.get("target_concept", "").strip().lower() != thin_lower
+                                        ]
+                                        folded_titles.add(thin_lower)
+                        except Exception:
+                            continue
+                print(f"Resumed: {len(processed_titles)} thin concepts already evaluated ({len(folded_titles)} folded into hosts).")
+            except Exception as e:
+                print(f"Warning: Failed reading resume decisions: {e}")
+
         # Identify Thin Concepts
         thin_tasks = []
         for c in self.concepts:
+            t_lower = c["title"].strip().lower()
+            if self.resume and t_lower in processed_titles:
+                continue
             words = len(c.get("description", "").strip().split())
             if words < self.min_words:
                 candidates = self.find_candidate_hosts(c, inbound_index, chunk_index)
                 if candidates:
                     thin_tasks.append((c, candidates))
 
-        print(f"Identified {len(thin_tasks)} thin concepts (< {self.min_words} words) with viable candidate hosts.")
-
-        folded_titles: Set[str] = set()
-        pruned_titles: Set[str] = set()
+        print(f"Identified {len(thin_tasks)} thin concepts (< {self.min_words} words) pending LLM folding.")
 
         # Run Async LLM Evaluation
         settings = self.settings
@@ -238,9 +296,15 @@ CANDIDATE HOST CONCEPTS:
                 """
                 thin_concept, _candidates = item
                 if not (decision and decision.should_fold and decision.target_host_title):
+                    self.decisions.record(
+                        "concept_evaluated", method="llm", thin_concept=thin_concept["title"],
+                        should_fold=False)
                     return
                 target_host = self.title_map.get(decision.target_host_title.lower())
                 if not target_host or target_host["title"].lower() in folded_titles:
+                    self.decisions.record(
+                        "concept_evaluated", method="llm", thin_concept=thin_concept["title"],
+                        should_fold=False, reason="host_already_folded_or_missing")
                     return
 
                 # Apply Merged Synthesis
@@ -270,7 +334,8 @@ CANDIDATE HOST CONCEPTS:
                 self.decisions.record(
                     "concept_folded", method="llm", thin_concept=thin_concept["title"],
                     host=target_host["title"],
-                    description_rewritten=bool(decision.synthesized_description))
+                    description_rewritten=bool(decision.synthesized_description),
+                    synthesized_description=decision.synthesized_description)
                 folded_titles.add(thin_concept["title"].lower())
 
             pool = pool_for_stage(self.args, settings, STAGE)
@@ -394,6 +459,7 @@ def main():
         stage=STAGE,
         description="Step 4B: LLM-Driven Thin Concept Folding & Pruning")
     parser.add_argument("--min_concept_words", type=int, default=30)
+    parser.add_argument("--resume", action="store_true", help="Resume from existing decision logs instead of re-evaluating completed concepts")
 
     args = parser.parse_args()
     handler = ThinConceptHandler(args)
