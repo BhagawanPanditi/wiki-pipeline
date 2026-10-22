@@ -21,15 +21,10 @@ STAGE = "extract-concepts"
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
 
-class OutboundRelation(BaseModel):
-    target_concept: str = Field(description="Exact canonical title of target concept.")
-    relation: str = Field(description="1 concise sentence describing the relationship.")
-
 class Concept(BaseModel):
     title: str = Field(description="Exact canonical title (1-6 words, singular).")
-    aliases: List[str] = Field(default_factory=list, description="Acronyms or alternate names.")
-    description: str = Field(description="Single dense factual paragraph.")
-    outbound_relations: List[OutboundRelation] = Field(default_factory=list)
+    aliases: List[str] = Field(default_factory=list, description="Explicit acronyms or alternate names.")
+    description: str = Field(description="Single dense factual paragraph retaining all metrics and details.")
 
 class ChunkExtractionSchema(BaseModel):
     concepts: List[Concept] = Field(default_factory=list)
@@ -48,6 +43,10 @@ CONTEXT BOUNDARIES:
 - CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g. "this system", "they") or acronyms to standard canonical titles.
 - Never invent facts or add outside knowledge.
 
+TITLES AND ALIASES:
+- Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the name any other chunk would use for the same thing, so concepts merge cleanly across chunks.
+- Aliases: Semicolon-separated list of acronyms or alternate names that explicitly appear in the text. If none, leave empty.
+
 SOLID CONCEPTS ONLY (NO FRAGMENTATION):
 - Extract only major, solid, well-developed subjects: a core idea, system, entity, method, mechanism, theory, phenomenon, or process.
 - Strictly avoid creating thin, 1-2 sentence stub concepts for minor parameters, properties, sub-steps, or variants. Every minor detail, metric, and property MUST be absorbed directly into the comprehensive description of its primary parent concept.
@@ -64,20 +63,12 @@ Descriptions must preserve exact concrete details rather than high-level general
 3. CONDITIONS & CONSTRAINTS: Specific operational boundaries, environmental constraints, procedural steps, and dates/years.
 4. ATTRIBUTIONS: Specific author, study, or expert attributions tied to explicit claims.
 
-OUTBOUND RELATIONS (BETWEEN CONCEPTS ONLY):
-- Identify meaningful directional relations from this concept to other concepts (either extracted in this chunk or clearly identified in the surrounding context).
-- The concept being described is always the subject. In 1 concise sentence, explain how it affects, uses, produces, relates to, or contrasts with the Target Concept.
-- If there are no clear outbound relations, leave relations empty.
-
 OUTPUT FORMAT:
 Output each concept using XML tags matching this exact structure:
 <concept>
 <title>Exact Canonical Title</title>
 <aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
 <description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all raw quantitative metrics, parameter bounds, specific findings, and detailed statements from this chunk.</description>
-<relations>
-Target Concept Title :: 1 concise sentence describing how this concept affects or relates outward to Target Concept.
-</relations>
 </concept>
 
 If no substantive concepts exist in the chunk, output nothing.
@@ -109,23 +100,10 @@ def parse_xml_concepts(text: str) -> List[Concept]:
             raw_aliases = aliases_m.group(1).strip()
             aliases = [a.strip() for a in re.split(r"[;,]", raw_aliases) if a.strip()]
 
-        relations = []
-        rel_m = re.search(r"<relations>(.*?)</relations>", block, re.DOTALL | re.IGNORECASE)
-        if rel_m:
-            for line in rel_m.group(1).strip().splitlines():
-                line = line.strip()
-                if "::" in line:
-                    parts = line.split("::", 1)
-                    tgt = parts[0].strip()
-                    desc = parts[1].strip()
-                    if tgt and desc:
-                        relations.append(OutboundRelation(target_concept=tgt, relation=desc))
-
         concepts.append(Concept(
             title=title,
             aliases=aliases,
             description=description,
-            outbound_relations=relations
         ))
 
     return concepts
