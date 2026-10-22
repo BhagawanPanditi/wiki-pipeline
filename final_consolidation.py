@@ -530,12 +530,21 @@ class FinalConsolidationPipeline:
 
             if relations:
                 md_content.append("## Related Concepts\n")
-                for rel in relations:
+                primary_cap = getattr(self.args, "max_primary_links", 15)
+                primary_relations = relations[:primary_cap]
+                extended_relations = relations[primary_cap:]
+
+                for rel in primary_relations:
                     tgt = rel.get("target_concept", "")
                     r_text = rel.get("relation", "")
                     jacc = rel.get("jaccard_similarity")
                     jacc_str = f" *(Jaccard similarity: {jacc})*" if jacc is not None else ""
                     md_content.append(f"- **[[{tgt}]]**: {r_text}{jacc_str}")
+
+                if extended_relations:
+                    md_content.append("\n### Extended Context & Mentions\n")
+                    compact_links = [f"[[{r.get('target_concept', '')}]]" for r in extended_relations if r.get('target_concept')]
+                    md_content.append(", ".join(compact_links))
                 md_content.append("")
 
             atomic_write_text(md_path, "\n".join(md_content))
@@ -563,6 +572,8 @@ def main():
     parser = build_parser(stage=STAGE, description="Final knowledge graph consolidation, island audit and markdown wiki export", include_resume=True)
     parser.add_argument("--skip_deep_verify", action="store_true",
                         help="Skip LLM deep verification and export current graph.")
+    parser.add_argument("--max_primary_links", type=int, default=15,
+                        help="Maximum primary related links with full explanations on Markdown pages (remainder listed compactly).")
     args = parser.parse_args()
 
     pipeline = FinalConsolidationPipeline(args)
