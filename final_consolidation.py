@@ -36,6 +36,46 @@ from utils.llm_pool import pool_for_stage
 STAGE = "final-macro-scan"
 DEEP_STAGE = "final-deep-verify"
 
+def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "STAGE 9: FINAL CONSOLIDATED GRAPH"):
+    """Compute and print histogram distribution of related links across all concepts with dynamic bins (bin width = 5)."""
+    if not concepts:
+        print(f"\n[{title_label}] No concepts found.")
+        return
+
+    counts = [len(c.get("outbound_relations", [])) for c in concepts]
+    total = len(counts)
+    avg_links = sum(counts) / total if total else 0.0
+    max_count = max(counts) if counts else 0
+
+    # Build dynamic bins with step=5 up to max_count
+    bins = [("0 links", 0, 0)]
+    step = 5
+    curr = 1
+    while curr <= max_count:
+        upper = curr + step - 1
+        bins.append((f"{curr} - {upper} links", curr, upper))
+        curr += step
+
+    bin_counts = {label: 0 for label, _, _ in bins}
+    for count in counts:
+        for label, low, high in bins:
+            if low <= count <= high:
+                bin_counts[label] += 1
+                break
+
+    print(f"\n============================================================")
+    print(f"RELATED LINKS DISTRIBUTION [{title_label}] (Total Concepts: {total})")
+    print(f"Average Links per Concept: {avg_links:.2f} | Max Links: {max_count} | Disconnected Concepts (0 links): {bin_counts['0 links']} ({bin_counts['0 links'] / total * 100:.1f}%)")
+    print(f"------------------------------------------------------------")
+    print(f"{'Links Range':<20} {'Concept Count':<15} {'Percentage':<12}")
+    print(f"------------------------------------------------------------")
+    for label, _, _ in bins:
+        c_count = bin_counts[label]
+        pct = (c_count / total * 100) if total else 0.0
+        bar = "█" * int(pct / 2)
+        print(f"{label:<20} {c_count:<15} {pct:>5.1f}%   {bar}")
+    print(f"============================================================\n")
+
 # ── XML System Prompt for Deep Verification ───────────────────────────────────
 
 SYSTEM_PROMPT_DEEP_VERIFY = """\
@@ -414,6 +454,9 @@ class FinalConsolidationPipeline:
         print(f"Total surviving concepts after final merge & pruning: {len(final_concepts)}")
         atomic_write_json(self.global_concepts_file, {"concepts": final_concepts})
 
+        # Print detailed link distribution statistics
+        print_link_distribution(final_concepts, title_label="STAGE 9: SURVIVING CONCEPTS GRAPH")
+
         # Sync individual concept files if concepts directory exists
         concepts_dir = self.wiki_path / "concepts"
         if concepts_dir.is_dir():
@@ -421,7 +464,10 @@ class FinalConsolidationPipeline:
             for c in final_concepts:
                 c_fname = f"{sanitize_filename(c['title'])}.json"
                 surviving_files.add(c_fname)
-                atomic_write_json(concepts_dir / c_fname, c)
+                try:
+                    atomic_write_json(concepts_dir / c_fname, c, fsync_dir=False)
+                except Exception:
+                    pass
             # Remove any concept files that were pruned or merged away
             for old_file in concepts_dir.glob("*.json"):
                 if old_file.name not in surviving_files:

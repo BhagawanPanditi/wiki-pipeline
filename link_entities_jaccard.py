@@ -42,7 +42,7 @@ def normalize_entity(ent: str) -> str:
     return ent.strip()
 
 def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "RELATED LINKS"):
-    """Compute and print histogram distribution of related links across all concepts."""
+    """Compute and print histogram distribution of related links across all concepts with dynamic bins (bin width = 5)."""
     if not concepts:
         print(f"\n[{title_label}] No concepts found.")
         return
@@ -50,35 +50,34 @@ def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "
     counts = [len(c.get("outbound_relations", [])) for c in concepts]
     total = len(counts)
     avg_links = sum(counts) / total if total else 0.0
+    max_count = max(counts) if counts else 0
 
-    bins = [
-        ("0 links", lambda n: n == 0),
-        ("1 - 5 links", lambda n: 1 <= n <= 5),
-        ("6 - 10 links", lambda n: 6 <= n <= 10),
-        ("11 - 15 links", lambda n: 11 <= n <= 15),
-        ("16 - 20 links", lambda n: 16 <= n <= 20),
-        ("21 - 25 links", lambda n: 21 <= n <= 25),
-        ("26 - 30 links", lambda n: 26 <= n <= 30),
-        ("31+ links", lambda n: n >= 31),
-    ]
+    # Build dynamic bins with step=5 up to max_count
+    bins = [("0 links", 0, 0)]
+    step = 5
+    curr = 1
+    while curr <= max_count:
+        upper = curr + step - 1
+        bins.append((f"{curr} - {upper} links", curr, upper))
+        curr += step
 
-    bin_counts = {label: 0 for label, _ in bins}
+    bin_counts = {label: 0 for label, _, _ in bins}
     for count in counts:
-        for label, fn in bins:
-            if fn(count):
+        for label, low, high in bins:
+            if low <= count <= high:
                 bin_counts[label] += 1
                 break
 
     print(f"\n============================================================")
     print(f"RELATED LINKS DISTRIBUTION [{title_label}] (Total Concepts: {total})")
-    print(f"Average Links per Concept: {avg_links:.2f} | Disconnected Concepts (0 links): {bin_counts['0 links']} ({bin_counts['0 links'] / total * 100:.1f}%)")
+    print(f"Average Links per Concept: {avg_links:.2f} | Max Links: {max_count} | Disconnected Concepts (0 links): {bin_counts['0 links']} ({bin_counts['0 links'] / total * 100:.1f}%)")
     print(f"------------------------------------------------------------")
     print(f"{'Links Range':<20} {'Concept Count':<15} {'Percentage':<12}")
     print(f"------------------------------------------------------------")
-    for label, _ in bins:
+    for label, _, _ in bins:
         c_count = bin_counts[label]
         pct = (c_count / total * 100) if total else 0.0
-        bar = "█" * int(pct / 3)
+        bar = "█" * int(pct / 2)
         print(f"{label:<20} {c_count:<15} {pct:>5.1f}%   {bar}")
     print(f"============================================================\n")
 
