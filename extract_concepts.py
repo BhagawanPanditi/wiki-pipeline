@@ -37,37 +37,34 @@ class ChunkExtractionSchema(BaseModel):
 # ── System Prompt (XML Format) ────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an expert knowledge extractor building an LLM Wiki Knowledge Graph from documents in any domain (science, engineering, economics, programming, history, fiction, etc.).
-Analyze the CURRENT CHUNK and extract its core concepts, dense factual descriptions, and outbound relationships.
+You are an expert knowledge extractor building an LLM Wiki Knowledge Graph from documents in any domain (science, engineering, software, economics, history, fiction, etc.).
+Your mission is to SQUEEZE THE CURRENT CHUNK FACTUALLY DRY into comprehensive, highly dense, solid concepts.
 
 INPUT & NOISE CLEANING:
 - The text is raw and uncleaned. SILENTLY IGNORE all HTML tags, scraping artifacts, navigation links, headers, footers, cookie notices, and promotional clutter. Focus ONLY on substantive informational text.
-- If the CURRENT CHUNK contains no substantive core concepts (e.g., solely bibliographies, navigational boilerplate, or non-informative text), output nothing.
+- If the CURRENT CHUNK contains no substantive informational text (e.g., solely bibliographies, navigational boilerplate, or empty fragments), output nothing.
 
 CONTEXT BOUNDARIES:
 - CURRENT CHUNK is your ONLY source for facts.
 - Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g., "this system", "they") or acronyms to find full canonical names.
 - DO NOT extract facts, numbers, or statements that appear exclusively in CONTEXT BEFORE or CONTEXT AFTER. Never add outside knowledge.
 
-WHAT IS A CONCEPT:
-- A distinct substantive subject the chunk explains in meaningful detail: an idea, method, algorithm, mechanism, entity, policy, system, event, rule, condition, character, or theory.
-- Extract every such concept that has meaningful explanatory detail in the text. Skip passing mentions that have no detail.
-- Do NOT create concepts from structural labels ("Introduction", "Results", "Overview") or summaries of the entire chunk.
+SOLID CONCEPTS ONLY (NO THIN CONCEPTS):
+- Extract only major, solid, well-developed subjects: an architecture, algorithm, system, paradigm, protocol, mechanism, theory, entity, condition, or primary method.
+- STRICTLY FORBIDDEN: Do NOT create thin, fragmented concepts for minor parameters, single functions, isolated variables, or 1-sentence sub-steps. All such details MUST be absorbed into the comprehensive description of their primary host concept.
+- Do NOT create concepts from structural labels ("Introduction", "Results", "Example", "Overview") or meta-summaries.
 
-TITLES AND ALIASES:
-- Title: 1-6 words, Title Case, standard canonical name (expand acronyms), singular unless plural by definition. Use the name any other chunk would use for the same thing so concepts merge cleanly.
-- Aliases: Semicolon-separated list of acronyms or alternate names explicitly appearing in the text. If none, leave empty.
-
-DESCRIPTIONS (HOLD ALL FACTS):
-- Write a single, dense, comprehensive factual paragraph for each concept. The paragraph must be self-contained: explicitly name the subject, no "this" or "the above".
-- Every substantive fact, parameter, and metric from the text MUST be preserved in full complete sentences inside `description`.
+SQUEEZE THE CHUNK DRY (COMPREHENSIVE DESCRIPTIONS):
+- Every important fact, parameter, metric, mechanism, or code logic in the chunk MUST be captured inside the description of a concept. Leave zero substantive facts unabsorbed.
+- Descriptions MUST be long, dense, and self-contained (typically 100 to 250+ words). Name the concept explicitly—never use "this" or "the above".
 
 EXHAUSTIVE FACTUAL RETENTION MANDATE:
-Descriptions MUST retain exact detail rather than abstracting away facts. You MUST preserve in sentence form:
-1. QUANTITATIVE METRICS & BOUNDS: Exact numbers, statistical findings, percentages, measurements, ranges, parameter limits, formulas, and complexity.
-2. FORMAL ENTITIES & NAMED TERMS: Specific algorithms, software/tool versions, taxonomies, codes, benchmarks, locations, or formal classifications.
-3. CONDITIONS & SPECIFICATIONS: Specific operational bounds, environmental constraints, experimental conditions, procedural steps, and dates/years.
-4. CREDITED ATTRIBUTIONS: Specific expert, study, author, or historical attributions when linked to explicit claims.
+Descriptions MUST retain exhaustive concrete detail rather than abstracting away facts. You MUST preserve in sentence form:
+1. QUANTITATIVE METRICS & BOUNDS: Exact numbers, statistical findings, percentages, measurements, ranges, parameter limits, formulas, and time/space complexity.
+2. CODE & ALGORITHMIC LOGIC: Implementation mechanics, functions, control flow, data structures, runtime characteristics, and configuration parameters.
+3. FORMAL ENTITIES & NAMED TERMS: Specific algorithms, tools, software versions, libraries, benchmarks, taxonomies, standards, or formal classifications.
+4. CONDITIONS & SPECIFICATIONS: Operational bounds, hardware/environmental constraints, procedural steps, and dates/years.
+5. CREDITED ATTRIBUTIONS: Specific expert, study, author, or historical attributions when linked to explicit claims.
 
 OUTBOUND RELATIONS (ONLY BETWEEN CONCEPTS):
 - Relations must ONLY connect to other real, substantive concepts (no conversational phrases, no noise).
