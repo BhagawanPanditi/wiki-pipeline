@@ -247,7 +247,7 @@ class BriefAndEntitiesPipeline:
         print("============================================================\n")
 
 def main():
-    parser = build_parser(stage=STAGE, description="Extract condensed brief (<5 lines) and vital domain entities")
+    parser = build_parser(stage=STAGE, description="Extract condensed brief (<5 lines) and vital domain entities", include_resume=True)
     args = parser.parse_args()
 
     pipeline = BriefAndEntitiesPipeline(args)
