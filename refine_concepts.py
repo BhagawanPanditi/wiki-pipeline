@@ -60,25 +60,41 @@ YOUR MISSION:
 Perform an exhaustive comparison between the RAW CHUNK text and the EXISTING EXTRACTED CONCEPTS (from Pass 1).
 Identify any missing concepts, omitted technical metrics, parameters, or factual details, and generate XML patch updates.
 
-CONTEXT BOUNDARIES:
-- CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g. "this system", "they") or acronyms to canonical names.
-- Never extract facts that appear exclusively in CONTEXT BEFORE or CONTEXT AFTER.
+INPUT & NOISE CLEANING:
+- Silently ignore HTML tags, scraping artifacts, navigation menus, headers/footers, cookie notices, and boilerplate.
+- If the chunk contains no substantive informational content, output nothing.
 
-CRITICAL RULES:
-1. ONLY SOLID CONCEPTS:
-   - Extract major, solid, well-developed subjects. Minor details and properties must be absorbed into the comprehensive description of their primary concept.
-2. ZERO INFORMATION LOSS (SQUEEZE THE CHUNK DRY):
-   - No useful piece of substantive informational content, technical metric, parameter bound, procedural detail, condition, or finding from CURRENT CHUNK should be left uncaptured.
-   - Squeeze every useful piece of information into a concept description (either updating an existing concept via <update_concept> or adding a missed major concept via <new_concept>).
-3. FACTS ARE COMPLETE SENTENCES:
-   - ALL technical facts, numbers, bounds, parameters, tool mentions, and findings MUST be complete sentences inside concept descriptions.
-4. SELF-AUDIT FACTUAL GAPS:
-   - Perform an objective comparison between the raw chunk and existing concepts. If a metric, parameter, or concept was missed, output a patch.
+CONTEXT BOUNDARIES:
+- CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g. "this system", "they") or acronyms to standard canonical titles.
+- Never extract facts that appear exclusively in CONTEXT BEFORE or CONTEXT AFTER.
+- Never invent facts or add outside knowledge.
+
+TITLES AND ALIASES:
+- Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the name any other chunk would use for the same thing, so concepts merge cleanly across chunks.
+- Aliases: Semicolon-separated list of acronyms or alternate names that explicitly appear in the text. If none, leave empty.
+
+SOLID CONCEPTS ONLY (NO FRAGMENTATION / NO THIN CONCEPTS):
+- Extract only major, solid, well-developed subjects: a core idea, system, entity, method, mechanism, theory, phenomenon, or process.
+- Strictly avoid creating thin, 1-2 sentence stub concepts for minor parameters, properties, sub-steps, or variants. Every minor detail, metric, and property MUST be absorbed directly into the comprehensive description of its primary parent concept (prefer <update_concept> over creating thin new concepts).
+- Do not extract meta-labels ("Introduction", "Chapter 1", "Summary") or whole-chunk overviews.
+
+ZERO INFORMATION LOSS (SQUEEZE THE CHUNK DRY):
+- Every substantive fact, number, parameter, metric, condition, finding, and mechanism in the chunk MUST be captured inside one of the concept descriptions. Leave zero informational content unabsorbed.
+- Squeeze every useful piece of information into a concept description (either updating an existing concept via <update_concept> or adding a missed major concept via <new_concept>).
+- Descriptions must be comprehensive, dense paragraphs that explicitly name the subject and stand entirely on their own.
+
+FACTUAL RETENTION MANDATE:
+Descriptions must preserve exact concrete details rather than high-level generalizations:
+1. QUANTITATIVE FACTS & BOUNDS: Exact numbers, statistics, ranges, thresholds, formulas, and measurements.
+2. FORMAL NAMES & TERMS: Specific named entities, tools, techniques, classifications, benchmarks, or formal designations.
+3. CONDITIONS & CONSTRAINTS: Specific operational boundaries, environmental constraints, procedural steps, and dates/years.
+4. ATTRIBUTIONS: Specific author, study, or expert attributions tied to explicit claims.
+5. COMPLETE SENTENCES: ALL technical facts, numbers, bounds, parameters, tool mentions, and findings MUST be complete sentences inside concept descriptions.
 
 THINKING PROCESS (SANDBOXED):
 - If you need to analyze the text, plan missing concepts, or deliberate on updates, you MUST do so strictly inside `<think>...</think>` tags at the very beginning of your response.
 - Once `</think>` is closed, output ONLY the final XML update blocks.
-- Absolutely NO commentary or notes outside `<think>...</think>`.
+- Absolutely NO commentary, reasoning, or notes outside `<think>...</think>`.
 
 OUTPUT FORMAT:
 Output brand-new concepts using <new_concept>...</new_concept> blocks:
