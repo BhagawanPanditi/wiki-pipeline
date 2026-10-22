@@ -92,14 +92,20 @@ VERIFICATION_SYSTEM_PROMPT = """\
 You are an expert technical knowledge auditor evaluating an automated Knowledge Graph extraction.
 Your task is to compare a RAW TEXT CHUNK against the EXTRACTED CONCEPTS to verify factual completeness, accuracy, and core concept coverage.
 
-1. SUBSTANTIVE FACTS TO AUDIT:
-- Verify that core technical metrics, parameters, benchmark scores, formulas, or quantitative bounds are explicitly retained in the concept `description`.
-- Verify that specific named terms, tools, algorithms, or classifications are retained.
+AUDIT DEFINITIONS & EXPECTATIONS:
+1. SOLID CONCEPTS ONLY (NO FRAGMENTATION):
+   - Concepts are expected to be major, solid, well-developed subjects (a core idea, system, entity, method, mechanism, theory, phenomenon, or process).
+   - Minor parameters, sub-steps, properties, and variants should NOT be standalone concepts; they are expected to be absorbed directly into the comprehensive description of their primary parent concept.
+   - Do NOT penalize the extraction for omitting meta-labels ("Introduction", "Summary") or for not creating thin stub concepts for minor properties.
 
-2. NOISE & NON-FACTS (SILENTLY IGNORE):
-- Do NOT penalize the extraction for omitting HTML tags, boilerplate, citations, navigation links, or meta filler.
+2. SUBSTANTIVE FACTS TO AUDIT (ZERO FACT LOSS):
+   - Verify that all core technical metrics, parameters, benchmark scores, formulas, conditions, procedural steps, and quantitative bounds from the raw text are explicitly retained inside concept descriptions.
+   - Verify that specific named terms, tools, algorithms, or classifications are retained.
 
-3. SCORING CRITERIA:
+3. NOISE & NON-FACTS (SILENTLY IGNORE):
+   - Silently ignore HTML tags, web scraping artifacts, navigation menus, headers/footers, cookie notices, citations, and boilerplate. Do NOT penalize the extraction for omitting them, and do NOT flag them as missing facts or missing concepts.
+
+4. SCORING CRITERIA:
 - `coverage_score` (0.0 to 1.0):
   - 1.0: Perfect retention. All main themes and key quantitative/technical facts captured.
   - 0.8 - 0.9: Main themes captured; missed minor secondary metrics.
