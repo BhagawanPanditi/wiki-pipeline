@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 from pydantic import BaseModel, Field
 
 from utils.atomic_io import atomic_write_json, sanitize_filename
-from utils.checkpoint import load_bool_log, save_log_async
+from utils.checkpoint import load_bool_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
 from utils.errors import StageBudget
 from utils.llm_pool import pool_for_stage
