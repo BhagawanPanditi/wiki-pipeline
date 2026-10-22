@@ -6,13 +6,11 @@ Refinement Pass 2: Second-Pass Knowledge Graph Concept Extraction & Patching
 """
 
 import asyncio
-import functools
 import json
 import re
 import shutil
-import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
 
@@ -20,15 +18,8 @@ from config import _read_config
 from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
 from utils.chunks import load_cached_chunks
 from utils.cli import build_parser, resolve_settings
-from utils.attempts import AttemptHistory
-from utils.event_log import EventLog
-from utils.layout import log_path
 from utils.errors import StageBudget
-from utils.json_repair import clean_json_string as _extract_json
 from utils.llm_pool import pool_for_stage
-
-# Pass 2 historically also accepted an unfenced outermost JSON object.
-clean_json_string = functools.partial(_extract_json, allow_bare_object=True)
 
 STAGE = "refine-concepts"
 
@@ -69,11 +60,16 @@ YOUR MISSION:
 Perform an exhaustive comparison between the RAW CHUNK text and the EXISTING EXTRACTED CONCEPTS (from Pass 1).
 Identify any missing concepts, omitted technical metrics, parameters, or factual details, and generate XML patch updates.
 
+CONTEXT BOUNDARIES:
+- CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g. "this system", "they") or acronyms to canonical names.
+- Never extract facts that appear exclusively in CONTEXT BEFORE or CONTEXT AFTER.
+
 CRITICAL RULES:
 1. ONLY SOLID CONCEPTS:
    - Extract major, solid, well-developed subjects. Minor details and properties must be absorbed into the comprehensive description of their primary concept.
-2. NO RELATIONS OR ENTITIES:
-   - Concepts are strictly composed of `title`, `aliases`, and `description`. Do not extract relations or separate entities.
+2. ZERO INFORMATION LOSS (SQUEEZE THE CHUNK DRY):
+   - No useful piece of substantive informational content, technical metric, parameter bound, procedural detail, condition, or finding from CURRENT CHUNK should be left uncaptured.
+   - Squeeze every useful piece of information into a concept description (either updating an existing concept via <update_concept> or adding a missed major concept via <new_concept>).
 3. FACTS ARE COMPLETE SENTENCES:
    - ALL technical facts, numbers, bounds, parameters, tool mentions, and findings MUST be complete sentences inside concept descriptions.
 4. SELF-AUDIT FACTUAL GAPS:
@@ -226,7 +222,7 @@ class WikiSecondPassPipeline:
             corrupt_message="Pass 2 log file corrupted. Re-initializing.")
 
     def cleanup_incomplete_states(self):
-        """Purges pass2_log entries marked False and cleans up incomplete staging files upon resume."""
+        """Purges pass2_log entries marked False and restores backups upon resume."""
         print("Sanitizing incomplete Pass 2 extraction states...")
         purged = 0
         for key, completed in list(self.pass2_log.items()):
@@ -236,18 +232,10 @@ class WikiSecondPassPipeline:
 
                 pass1_backup = chunk_dir / "concepts_pass1_backup.json"
                 concepts_file = chunk_dir / "concepts.json"
-                pass2_file = chunk_dir / "pass2_refinement.json"
 
-                # If backup exists, always restore it to fix any corrupted merges
+                # If backup exists, restore it to fix any corrupted merges
                 if pass1_backup.exists():
                     shutil.copy(pass1_backup, concepts_file)
-
-                # Delete the partial LLM output if it exists
-                if pass2_file.exists():
-                    try:
-                        pass2_file.unlink()
-                    except Exception:
-                        pass
 
                 del self.pass2_log[key]
                 purged += 1
@@ -386,43 +374,26 @@ If the existing extraction is already factually complete, output nothing.
             )
 
             choice = response.choices[0]
-            finish_reason = choice.finish_reason
             raw_text = choice.message.content or ""
-
             return parse_xml_refinement(raw_text)
 
-        except Exception as exc:
-            self.attempts.record(key, server=str(client.base_url), finish_reason=finish_reason,
-                                 raw_text=raw_text, error_type=type(exc).__name__,
-                                 error_message=str(exc))
+        except Exception:
             raise
 
     async def persist_refinement(self, item: Dict[str, Any],
                                  delta: Pass2ExtractionSchema) -> None:
-        """SUCCESS: stream the delta, back up Pass 1, then merge into concepts.json."""
+        """SUCCESS: back up Pass 1, then merge into concepts.json."""
         key = item["key"]
         chunk_dir = item["chunk_dir"]
 
-        # 1. Save Pass 2 raw delta refinement JSON
-        pass2_file = chunk_dir / "pass2_refinement.json"
-        await asyncio.to_thread(
-            pass2_file.write_text, delta.model_dump_json(indent=2), encoding="utf-8"
-        )
-
-        # 2. Backup Pass 1 concepts.json if backup does not exist
+        # 1. Backup Pass 1 concepts.json if backup does not exist
         pass1_backup = chunk_dir / "concepts_pass1_backup.json"
         concepts_file = chunk_dir / "concepts.json"
         if not pass1_backup.exists() and concepts_file.exists():
             await asyncio.to_thread(shutil.copy, concepts_file, pass1_backup)
 
-        # 3. Apply updates & merged output to concepts.json
+        # 2. Apply updates & merged output to concepts.json
         merged_data = self.apply_merges(item["pass1_concepts"], delta)
-        self.decisions.record(
-            "concept_refined", chunk=key,
-            concepts_updated=[{"title": u.title, "aliases_added": list(u.additional_aliases),
-                               "has_desc": bool(u.additional_description)}
-                              for u in delta.concept_updates],
-            new_concepts_added=[c.title for c in delta.new_concepts])
         merged_payload = json.dumps(merged_data, indent=2)
         await asyncio.to_thread(concepts_file.write_text, merged_payload, encoding="utf-8")
 
@@ -431,22 +402,6 @@ If the existing extraction is already factually complete, output nothing.
         if self.flush_count >= 50:
             await save_log_async(self.pass2_log_file, self.pass2_log.copy())
             self.flush_count = 0
-
-    async def write_failure_debug(self, item: Dict[str, Any],
-                                  failure: Dict[str, Any]) -> None:
-        """FAILURE: save the Pass 2 debug log with every attempt, untruncated."""
-        key = item["key"]
-        debug_data = {
-            "key": key,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "attempts": self.attempts.get(key),
-            "final_error": failure.get("error"),
-            "final_classification": failure.get("classification"),
-            "last_server": failure.get("server"),
-        }
-        payload = json.dumps(debug_data, indent=2)
-        await asyncio.to_thread((item["chunk_dir"] / "pass2_debug.json").write_text,
-                                payload, encoding="utf-8")
 
     def apply_merges(
         self, pass1_data: Any, pass2_delta: Pass2ExtractionSchema
@@ -523,11 +478,7 @@ If the existing extraction is already factually complete, output nothing.
         Raises:
             RuntimeError: If any chunk is still incomplete after retries."""
         self.settings = resolve_settings(self.args, STAGE)
-        self.decisions = EventLog(log_path(self.base_wiki_dir, STAGE, "decisions"), label=STAGE)
-        self.debug = EventLog(log_path(self.base_wiki_dir, STAGE, "debug"),
-                                 label=STAGE)
         self.budget = StageBudget(self.settings.budget_minutes)
-        self.attempts = AttemptHistory()
         self.flush_count = 0
 
         # Trigger cleanup if the resume flag is passed
@@ -547,14 +498,13 @@ If the existing extraction is already factually complete, output nothing.
               f"{settings.concurrency_per_server} concurrent request(s) each "
               f"(item i -> server i % N).")
         print(f"Per-item attempts: {settings.attempts} | Stage budget: "
-              f"{settings.budget_minutes:g} min | Debug log: {self.debug.path}")
+              f"{settings.budget_minutes:g} min")
 
         if not pending:
             print("All chunks are already refined in Pass 2!")
             return
 
-        # Mark every pending chunk in-progress, as the old worker did under a lock,
-        # so --resume can purge anything left half-written.
+        # Mark every pending chunk in-progress
         for item in pending:
             self.pass2_log.setdefault(item["key"], False)
 
@@ -568,16 +518,12 @@ If the existing extraction is already factually complete, output nothing.
                     desc=f"Pass 2 Refinement [{self.domain}]",
                     key_fn=lambda i: i["key"],
                     budget=self.budget,
-                    debug=self.debug,
+                    debug=None,
                     attempt_timeout=settings.profile.attempt_timeout,
                     on_result=self.persist_refinement,
                 )
         finally:
             await save_log_async(self.pass2_log_file, self.pass2_log)
-            self.debug.close()
-
-        for failure in result.failures:
-            await self.write_failure_debug(pending[failure["index"]], failure)
 
         print("Requests served per server:")
         for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):

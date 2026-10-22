@@ -213,11 +213,21 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
         raise ValueError("Missing 'model'! Specify via --model or set 'model_name' in config.json.")
 
     # 3. Concurrency
-    concurrency = int(get_setting(
-        getattr(args, "concurrency_per_server", None),
-        "concurrency_per_server",
-        "--concurrency_per_server"
-    ))
+    cli_concurrency = getattr(args, "concurrency_per_server", None)
+    if cli_concurrency not in (None, 0, 0.0, ""):
+        concurrency = int(cli_concurrency)
+    elif "concurrency_per_server" in stage_cfg:
+        concurrency = int(stage_cfg["concurrency_per_server"])
+    elif "concurrency_per_server" in cfg:
+        concurrency = int(cfg["concurrency_per_server"])
+    elif isinstance(servers, dict) and servers:
+        # Per-server concurrency is already defined in the servers dictionary
+        concurrency = max(int(c) for c in servers.values())
+    else:
+        raise ValueError(
+            "Missing required parameter '--concurrency_per_server'! "
+            "Specify via CLI argument or set 'concurrency_per_server' or a servers dictionary in config.json."
+        )
 
     # 4. Max Tokens
     max_tokens = int(get_setting(

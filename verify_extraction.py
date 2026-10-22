@@ -35,8 +35,6 @@ from utils.atomic_io import atomic_write_text
 from utils.checkpoint import CheckpointLog
 from utils.chunks import load_cached_chunks
 from utils.cli import build_parser, resolve_settings
-from utils.event_log import EventLog
-from utils.layout import log_path
 from utils.errors import StageBudget
 from utils.json_repair import clean_json_string
 from utils.llm_pool import pool_for_stage
@@ -101,10 +99,7 @@ Your task is to compare a RAW TEXT CHUNK against the EXTRACTED CONCEPTS to verif
 2. NOISE & NON-FACTS (SILENTLY IGNORE):
 - Do NOT penalize the extraction for omitting HTML tags, boilerplate, citations, navigation links, or meta filler.
 
-3. CONCEPTS HAVE NO OUTBOUND RELATIONS OR ENTITIES:
-- Concepts are purely composed of `title`, `aliases`, and `description`. All facts belong inside `description`.
-
-4. SCORING CRITERIA:
+3. SCORING CRITERIA:
 - `coverage_score` (0.0 to 1.0):
   - 1.0: Perfect retention. All main themes and key quantitative/technical facts captured.
   - 0.8 - 0.9: Main themes captured; missed minor secondary metrics.
@@ -179,7 +174,6 @@ class WikiVerifierPipeline:
         # Phase-specific outputs: phase 2 must not overwrite phase 1
         self.result_filename = PASS1_RESULT if self.phase == 1 else PASS2_RESULT
         log_name = "verification_pass1_log.json" if self.phase == 1 else "verification_pass2_log.json"
-        debug_stage = self.stage  # log/<stage>.debug.jsonl: one file per phase
         self.verification_log_file = self.base_wiki_dir / log_name
 
         if not self.staging_dir.exists():
@@ -188,7 +182,6 @@ class WikiVerifierPipeline:
             )
 
         self.checkpoint = CheckpointLog(self.verification_log_file, flush_every=50)
-        self.debug = EventLog(log_path(self.base_wiki_dir, debug_stage, "debug"), label=self.stage)
         self.budget = StageBudget(self.settings.budget_minutes)
         self.verification_failures: Dict[str, str] = {}
 
@@ -318,7 +311,6 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
     def parse_verification(self, raw_text: Optional[str], key: str) -> VerificationResult:
         """Parse an audit response from XML (with JSON fallback) into VerificationResult."""
         if not raw_text:
-            self.debug.record("empty_response", key=key)
             raise ValueError("Empty verification response")
 
         # 1. Strip thinking tags
@@ -418,7 +410,6 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
         except Exception:
             pass
 
-        self.debug.record("parse_failure", key=key, raw_response=raw_text)
         raise ValueError(f"Could not parse verification output for {key}")
 
     async def verify_chunk(self, client: Any, item: Dict[str, Any],
@@ -469,9 +460,6 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
         )
         choice = response.choices[0]
         if choice.finish_reason == "length":
-            self.debug.record("truncated_response", key=item["key"],
-                              max_tokens=self.settings.max_tokens or 4096,
-                              raw_response=choice.message.content)
             raise ValueError("Verification response truncated: hit max_tokens limit")
         return self.parse_verification(choice.message.content, item["key"])
 
@@ -482,11 +470,6 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
         payload = result.model_dump_json(indent=2)
         await asyncio.to_thread(atomic_write_text, item["result_file"], payload)
         self.checkpoint.mark(item["key"], True)
-        self.debug.record("verified", key=item["key"], phase=self.phase,
-                          coverage_score=result.coverage_score,
-                          is_sufficient=result.is_sufficient,
-                          missing_concepts=len(result.missing_concepts),
-                          missing_facts=len(result.missing_facts))
         if self.checkpoint.needs_flush():
             await self.checkpoint.flush()
 
@@ -548,8 +531,7 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
               f"{self.settings.concurrency_per_server} concurrent request(s) each "
               f"(item i -> server i % N).")
         print(f"Per-item attempts: {self.settings.attempts} | "
-              f"Stage budget: {self.settings.budget_minutes:g} min | "
-              f"Debug log: {self.debug.path}")
+              f"Stage budget: {self.settings.budget_minutes:g} min")
 
         if not pending:
             print("All available extractions are already verified for this phase!")
@@ -567,13 +549,12 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
                     desc=f"Verifying phase {self.phase} [{self.domain}]",
                     key_fn=lambda item: item["key"],
                     budget=self.budget,
-                    debug=self.debug,
+                    debug=None,
                     attempt_timeout=self.settings.profile.attempt_timeout,
                     on_result=self.persist_result,
                 )
         finally:
             await self.checkpoint.flush()
-            self.debug.close()
 
         print("Requests served per server:")
         for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
@@ -619,10 +600,7 @@ def main():
     args = parser.parse_args()
 
     verifier = WikiVerifierPipeline(args)
-    try:
-        asyncio.run(verifier.run())
-    finally:
-        verifier.debug.close()
+    asyncio.run(verifier.run())
 
 if __name__ == "__main__":
     main()

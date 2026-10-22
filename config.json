@@ -7,7 +7,7 @@
     "http://cn26-a40:8001/v1": 20
   },
   "model_name": "Qwen/Qwen3.8-27B",
-  "concurrency_per_server": 32,
   "max_tokens": 16000,
-  "request_timeout": 2400.0
+  "request_timeout": 2400.0,
+  "enable_thinking": false
 }
