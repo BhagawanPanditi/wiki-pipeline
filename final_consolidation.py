@@ -497,7 +497,7 @@ class FinalConsolidationPipeline:
         print("============================================================\n")
 
 def main():
-    parser = build_parser(stage=STAGE, description="Final knowledge graph consolidation, island audit and markdown wiki export")
+    parser = build_parser(stage=STAGE, description="Final knowledge graph consolidation, island audit and markdown wiki export", include_resume=True)
     parser.add_argument("--skip_deep_verify", action="store_true",
                         help="Skip LLM deep verification and export current graph.")
     args = parser.parse_args()

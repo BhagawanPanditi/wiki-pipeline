@@ -542,7 +542,7 @@ def global_consolidate(domain_dir: Path, args: Any):
     print("============================================================\n")
 
 def main():
-    parser = build_parser(stage=STAGE, description="Consolidate concepts across documents using LLM-verified matches")
+    parser = build_parser(stage=STAGE, description="Consolidate concepts across documents using LLM-verified matches", include_resume=True)
     parser.add_argument("--skip_alias_verification", action="store_true",
                         help="Skip LLM verification of candidate pairs.")
     args = parser.parse_args()

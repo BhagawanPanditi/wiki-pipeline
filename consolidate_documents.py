@@ -498,7 +498,7 @@ class WikiDocumentConsolidatorPipeline:
         print("============================================================\n")
 
 def main():
-    parser = build_parser(stage=STAGE, description="Consolidate concepts across chunks within each document")
+    parser = build_parser(stage=STAGE, description="Consolidate concepts across chunks within each document", include_resume=True)
     args = parser.parse_args()
 
     pipeline = WikiDocumentConsolidatorPipeline(args)
