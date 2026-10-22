@@ -113,7 +113,7 @@ run_stage() {
     echo "=============================================================================="
 
     local start_time=$(date +%s)
-    local retries=3
+    local retries=5
     local attempt=1
     while [ $attempt -le $retries ]; do
         if "${cmd[@]}"; then

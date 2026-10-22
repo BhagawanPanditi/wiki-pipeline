@@ -821,25 +821,19 @@ class FinalConsolidationPipeline:
                     r_text = rel.get("relation", "")
                     jacc = rel.get("jaccard_similarity")
                     jacc_str = f" *(Jaccard similarity: {jacc})*" if jacc is not None else ""
-                    md_content.append(f"- **[[{tgt}]]**: {r_text}{jacc_str}")
+                    tgt_slug = sanitize_filename(tgt) or "unnamed_concept"
+                    md_content.append(f"- [[{tgt_slug}|{tgt}]]: {r_text}{jacc_str}")
 
                 if extended_relations:
                     md_content.append("\n### Extended Context & Mentions\n")
-                    compact_links = [f"[[{r.get('target_concept', '')}]]" for r in extended_relations if r.get('target_concept')]
+                    compact_links = [
+                        f"[[{sanitize_filename(r.get('target_concept', ''))}|{r.get('target_concept', '')}]]"
+                        for r in extended_relations if r.get('target_concept')
+                    ]
                     md_content.append(", ".join(compact_links))
                 md_content.append("")
 
             atomic_write_text(md_path, "\n".join(md_content))
-            index_entries.append((title, f"{safe_name}.md", brief))
-
-        # Root Concept Index
-        index_entries.sort(key=lambda x: x[0].lower())
-        index_lines = ["# Knowledge Graph Concept Index\n", f"Total Concepts: {len(index_entries)}\n"]
-        for t, fname, b in index_entries:
-            b_snip = f" — {b[:120]}..." if b else ""
-            index_lines.append(f"- [{t}]({fname}){b_snip}")
-
-        atomic_write_text(self.md_dir / "concept_index.md", "\n".join(index_lines))
 
         print("\n============================================================")
         print("STAGE 9: FINAL CONSOLIDATION & WIKI EXPORT COMPLETE")
