@@ -32,12 +32,16 @@ flowchart TD
     Corpus["Input Corpus (.jsonl / .json)"] --> Pass1["Stage 1: extract_concepts.py (Pass 1)"]
     Pass1 --> Staging1["staging/<doc>/<chunk>/concepts.json"]
     Staging1 --> Verify1["Stage 2: verify_extraction.py --phase 1"]
-    Verify1 --> Report1["verification.json (Audit Findings)"]
+    Verify1 --> Report1["verification_pass1.json (Audit Findings)"]
     Report1 --> Refine["Stage 3: refine_concepts.py (Pass 2)"]
     Staging1 --> Refine
     Refine --> Staging2["Refined concepts.json (Backed up Pass 1)"]
     Staging2 --> Verify2["Stage 4: verify_extraction.py --phase 2"]
     Verify2 --> Summary["verification_summary.json (Quality Improvement Table)"]
+    Staging2 --> DocConsolidate["Stage 5: consolidate_documents.py"]
+    DocConsolidate --> DocOut["consolidated/<doc>/concepts.json"]
+    DocOut --> GlobalConsolidate["Stage 6: consolidate_global.py"]
+    GlobalConsolidate --> GlobalOut["global_concepts.json & concepts/<title>.json"]
 ```
 
 ---
@@ -143,6 +147,58 @@ Missed Facts                   42         7           -35  -83.3%
 
 ---
 
+### Stage 5: Document Consolidation (`consolidate_documents.py`)
+
+Fuses duplicate concepts extracted from different chunks **within the same document**.
+- Gives the LLM concept titles, aliases, and a ~40-word context hint from the description.
+- Evaluates candidate merges using pure XML `<merge_clusters>`.
+- Preserves full provenance `[doc::chunk]` and unifies aliases and descriptions.
+- Computes and displays thin-concept word distribution before and after.
+
+#### XML Output Format:
+```xml
+<think>
+[Deduplication analysis across chunks]
+</think>
+<merge_clusters>
+<cluster>
+<primary_title>Photosynthesis</primary_title>
+<merged_titles>
+- Oxygenic Photosynthesis
+- Photosynthetic Process
+</merged_titles>
+</cluster>
+</merge_clusters>
+```
+
+---
+
+### Stage 6: Global Consolidation (`consolidate_global.py`)
+
+Fuses duplicate concepts **across the entire document corpus**.
+- Discovers candidate pairs with identical titles, plural/lemma variations, and title-to-alias alignments.
+- Provides the LLM with both titles, all aliases, and the first ~40 words of description for semantic disambiguation.
+- Verifies merges via pure XML `<verdicts>` (`<is_same_entity>true/false</is_same_entity>`).
+- Fuses descriptions into cited paragraphs (`[doc::chunk]`), creates `global_concepts.json` and standalone files under `concepts/<title>.json`.
+- Outputs thin-concept word distribution before and after.
+
+#### XML Output Format:
+```xml
+<think>
+[Comparison and disambiguation notes]
+</think>
+<verdicts>
+<verdict>
+<pair_index>1</pair_index>
+<is_same_entity>true</is_same_entity>
+<chosen_canonical_title>Amyotrophic Lateral Sclerosis</chosen_canonical_title>
+<reason>Direct synonymous medical reference.</reason>
+</verdict>
+</verdicts>
+```
+
+---
+
 ## 3. Configuration & Server Setup
 
 Execution parameters are defined in `config.json` at the repository root:
@@ -214,6 +270,20 @@ python3 verify_extraction.py \
   --disable_thinking
 ```
 
+### Step 5: Consolidate Within Documents (Stage 5)
+```bash
+python3 consolidate_documents.py \
+  --wiki_path "/path/to/wiki/biology" \
+  --disable_thinking
+```
+
+### Step 6: Consolidate Globally Across Documents (Stage 6)
+```bash
+python3 consolidate_global.py \
+  --wiki_path "/path/to/wiki/biology" \
+  --disable_thinking
+```
+
 ---
 
 ## 5. Resuming Interrupted Runs
@@ -225,4 +295,5 @@ python3 extract_concepts.py --wiki_path "/path/to/wiki/biology" --input_path "/p
 python3 verify_extraction.py --wiki_path "/path/to/wiki/biology" --phase 1 --resume
 python3 refine_concepts.py --wiki_path "/path/to/wiki/biology" --resume
 python3 verify_extraction.py --wiki_path "/path/to/wiki/biology" --phase 2 --resume
+python3 consolidate_documents.py --wiki_path "/path/to/wiki/biology" --resume
 ```
