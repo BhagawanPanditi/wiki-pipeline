@@ -14,6 +14,7 @@ between concepts that share vital named entities:
 """
 
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
@@ -27,8 +28,18 @@ from utils.cli import build_parser
 STAGE = "link-entities"
 
 def normalize_entity(ent: str) -> str:
-    """Normalize entity text for exact matching."""
-    return ent.strip().lower()
+    """Normalize entity text with robust lemmatization for matching."""
+    if not ent:
+        return ""
+    ent = ent.strip().lower()
+    ent = re.sub(r"[^\w\s-]", "", ent)
+    if ent.endswith("ies") and len(ent) > 4:
+        ent = ent[:-3] + "y"
+    elif ent.endswith("es") and len(ent) > 4 and not ent.endswith(("ses", "xes", "ches", "shes")):
+        ent = ent[:-2]
+    elif ent.endswith("s") and len(ent) > 3 and not ent.endswith("ss"):
+        ent = ent[:-1]
+    return ent.strip()
 
 def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "RELATED LINKS"):
     """Compute and print histogram distribution of related links across all concepts."""
@@ -73,9 +84,10 @@ def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "
 
 def enrich_graph_via_jaccard(
     wiki_path: Path,
-    min_shared_entities: int = 2,
-    min_jaccard: float = 0.15,
-    max_hub_threshold: int = 50,
+    min_shared_entities: int = 1,
+    min_jaccard: float = 0.05,
+    max_hub_threshold: int = 150,
+    specific_entity_threshold: int = 50,
     dry_run: bool = False
 ):
     global_concepts_file = wiki_path / "global_concepts.json"
@@ -97,10 +109,19 @@ def enrich_graph_via_jaccard(
     entity_to_concepts: Dict[str, Set[str]] = defaultdict(set)
     concept_entities: Dict[str, Set[str]] = {}
     concept_by_title: Dict[str, Dict[str, Any]] = {}
+    title_lookup: Dict[str, str] = {}
 
     for c in concepts:
         title = c["title"]
         concept_by_title[title] = c
+        norm_t = normalize_entity(title)
+        if len(norm_t) > 2:
+            title_lookup[norm_t] = title
+        for alias in c.get("aliases", []):
+            norm_a = normalize_entity(alias)
+            if len(norm_a) > 2:
+                title_lookup[norm_a] = title
+
         raw_entities = c.get("entities", [])
         norm_set = set()
         for ent in raw_entities:
@@ -124,10 +145,21 @@ def enrich_graph_via_jaccard(
     giant_size = len(initial_components[0]) if initial_components else 0
     print(f"Initial Graph Connectivity: {len(initial_components)} components. Giant component: {giant_size}/{len(concepts)} ({giant_size/len(concepts)*100:.1f}%)")
 
-    # Find candidate pairs and compute Jaccard similarity
+    # 1. Direct Conceptual Mention (Title/Alias in Entities)
+    title_mention_links: List[Tuple[str, str, float, List[str]]] = []
+    for title, ents in concept_entities.items():
+        for ent in ents:
+            if ent in title_lookup:
+                matched_target = title_lookup[ent]
+                if matched_target != title and not G.has_edge(title, matched_target):
+                    title_mention_links.append((title, matched_target, 1.0, [ent]))
+
+    print(f"Discovered {len(title_mention_links)} cross-reference links where a concept's title appears in key entities.")
+
+    # 2. Shared Entities & Jaccard Similarity
     pair_shared: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     for ent, titles in entity_to_concepts.items():
-        if 1 < len(titles) <= max_hub_threshold:  # skip ultra-generic hubs
+        if 1 < len(titles) <= max_hub_threshold:  # Filter out excessively broad generic hubs
             t_list = sorted(list(titles))
             for i in range(len(t_list)):
                 for j in range(i + 1, len(t_list)):
@@ -142,16 +174,33 @@ def enrich_graph_via_jaccard(
         union_len = len(set1 | set2)
         jaccard = len(shared) / union_len if union_len > 0 else 0.0
 
-        if len(shared) >= min_shared_entities or jaccard >= min_jaccard:
+        # Qualifying criteria:
+        # A) Multiple shared entities (>= min_shared_entities)
+        # B) High Jaccard similarity score (>= min_jaccard)
+        # C) Single shared entity IF the entity is domain-specific (frequency <= specific_entity_threshold)
+        qualifies = False
+        if len(shared) >= 2 or jaccard >= min_jaccard:
+            qualifies = True
+        elif len(shared) == 1 and min_shared_entities <= 1:
+            only_ent = next(iter(shared))
+            if len(entity_to_concepts[only_ent]) <= specific_entity_threshold:
+                qualifies = True
+
+        if qualifies:
             candidate_links.append((t1, t2, jaccard, sorted(list(shared))))
 
-    print(f"Discovered {len(candidate_links)} reciprocal candidate pair(s) meeting Jaccard threshold >= {min_jaccard} or shared >= {min_shared_entities}.")
+    print(f"Discovered {len(candidate_links)} reciprocal candidate pair(s) meeting semantic criteria.")
+
+    # Merge candidate links
+    all_new_links = title_mention_links + candidate_links
 
     # Establish reciprocal bidirectional links for all qualifying pairs
     added_links_by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     new_edges_added = 0
 
-    for t1, t2, jaccard, shared_list in candidate_links:
+    for t1, t2, jaccard, shared_list in all_new_links:
+        if G.has_edge(t1, t2):
+            continue
         shared_summary = ", ".join(shared_list[:4])
         rel_text = f"Functionally related via shared key entities: {shared_summary}."
 
@@ -221,7 +270,10 @@ def enrich_graph_via_jaccard(
             while file_path.exists() and not file_path.is_file():
                 file_path = concepts_dir / f"{safe_name}_{counter}.json"
                 counter += 1
-            atomic_write_json(file_path, c)
+            try:
+                atomic_write_json(file_path, c, fsync_dir=False)
+            except Exception:
+                pass
 
     print("\n============================================================")
     print("STAGE 8: JACCARD ENTITY LINKING COMPLETE")
@@ -235,14 +287,17 @@ def main():
         stage=STAGE,
         description="Establish bidirectional semantic relations using Jaccard entity overlap",
         include_max_tokens=False,
-        include_model=False
+        include_model=False,
+        include_resume=True
     )
-    parser.add_argument("--min_shared_entities", type=int, default=2,
-                        help="Minimum shared entities to trigger a link.")
-    parser.add_argument("--min_jaccard", type=float, default=0.15,
+    parser.add_argument("--min_shared_entities", type=int, default=1,
+                        help="Minimum shared entities to trigger a link (default: 1 for specific entities).")
+    parser.add_argument("--min_jaccard", type=float, default=0.05,
                         help="Minimum Jaccard similarity score (|A∩B| / |A∪B|).")
-    parser.add_argument("--max_hub_threshold", type=int, default=50,
+    parser.add_argument("--max_hub_threshold", type=int, default=150,
                         help="Max concepts sharing an entity before treating it as an ultra-generic hub.")
+    parser.add_argument("--specific_entity_threshold", type=int, default=50,
+                        help="Max concepts sharing an entity for 1 shared entity to trigger a link.")
     parser.add_argument("--dry_run", action="store_true",
                         help="Simulate without modifying files.")
 
@@ -256,6 +311,7 @@ def main():
         min_shared_entities=args.min_shared_entities,
         min_jaccard=args.min_jaccard,
         max_hub_threshold=args.max_hub_threshold,
+        specific_entity_threshold=args.specific_entity_threshold,
         dry_run=args.dry_run
     )
 
