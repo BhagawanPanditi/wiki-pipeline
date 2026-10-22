@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Global Concept Consolidation Pass (Exact & Verified-Alias)
-----------------------------------------------------------
-Fuses concepts across all documents in the corpus:
-Phase 1: Deterministic Exact Title & Normalization Merge (no LLM, 100% precision).
-Phase 2: LLM-Verified Title-to-Alias Equivalence (pure XML, thinking control, high recall).
-Phase 3: Concept Attribute & Provenance Fusion (generates cited descriptions & global_concepts.json).
-Outputs comprehensive word-count distribution and thin-concept statistics before and after consolidation.
+Global Concept Consolidation Pass (LLM-Verified Exact, Lemma & Alias Merging)
+------------------------------------------------------------------------------
+Fuses concepts across all documents in the corpus using LLM verification:
+- Candidate pairs with identical titles, lemma plurals, punctuation differences,
+  or title-to-alias alignments are identified.
+- Context provided to LLM: Title, Aliases, and first ~40-50 words of Description.
+- LLM confirms whether both concepts refer to the exact same canonical entity.
+- Disjoint Set / UnionFind applies confirmed merges.
+- Exports global_concepts.json and concepts/<title>.json with provenance citations.
+- Outputs thin concept statistics (word-count distribution) before and after.
 """
 
 import asyncio
@@ -76,6 +79,16 @@ def canonical_lemma_key(title: str) -> str:
         normalized.append(tok)
     return " ".join(normalized)
 
+def get_context_hint(desc: str, max_words: int = 40) -> str:
+    """Extracts first ~40 words from description as rich context for LLM comparison."""
+    if not desc:
+        return "No description available."
+    words = desc.strip().split()
+    snippet = " ".join(words[:max_words])
+    if len(words) > max_words:
+        snippet += "..."
+    return snippet
+
 class UnionFind:
     """Disjoint Set with iterative path compression and cycle prevention."""
     def __init__(self):
@@ -111,15 +124,17 @@ class UnionFind:
         if root1 and root2 and root1 != root2:
             self.parent[root1] = root2
 
-# ── XML System Prompt for Alias Verification ──────────────────────────────────
+# ── XML System Prompt for LLM Concept Merge Verification ──────────────────────
 
-SYSTEM_PROMPT_ALIAS_VERIFY = """\
+SYSTEM_PROMPT_MERGE_VERIFY = """\
 You are an expert technical knowledge graph consolidator evaluating candidate concepts across documents.
-You are given candidate pairs of concepts where Concept A's title matches or closely aligns with Concept B's alias.
+You are given candidate pairs of concepts that share identical titles, plural/spelling variants, or title-to-alias alignments.
+Each concept is presented with its Canonical Title, Aliases, and a ~40-word Context Snippet from its description.
+
 Your task is to determine whether both concepts refer to the EXACT SAME real-world entity, process, tool, gene, condition, or technical subject.
 
 CRITICAL RULES:
-1. MERGE (is_same_entity: true): Only if both concepts denote the identical subject (e.g., 'Amyotrophic Lateral Sclerosis' and 'Lou Gehrig's Disease').
+1. MERGE (is_same_entity: true): Only if both concepts denote the identical subject (e.g., 'Amyotrophic Lateral Sclerosis' and 'Lou Gehrig's Disease', or 'Photosynthesis' and 'Photosynthetic Process').
 2. KEEP SEPARATE (is_same_entity: false): Do NOT merge if one is an acronym that is polysemous, or if one is a sub-component/subtype of the other (e.g. 'T Cell' vs 'Cell', 'Cornea' vs 'Retina').
 3. When in doubt, prefer FALSE. Keeping concepts separate preserves graph integrity.
 
@@ -136,27 +151,27 @@ OUTPUT FORMAT:
 <verdict>
 <pair_index>1</pair_index>
 <is_same_entity>true</is_same_entity>
-<chosen_canonical_title>Concept Title A</chosen_canonical_title>
+<chosen_canonical_title>Exact Canonical Title</chosen_canonical_title>
 <reason>Direct synonymous reference.</reason>
 </verdict>
 </verdicts>
 """
 
-class AliasVerdict(BaseModel):
+class MergeVerdict(BaseModel):
     pair_index: int = 1
     is_same_entity: bool = False
     chosen_canonical_title: str = ""
     reason: str = ""
 
-def parse_xml_alias_verdicts(text: str) -> List[AliasVerdict]:
-    """Parse <verdicts> blocks into AliasVerdict objects, stripping thinking tags."""
+def parse_xml_merge_verdicts(text: str) -> List[MergeVerdict]:
+    """Parse <verdicts> blocks into MergeVerdict objects, stripping thinking tags."""
     if not text:
         return []
 
     clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
     clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
 
-    verdicts: List[AliasVerdict] = []
+    verdicts: List[MergeVerdict] = []
     blocks = re.findall(r"<verdict>(.*?)</verdict>", clean_text, re.DOTALL | re.IGNORECASE)
     for block in blocks:
         idx_m = re.search(r"<pair_index>(\d+)</pair_index>", block, re.IGNORECASE)
@@ -173,7 +188,7 @@ def parse_xml_alias_verdicts(text: str) -> List[AliasVerdict]:
         reason_m = re.search(r"<reason>(.*?)</reason>", block, re.DOTALL | re.IGNORECASE)
         reason = reason_m.group(1).strip() if reason_m else ""
 
-        verdicts.append(AliasVerdict(
+        verdicts.append(MergeVerdict(
             pair_index=idx,
             is_same_entity=is_same,
             chosen_canonical_title=canon,
@@ -187,7 +202,7 @@ def parse_xml_alias_verdicts(text: str) -> List[AliasVerdict]:
             if m:
                 payload = json.loads(m.group(0))
                 for item in payload.get("pair_verdicts", []):
-                    verdicts.append(AliasVerdict(
+                    verdicts.append(MergeVerdict(
                         pair_index=item.get("pair_index", len(verdicts) + 1),
                         is_same_entity=bool(item.get("is_same_entity", False)),
                         chosen_canonical_title=item.get("chosen_canonical_title", ""),
@@ -246,13 +261,13 @@ def print_concept_word_distribution(concepts: List[Dict[str, Any]], title_label:
         print(f"{label:<20} {count:<10} {pct:>5.1f}%   {bar}")
     print(f"============================================================\n")
 
-# ── Alias Verification Runner ─────────────────────────────────────────────────
+# ── Merge Verification Runner ─────────────────────────────────────────────────
 
-def make_alias_pairs_prompt(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> str:
+def make_candidate_pairs_prompt(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> str:
     blocks = []
     for i, (c1, c2) in enumerate(pairs, 1):
-        c1_desc = " ".join(c1.get("description", "").split())[:200]
-        c2_desc = " ".join(c2.get("description", "").split())[:200]
+        c1_context = get_context_hint(c1.get("description", ""), max_words=40)
+        c2_context = get_context_hint(c2.get("description", ""), max_words=40)
         c1_aliases = ", ".join(c1.get("aliases", [])) or "None"
         c2_aliases = ", ".join(c2.get("aliases", [])) or "None"
 
@@ -260,16 +275,16 @@ def make_alias_pairs_prompt(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]) 
             f"PAIR #{i}:\n"
             f"  Concept 1: \"{c1.get('title')}\"\n"
             f"    Aliases: {c1_aliases}\n"
-            f"    Context: {c1_desc}\n"
+            f"    Context (~40 words): {c1_context}\n"
             f"  Concept 2: \"{c2.get('title')}\"\n"
             f"    Aliases: {c2_aliases}\n"
-            f"    Context: {c2_desc}"
+            f"    Context (~40 words): {c2_context}"
         )
         blocks.append(block)
-    return "VERIFY THE FOLLOWING CONCEPT PAIRS:\n\n" + "\n\n".join(blocks)
+    return "VERIFY THE FOLLOWING CONCEPT PAIRS (Decide if they denote the EXACT SAME entity):\n\n" + "\n\n".join(blocks)
 
-async def verify_alias_batch(client: Any, batch: List[Tuple[Dict[str, Any], Dict[str, Any]]], settings: Any, args: Any) -> List[AliasVerdict]:
-    user_prompt = make_alias_pairs_prompt(batch)
+async def verify_merge_batch(client: Any, batch: List[Tuple[Dict[str, Any], Dict[str, Any]]], settings: Any, args: Any) -> List[MergeVerdict]:
+    user_prompt = make_candidate_pairs_prompt(batch)
 
     extra_body: Dict[str, Any] = {}
     model_kwargs: Dict[str, Any] = {}
@@ -289,14 +304,14 @@ async def verify_alias_batch(client: Any, batch: List[Tuple[Dict[str, Any], Dict
     response = await client.chat.completions.create(
         model=settings.model_name,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_ALIAS_VERIFY},
+            {"role": "system", "content": SYSTEM_PROMPT_MERGE_VERIFY},
             {"role": "user", "content": user_prompt}
         ],
         max_tokens=settings.max_tokens or 8192,
         **model_kwargs
     )
     raw_text = response.choices[0].message.content or ""
-    return parse_xml_alias_verdicts(raw_text)
+    return parse_xml_merge_verdicts(raw_text)
 
 # ── Main Pipeline Execution ───────────────────────────────────────────────────
 
@@ -330,95 +345,78 @@ def global_consolidate(domain_dir: Path, args: Any):
     # Display initial word-count distribution before global merge
     print_concept_word_distribution(all_raw_concepts, title_label="STAGE 6: BEFORE GLOBAL CONSOLIDATION")
 
-    # 2. Phase 1: Deterministic Exact Title & Lemma Normalization
-    uf = UnionFind()
+    # 2. Gather Candidate Merge Pairs (Exact Title, Lemma/Plural Variants, and Title-to-Alias alignments)
+    # Group by canonical lemma key to find candidate exact and lemma variants across documents
+    lemma_groups: Dict[str, List[Dict[str, Any]]] = {}
     for c in all_raw_concepts:
-        title = c.get("title", "").strip()
-        if title:
-            uf.find(title)
-
-    for c in all_raw_concepts:
-        title = c.get("title", "").strip()
-        if not title:
+        t = c.get("title", "").strip()
+        if not t:
             continue
-        uf.union(title, title)
-
-    title_groups: Dict[str, List[Dict[str, Any]]] = {}
-    for c in all_raw_concepts:
-        title = c.get("title", "").strip()
-        if not title:
-            continue
-        root = uf.find(title)
-        title_groups.setdefault(root, []).append(c)
-
-    exact_concepts: List[Dict[str, Any]] = []
-    for root, members in title_groups.items():
-        title_counter = Counter(c.get("title", "").strip() for c in members)
-        chosen_title = title_counter.most_common(1)[0][0]
-
-        merged_aliases = set()
-        for c in members:
-            merged_aliases.add(c.get("title", "").strip())
-            for a in c.get("aliases", []):
-                if a.strip():
-                    merged_aliases.add(a.strip())
-        merged_aliases.discard(chosen_title)
-
-        all_desc_sentences = []
-        for c in members:
-            d = c.get("description", "").strip()
-            if d:
-                all_desc_sentences.append(d)
-
-        exact_concepts.append({
-            "title": chosen_title,
-            "root": root,
-            "aliases": sorted(list(merged_aliases)),
-            "description": " ".join(all_desc_sentences[:3]),
-            "members": members,
-        })
-
-    print(f"Concepts after Deterministic Exact Title Matching: {len(exact_concepts)} "
-          f"(merged {raw_concepts_count - len(exact_concepts)} identical titles)")
-
-    # 3. Phase 2: LLM-Verified Title-to-Alias Matching
-    alias_to_concept: Dict[str, List[Dict[str, Any]]] = {}
-    for ec in exact_concepts:
-        for alias in ec["aliases"]:
-            clean_al = canonical_lemma_key(alias)
-            if len(clean_al) > 3 and clean_al not in STOP_WORDS:
-                alias_to_concept.setdefault(clean_al, []).append(ec)
+        key = canonical_lemma_key(t)
+        lemma_groups.setdefault(key, []).append(c)
 
     candidate_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     seen_pair_keys: Set[Tuple[str, str]] = set()
 
-    for ec in exact_concepts:
-        norm_title = ec["root"]
-        if norm_title in alias_to_concept:
-            for match in alias_to_concept[norm_title]:
-                if match["root"] != ec["root"]:
-                    pair_key = tuple(sorted([ec["root"], match["root"]]))
-                    if pair_key not in seen_pair_keys:
-                        seen_pair_keys.add(pair_key)
-                        candidate_pairs.append((ec, match))
+    # (A) Candidate pairs from exact/lemma match across different documents/instances
+    for key, group in lemma_groups.items():
+        if len(group) > 1:
+            for i in range(len(group)):
+                for j in range(i + 1, min(i + 5, len(group))):  # pair across distinct concepts in group
+                    c1, c2 = group[i], group[j]
+                    pk = tuple(sorted([c1.get("title", ""), c2.get("title", "")]))
+                    if pk[0].lower() != pk[1].lower() and pk not in seen_pair_keys:
+                        seen_pair_keys.add(pk)
+                        candidate_pairs.append((c1, c2))
 
-    print(f"Identified {len(candidate_pairs)} candidate title-to-alias pair(s) for LLM verification.")
+    # (B) Candidate pairs from Title-to-Alias alignments
+    alias_map: Dict[str, List[Dict[str, Any]]] = {}
+    for c in all_raw_concepts:
+        for alias in c.get("aliases", []):
+            clean_al = canonical_lemma_key(alias)
+            if len(clean_al) > 3 and clean_al not in STOP_WORDS:
+                alias_map.setdefault(clean_al, []).append(c)
 
-    approved_alias_merges = 0
+    for c in all_raw_concepts:
+        norm_title = canonical_lemma_key(c.get("title", ""))
+        if norm_title in alias_map:
+            for match in alias_map[norm_title]:
+                if canonical_lemma_key(match.get("title", "")) != norm_title:
+                    pk = tuple(sorted([c.get("title", ""), match.get("title", "")]))
+                    if pk not in seen_pair_keys:
+                        seen_pair_keys.add(pk)
+                        candidate_pairs.append((c, match))
+
+    print(f"Identified {len(candidate_pairs)} candidate merge pair(s) (exact/lemma/alias) with contextual descriptions.")
+
+    # 3. LLM Verification of Candidate Pairs
+    uf = UnionFind()
+    for c in all_raw_concepts:
+        t = c.get("title", "").strip()
+        if t:
+            uf.find(t)
+
+    # Identical strings always union immediately
+    for c in all_raw_concepts:
+        t = c.get("title", "").strip()
+        if t:
+            uf.union(t, t)
+
+    approved_merges = 0
     if candidate_pairs and not getattr(args, "skip_alias_verification", False):
         settings = resolve_settings(args, STAGE)
         batch_size = 10
         batches = [candidate_pairs[i:i + batch_size] for i in range(0, len(candidate_pairs), batch_size)]
 
-        async def run_alias_verification():
-            nonlocal approved_alias_merges
+        async def run_verification():
+            nonlocal approved_merges
             pool = pool_for_stage(args, settings, STAGE)
 
             async def handler(client, batch, server_index):
-                return await verify_alias_batch(client, batch, settings, args)
+                return await verify_merge_batch(client, batch, settings, args)
 
             async def on_batch_result(batch, verdicts):
-                nonlocal approved_alias_merges
+                nonlocal approved_merges
                 if verdicts:
                     for verdict in verdicts:
                         idx = verdict.pair_index - 1
@@ -426,25 +424,25 @@ def global_consolidate(domain_dir: Path, args: Any):
                             c1, c2 = batch[idx]
                             if verdict.is_same_entity:
                                 uf.union(c1["title"], c2["title"])
-                                approved_alias_merges += 1
+                                approved_merges += 1
 
             async with pool:
                 await pool.map(
                     batches,
                     handler,
                     attempts=settings.attempts,
-                    desc="Verifying Alias Candidate Pairs",
+                    desc="LLM Verifying Candidate Merge Pairs",
                     budget=None,
                     attempt_timeout=settings.profile.attempt_timeout,
                     on_result=on_batch_result,
                 )
 
-        asyncio.run(run_alias_verification())
-        print(f"LLM approved {approved_alias_merges} title-to-alias merges.")
+        asyncio.run(run_verification())
+        print(f"LLM confirmed and approved {approved_merges} concept merges.")
     else:
-        print("Skipping alias LLM verification (or no candidates found).")
+        print("Skipping LLM candidate pair verification (or no candidates found).")
 
-    # 4. Phase 3: Final Attribute, Citations & Description Fusion
+    # 4. Final Attribute, Provenance & Description Fusion
     final_groups: Dict[str, List[Dict[str, Any]]] = {}
     for c in all_raw_concepts:
         title = c.get("title", "").strip()
@@ -508,8 +506,8 @@ def global_consolidate(domain_dir: Path, args: Any):
         "summary": {
             "canonical_docs_evaluated": len(doc_files),
             "raw_input_concepts": raw_concepts_count,
-            "exact_matched_concepts": len(exact_concepts),
-            "alias_merges_approved": approved_alias_merges,
+            "candidate_pairs_checked": len(candidate_pairs),
+            "merges_approved_by_llm": approved_merges,
             "final_global_concepts": len(global_concepts),
         }
     }
@@ -534,19 +532,19 @@ def global_consolidate(domain_dir: Path, args: Any):
     print_concept_word_distribution(global_concepts, title_label="STAGE 6: AFTER GLOBAL CONSOLIDATION")
 
     print("\n============================================================")
-    print("GLOBAL CONSOLIDATION (EXACT & VERIFIED) COMPLETE")
+    print("GLOBAL CONSOLIDATION COMPLETE")
     print("============================================================")
     print(f"Total Canonical Docs Merged:  {len(doc_files)}")
     print(f"Raw Input Concepts Loaded:    {raw_concepts_count}")
-    print(f"Deterministic Exact Merged:   {len(exact_concepts)}")
-    print(f"Approved Alias Merges:        {approved_alias_merges}")
-    print(f"Final Global Concepts:        {len(global_concepts)}")
+    print(f"Candidate Pairs Audited:      {len(candidate_pairs)}")
+    print(f"Approved LLM Merges:          {approved_merges}")
+    print(f"Final Global Concepts:        {len(global_concepts)} (fused {raw_concepts_count - len(global_concepts)} duplicates)")
     print("============================================================\n")
 
 def main():
-    parser = build_parser(stage=STAGE, description="Consolidate concepts across documents using exact and verified matches")
+    parser = build_parser(stage=STAGE, description="Consolidate concepts across documents using LLM-verified matches")
     parser.add_argument("--skip_alias_verification", action="store_true",
-                        help="Skip LLM verification of title-to-alias candidate pairs.")
+                        help="Skip LLM verification of candidate pairs.")
     args = parser.parse_args()
 
     wiki_path = getattr(args, "wiki_path", None)
