@@ -43,7 +43,6 @@ WIKI_BASE_DIR="${WIKI_BASE_DIR:-/home/compiling-ganesh/24m0829/long_document/wik
 
 ALL_DOMAINS=(
     "sustainable_living"
-    "biology"
     "earth_science"
     "economics"
     "psychology"
@@ -114,7 +113,22 @@ run_stage() {
     echo "=============================================================================="
 
     local start_time=$(date +%s)
-    "${cmd[@]}"
+    local retries=3
+    local attempt=1
+    while [ $attempt -le $retries ]; do
+        if "${cmd[@]}"; then
+            break
+        else
+            if [ $attempt -lt $retries ]; then
+                echo ">>> [STAGE $stage_num WARNING] Command failed on attempt $attempt/$retries. Retrying with --resume in 5s..." >&2
+                sleep 5
+            else
+                echo ">>> [STAGE $stage_num ERROR] Command failed after $retries attempts!" >&2
+                exit 1
+            fi
+        fi
+        attempt=$((attempt + 1))
+    done
     local end_time=$(date +%s)
     local elapsed=$((end_time - start_time))
 
