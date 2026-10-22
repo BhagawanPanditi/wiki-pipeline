@@ -24,8 +24,6 @@ import httpx
 from openai import AsyncOpenAI
 from tqdm import tqdm
 
-from .event_log import EventLog
-from .llm_log import CURRENT_CALL, LLMCallLog, wrap_client
 from .errors import (AllServersUnhealthy, PermanentFailure, StageBudget,
                      TransientFailureExhausted, describe_error)
 from .retry import retry_async
@@ -178,7 +176,7 @@ class ServerPool:
             self._http.append(http_client)
             client = AsyncOpenAI(base_url=url, api_key="EMPTY",
                                  http_client=http_client, max_retries=0)
-            self._clients.append(wrap_client(client, url, self.llm_log))
+            self._clients.append(client)
         self._consecutive_failures = [0] * len(self.servers)
         self._healthy = [True] * len(self.servers)
         self._served = [0] * len(self.servers)
@@ -468,6 +466,5 @@ def pool_for_stage(args: Any, settings: Any, stage: str) -> ServerPool:
         connect_timeout=settings.profile.connect_timeout,
         max_connections_slack=20,
         label=stage,
-        llm_log=LLMCallLog.from_args(args, stage),
         failover=not getattr(args, "no_failover", False),
     )

@@ -101,42 +101,41 @@ def enrich_graph_via_jaccard(
         if len(shared) >= min_shared_entities or jaccard >= min_jaccard:
             candidate_links.append((t1, t2, jaccard, sorted(list(shared))))
 
-    # Prioritize higher Jaccard similarity
+    # Prioritize candidate pairs by highest Jaccard similarity first, then by number of shared entities
     candidate_links.sort(key=lambda x: (x[2], len(x[3])), reverse=True)
     print(f"Discovered {len(candidate_links)} candidate pair(s) meeting Jaccard threshold >= {min_jaccard} or shared >= {min_shared_entities}.")
 
-    node_link_budget: Dict[str, int] = defaultdict(int)
-    added_links_by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    new_edges_added = 0
-
+    # Collect candidate links per concept (t1 and t2)
+    concept_candidate_links: Dict[str, List[Tuple[str, float, List[str]]]] = defaultdict(list)
     for t1, t2, jaccard, shared_list in candidate_links:
-        if node_link_budget[t1] >= max_links_per_node and node_link_budget[t2] >= max_links_per_node:
-            continue
+        concept_candidate_links[t1].append((t2, jaccard, shared_list))
+        concept_candidate_links[t2].append((t1, jaccard, shared_list))
 
-        shared_summary = ", ".join(shared_list[:4])
-        rel_text = f"Functionally related via shared key entities: {shared_summary}."
+    added_links_by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    edges_set: Set[Tuple[str, str]] = set()
 
-        link_payload_1 = {
-            "target_concept": t2,
-            "relation": rel_text,
-            "jaccard_similarity": round(jaccard, 3),
-            "shared_entities": shared_list,
-            "source_chunks": []
-        }
-        link_payload_2 = {
-            "target_concept": t1,
-            "relation": rel_text,
-            "jaccard_similarity": round(jaccard, 3),
-            "shared_entities": shared_list,
-            "source_chunks": []
-        }
+    # For each concept, select top candidate links sorted strictly by Jaccard descending
+    for src, candidates in concept_candidate_links.items():
+        candidates.sort(key=lambda x: (x[1], len(x[2])), reverse=True)
+        top_candidates = candidates[:max_links_per_node]
 
-        added_links_by_source[t1].append(link_payload_1)
-        added_links_by_source[t2].append(link_payload_2)
-        node_link_budget[t1] += 1
-        node_link_budget[t2] += 1
-        G.add_edge(t1, t2)
-        new_edges_added += 1
+        for tgt, jaccard, shared_list in top_candidates:
+            edge_key = tuple(sorted([src, tgt]))
+            edges_set.add(edge_key)
+
+            shared_summary = ", ".join(shared_list[:4])
+            rel_text = f"Functionally related via shared key entities: {shared_summary}."
+
+            added_links_by_source[src].append({
+                "target_concept": tgt,
+                "relation": rel_text,
+                "jaccard_similarity": round(jaccard, 3),
+                "shared_entities": shared_list,
+                "source_chunks": []
+            })
+            G.add_edge(src, tgt)
+
+    new_edges_added = len(edges_set)
 
     post_components = list(nx.connected_components(G))
     post_components.sort(key=len, reverse=True)
@@ -193,8 +192,8 @@ def main():
                         help="Minimum shared entities to trigger a link.")
     parser.add_argument("--min_jaccard", type=float, default=0.15,
                         help="Minimum Jaccard similarity score (|A∩B| / |A∪B|).")
-    parser.add_argument("--max_links_per_node", type=int, default=4,
-                        help="Max new edges per node to maintain graph sparsity.")
+    parser.add_argument("--max_links_per_node", type=int, default=10,
+                        help="Max top ranked edges kept per concept (sorted strictly by Jaccard descending).")
     parser.add_argument("--dry_run", action="store_true",
                         help="Simulate without modifying files.")
 
