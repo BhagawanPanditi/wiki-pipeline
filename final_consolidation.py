@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 from utils.atomic_io import atomic_write_json, atomic_write_text, sanitize_filename
+from utils.citation_utils import clean_chunk_citations
 from utils.cli import build_parser, resolve_settings
 from utils.llm_pool import pool_for_stage
 
@@ -319,7 +320,7 @@ class FinalConsolidationPipeline:
             merged_aliases.discard(chosen_title)
             # Pick longest / most complete brief
             chosen_brief = max(briefs, key=len) if briefs else ""
-            fused_desc = " ".join(description_sentences)
+            fused_desc = clean_chunk_citations(" ".join(description_sentences))
 
             # Collect raw outbound relations
             raw_relations = []
@@ -413,6 +414,22 @@ class FinalConsolidationPipeline:
         print(f"Total surviving concepts after final merge & pruning: {len(final_concepts)}")
         atomic_write_json(self.global_concepts_file, {"concepts": final_concepts})
 
+        # Sync individual concept files if concepts directory exists
+        concepts_dir = self.wiki_path / "concepts"
+        if concepts_dir.is_dir():
+            surviving_files = set()
+            for c in final_concepts:
+                c_fname = f"{sanitize_filename(c['title'])}.json"
+                surviving_files.add(c_fname)
+                atomic_write_json(concepts_dir / c_fname, c)
+            # Remove any concept files that were pruned or merged away
+            for old_file in concepts_dir.glob("*.json"):
+                if old_file.name not in surviving_files:
+                    try:
+                        old_file.unlink()
+                    except OSError:
+                        pass
+
         # 6. Island Health Audit (Connected Components & Giant Component)
         print("Analyzing knowledge graph topology & islands...")
         G = nx.Graph()
@@ -448,7 +465,7 @@ class FinalConsolidationPipeline:
             brief = c.get("brief", "")
             aliases = ", ".join(c.get("aliases", []))
             entities = ", ".join(c.get("entities", [])[:15])
-            desc = c.get("description", "")
+            desc = clean_chunk_citations(c.get("description", ""))
             relations = c.get("outbound_relations", [])
 
             safe_name = sanitize_filename(title) or "unnamed_concept"

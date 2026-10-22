@@ -39,7 +39,26 @@ def clean_brief_text(text: str) -> str:
 
 
 def clean_chunk_citations(text: str) -> str:
-    """Convert chunk-level bracket citations to document-level citations."""
+    """Convert chunk-level bracket citations to document-level citations and deduplicate adjacent ones.
+    
+    Example:
+        [canon_013435abc85f::chunk_000][canon_013435abc85f::chunk_001]
+        -> [canon_013435abc85f]
+    """
     if not text:
         return ""
-    return _CHUNK_CITATION.sub(r"[\1]", text)
+
+    def replace_citation_groups(match):
+        group = match.group(0)
+        canon_ids = re.findall(r"\[\s*([A-Za-z0-9_-]+)(?:::[A-Za-z0-9_-]+)?\s*\]", group)
+        unique = []
+        for cid in canon_ids:
+            if cid not in unique:
+                unique.append(cid)
+        return " " + " ".join(f"[{cid}]" for cid in unique) + " "
+
+    pattern = r"(?:\[\s*[A-Za-z0-9_-]+(?:::[A-Za-z0-9_-]+)?\s*\]\s*)+"
+    cleaned = re.sub(pattern, replace_citation_groups, text)
+    cleaned = re.sub(r" +", " ", cleaned)
+    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+    return cleaned.strip()
