@@ -202,7 +202,7 @@ class BriefAndEntitiesPipeline:
             self.checkpoint[item["title"]] = True
             self.flush_count += 1
             if self.flush_count >= 20:
-                await save_log_async(self.log_file, self.checkpoint)
+                save_log_sync(self.log_file, self.checkpoint)
                 self.flush_count = 0
 
     async def run(self):
@@ -234,7 +234,7 @@ class BriefAndEntitiesPipeline:
                     on_result=self.persist_concept_brief,
                 )
 
-        await save_log_async(self.log_file, self.checkpoint)
+        save_log_sync(self.log_file, self.checkpoint)
 
         # Overwrite global_concepts.json with enriched briefs and entities
         print(f"Updating {self.global_concepts_file} with briefs and entities...")
