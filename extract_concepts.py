@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from utils.atomic_io import atomic_write_json
 from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
 from utils.cli import build_parser, resolve_settings
+from config import _read_config
 from utils.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
                           build_units, cache_manifest, deduplicate,
                           load_corpus, resolve_corpus_path,
@@ -63,19 +64,22 @@ Descriptions must preserve exact concrete details rather than high-level general
 3. CONDITIONS & CONSTRAINTS: Specific operational boundaries, environmental constraints, procedural steps, and dates/years.
 4. ATTRIBUTIONS: Specific author, study, or expert attributions tied to explicit claims.
 
+THINKING PROCESS (SANDBOXED):
+- If you need to analyze the text, plan concept boundaries, or deliberate on facts, you MUST do so strictly inside `<think>...</think>` tags at the very beginning of your response.
+- Once `</think>` is closed, output ONLY the final `<concept>...</concept>` XML blocks.
+- Absolutely NO thinking, reasoning, notes, or scratchpads outside `<think>...</think>` or inside `<concept>` tags.
+
 OUTPUT FORMAT:
-Output each concept using XML tags matching this exact structure:
+<think>
+[Optional analysis and concept boundary planning]
+</think>
 <concept>
 <title>Exact Canonical Title</title>
 <aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
 <description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all raw quantitative metrics, parameter bounds, specific findings, and detailed statements from this chunk.</description>
 </concept>
 
-STRICT OUTPUT DISCIPLINE:
-- Start your response IMMEDIATELY with the first `<concept>` tag.
-- Absolutely NO thinking, reasoning, chain-of-thought, drafting notes, scratchpads, preambles, or postambles.
-- Output ONLY pure `<concept>...</concept>` blocks and nothing else.
-- If no substantive concepts exist in the chunk, output nothing.
+If no substantive concepts exist in the chunk, output nothing.
 """
 
 # ── XML Parsing Helper ────────────────────────────────────────────────────────
@@ -85,9 +89,9 @@ def parse_xml_concepts(text: str) -> List[Concept]:
     if not text:
         return []
 
-    # 1. Strip thinking tags emitted by reasoning models
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # 1. Strip thinking tags (closed or truncated) emitted by reasoning models
+    text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<thought>.*?(?:</thought>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
 
     concepts = []
     # 2. Match non-nested <concept> blocks (ensures any outer scratchpad or drafting <concept> is skipped)
@@ -145,6 +149,7 @@ class WikiExtractorPipeline:
         self.extraction_log = load_bool_log(
             self.log_file,
             corrupt_message="Log file corrupted. Initializing fresh extraction log.")
+        self.cfg = _read_config()
 
     def cleanup_incomplete_states(self):
         """Remove partial concept files for incomplete chunks."""
@@ -309,16 +314,47 @@ CURRENT CHUNK:
 CONTEXT AFTER:
 {chunk_data['context_after']}
 
-Extract the substantive concepts from CURRENT CHUNK now. Output pure XML starting immediately with <concept>. Do not output any thinking or commentary.
+Extract the substantive concepts from CURRENT CHUNK now. If you need to think, put all thinking strictly inside <think>...</think>, followed immediately by <concept>...</concept> blocks.
 """
+        # Determine thinking mode & sampling parameters
+        cfg_enable = self.cfg.get("enable_thinking") if hasattr(self, "cfg") else None
+        disable_cli = getattr(self.args, "disable_thinking", False)
+        enable_cli = getattr(self.args, "enable_thinking", False)
+
+        if disable_cli or (cfg_enable is False and not enable_cli):
+            # Qwen Instruct / Non-thinking Mode
+            extra_body = {
+                "chat_template_kwargs": {"enable_thinking": False},
+                "top_k": 20,
+                "repetition_penalty": 1.0,
+            }
+            temperature = 0.7
+            top_p = 0.80
+            presence_penalty = 1.5
+        elif enable_cli or (cfg_enable is True):
+            extra_body = {
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+            temperature = 0.1
+            top_p = 0.95
+            presence_penalty = 0.0
+        else:
+            extra_body = None
+            temperature = 0.1
+            top_p = 0.95
+            presence_penalty = 0.0
+
         response = await client.chat.completions.create(
             model=self.settings.model_name,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1,
+            temperature=temperature,
+            top_p=top_p,
+            presence_penalty=presence_penalty,
             max_tokens=self.settings.max_tokens,
+            extra_body=extra_body,
         )
 
         choice = response.choices[0]
@@ -352,7 +388,7 @@ ALREADY COMPLETED CONCEPTS:
 TASK:
 Continue extracting for the rest of the CURRENT CHUNK.
 Start by providing the complete <concept> block for {cut_off_desc}, then continue extracting any remaining concepts from the CURRENT CHUNK.
-Output in the exact same <concept>...</concept> XML format starting immediately with <concept>. Do not output any thinking or commentary.
+Output in the exact same <concept>...</concept> XML format. If you need to think, do so strictly inside <think>...</think>.
 """
             # Valid prefix of prior response up to last completed concept
             assistant_content = raw_text[:last_close_idx + len("</concept>")] if last_close_idx != -1 else raw_text
@@ -366,8 +402,11 @@ Output in the exact same <concept>...</concept> XML format starting immediately 
                         {"role": "assistant", "content": assistant_content},
                         {"role": "user", "content": continuation_prompt}
                     ],
-                    temperature=0.1,
+                    temperature=temperature,
+                    top_p=top_p,
+                    presence_penalty=presence_penalty,
                     max_tokens=self.settings.max_tokens,
+                    extra_body=extra_body,
                 )
                 cont_text = cont_response.choices[0].message.content or ""
                 continued_concepts = parse_xml_concepts(cont_text)
@@ -477,6 +516,10 @@ def main() -> None:
         description="High-throughput concept extractor: corpus -> per-chunk concepts",
         include_corpus=True,
         include_resume=True)
+    parser.add_argument("--disable_thinking", action="store_true", default=False,
+                        help="Disable Qwen3.8-27B thinking mode (Instruct mode with enable_thinking=False)")
+    parser.add_argument("--enable_thinking", action="store_true", default=False,
+                        help="Explicitly enable Qwen3.8-27B thinking mode")
     args = parser.parse_args()
     pipeline = WikiExtractorPipeline(args)
     asyncio.run(pipeline.run())
