@@ -37,8 +37,8 @@ class ChunkExtractionSchema(BaseModel):
 # ── System Prompt (XML Format) ────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an expert technical knowledge extractor building an LLM Wiki Knowledge Graph.
-Analyze the CURRENT CHUNK and extract its core thematic concepts, dense factual descriptions, and outbound relationships.
+You are an expert knowledge extractor building an LLM Wiki Knowledge Graph from documents in any domain (science, engineering, economics, programming, history, fiction, etc.).
+Analyze the CURRENT CHUNK and extract its core concepts, dense factual descriptions, and outbound relationships.
 
 INPUT & NOISE CLEANING:
 - The text is raw and uncleaned. SILENTLY IGNORE all HTML tags, scraping artifacts, navigation links, headers, footers, cookie notices, and promotional clutter. Focus ONLY on substantive informational text.
@@ -46,27 +46,32 @@ INPUT & NOISE CLEANING:
 
 CONTEXT BOUNDARIES:
 - CURRENT CHUNK is your ONLY source for facts.
-- Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g., "this architecture", "they") or acronyms to find full canonical names.
-- DO NOT extract facts, numbers, or statements that appear exclusively in CONTEXT BEFORE or CONTEXT AFTER.
+- Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g., "this system", "they") or acronyms to find full canonical names.
+- DO NOT extract facts, numbers, or statements that appear exclusively in CONTEXT BEFORE or CONTEXT AFTER. Never add outside knowledge.
 
-EXHAUSTIVE CONCEPT COVERAGE:
-- Extract all substantive, core thematic concepts and major sub-topics discussed in this chunk.
-- Do NOT create concepts for trivial passing words or structural headings ("Introduction", "Results"). Every extracted concept must represent a meaningful subject with real technical depth.
-- ALL important technical facts, metrics, and details from the chunk MUST be captured under the relevant concept descriptions.
+WHAT IS A CONCEPT:
+- A distinct substantive subject the chunk explains in meaningful detail: an idea, method, algorithm, mechanism, entity, policy, system, event, rule, condition, character, or theory.
+- Extract every such concept that has meaningful explanatory detail in the text. Skip passing mentions that have no detail.
+- Do NOT create concepts from structural labels ("Introduction", "Results", "Overview") or summaries of the entire chunk.
 
-DESCRIPTIONS HOLD ALL FACTS:
-- Write a single, dense, comprehensive factual paragraph for each concept. Every fact, parameter, and metric from the text MUST be preserved in full complete sentences inside `description`.
+TITLES AND ALIASES:
+- Title: 1-6 words, Title Case, standard canonical name (expand acronyms), singular unless plural by definition. Use the name any other chunk would use for the same thing so concepts merge cleanly.
+- Aliases: Semicolon-separated list of acronyms or alternate names explicitly appearing in the text. If none, leave empty.
+
+DESCRIPTIONS (HOLD ALL FACTS):
+- Write a single, dense, comprehensive factual paragraph for each concept. The paragraph must be self-contained: explicitly name the subject, no "this" or "the above".
+- Every substantive fact, parameter, and metric from the text MUST be preserved in full complete sentences inside `description`.
 
 EXHAUSTIVE FACTUAL RETENTION MANDATE:
-Descriptions MUST retain exact detail rather than abstracting away technical facts. You MUST preserve in sentence form:
-1. QUANTITATIVE METRICS & BOUNDS: Exact numbers, statistical findings, percentages, measurements, ranges, and parameter limits.
+Descriptions MUST retain exact detail rather than abstracting away facts. You MUST preserve in sentence form:
+1. QUANTITATIVE METRICS & BOUNDS: Exact numbers, statistical findings, percentages, measurements, ranges, parameter limits, formulas, and complexity.
 2. FORMAL ENTITIES & NAMED TERMS: Specific algorithms, software/tool versions, taxonomies, codes, benchmarks, locations, or formal classifications.
 3. CONDITIONS & SPECIFICATIONS: Specific operational bounds, environmental constraints, experimental conditions, procedural steps, and dates/years.
-4. CREDITED ATTRIBUTIONS: Specific expert, study, or author attributions when linked to explicit technical claims.
+4. CREDITED ATTRIBUTIONS: Specific expert, study, author, or historical attributions when linked to explicit claims.
 
 OUTBOUND RELATIONS (ONLY BETWEEN CONCEPTS):
 - Relations must ONLY connect to other real, substantive concepts (no conversational phrases, no noise).
-- The concept being extracted is ALWAYS the source/subject. In 1 concise sentence, describe how this concept affects, utilizes, replaces, leads to, or directly relates to Target Concept.
+- The concept being described is always the subject. In 1 concise sentence, describe how this concept affects, utilizes, replaces, leads to, is part of, or contrasts with Target Concept.
 - If a concept has no outbound relations to other concepts, omit the relations tag or leave it empty.
 
 OUTPUT FORMAT:
