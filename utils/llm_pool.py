@@ -238,12 +238,21 @@ class ServerPool:
             is counted on each server that tried it."""
         return dict(zip(self.servers, self._served))
 
-    def _mark_failure(self, index: int, classification: str) -> None:
+    def _mark_failure(self, index: int, classification: str, error: Optional[BaseException] = None) -> None:
         """Track connection-level failures and retire a server when it dies."""
-        if classification != "transient" or not self.failover:
+        # Only true network connectivity drops should retire a server, not model output validation errors
+        is_network_failure = False
+        if error is not None:
+            err_str = str(error).lower()
+            if any(term in err_str for term in ["connect", "connection refused", "remoteprotocolerror", "unreachable"]):
+                is_network_failure = True
+
+        if not is_network_failure or not self.failover:
             return
+
         self._consecutive_failures[index] += 1
         if self._consecutive_failures[index] >= self.unhealthy_threshold and self._healthy[index]:
+            print(f"\n[WARNING] Server {self.servers[index]} retired due to consecutive connection failures: {error}")
             self._healthy[index] = False
 
     def _next_healthy(self) -> Optional[int]:
@@ -384,8 +393,8 @@ class ServerPool:
                     await on_result(item, value)
             except (PermanentFailure, TransientFailureExhausted) as exc:
                 classification = "permanent" if isinstance(exc, PermanentFailure) else "transient"
-                self._mark_failure(server_index, classification)
                 cause = getattr(exc, "cause", None)
+                self._mark_failure(server_index, classification, error=cause or exc)
                 result.failures.append({
                     "key": key, "index": index, "server": url,
                     "classification": classification,
