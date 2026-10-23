@@ -811,7 +811,7 @@ class FinalConsolidationPipeline:
             md_content.append(f"{desc}\n")
 
             if relations:
-                md_content.append("## Related Concepts\n")
+                md_content.append("# Related\n")
                 primary_cap = getattr(self.args, "max_primary_links", 15)
                 primary_relations = relations[:primary_cap]
                 extended_relations = relations[primary_cap:]
