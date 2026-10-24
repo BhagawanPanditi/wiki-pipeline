@@ -1,10 +1,11 @@
 {
   "servers": {
-    "http://cn13-dgx:8000/v1": 64,
-    "http://cn43-l40:8005/v1": 32,
-    "http://cn35-a40:8002/v1": 24,
-    "http://cn26-a40:8000/v1": 20,
-    "http://cn26-a40:8001/v1": 20
+    "http://cn28-a40:8000/v1": 32,
+    "http://cn35-a40:8001/v1": 32,
+    "http://cn45-l40:8006/v1": 32,
+    "http://cn45-l40:8007/v1": 32,
+    "http://cn41-l40:8008/v1": 32,
+    "http://cn44-l40:8000/v1": 32
   },
   "model_name": "Qwen/Qwen3.8-27B",
   "max_tokens": 16000,
