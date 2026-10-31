@@ -161,7 +161,13 @@ class BriefAndEntitiesPipeline:
             max_growth=0,
             max_model_len=max_model_len,
         )
-        return parse_xml_brief_and_entities(raw_text)
+        try:
+            return parse_xml_brief_and_entities(raw_text)
+        except Exception as e:
+            if getattr(self.args, "debug", False):
+                print(f"\n[DEBUG Stage 7] Parse failed for concept '{title}'. Exception: {e}")
+                print(f"[DEBUG Stage 7] Raw LLM Output:\n{raw_text}\n{'='*60}")
+            raise
 
     async def persist_concept_brief(self, item: Dict[str, Any], res: BriefAndEntities):
         item["brief"] = res.brief

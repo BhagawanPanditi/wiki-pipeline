@@ -311,6 +311,8 @@ def add_common_args(
                         help="Per-attempt request timeout in seconds. Overrides config.json.")
     parser.add_argument("--no_failover", action="store_true",
                         help="Do not move work off a server that stops responding.")
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Enable verbose debugging, including printing raw LLM outputs on parse failure.")
     if include_resume:
         parser.add_argument("--resume", action="store_true",
                             help="Clear incomplete marks and continue from checkpoint.")
