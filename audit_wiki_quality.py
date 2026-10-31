@@ -119,15 +119,28 @@ class WikiQualityAuditor:
         corpus = load_corpus(corpus_file)
         print(f"Loaded {len(corpus)} documents from corpus.")
 
+        # Load canonical doc mapping if available
+        mapping_file = self.wiki_path / "doc_mapping.json"
+        doc_mapping = {}
+        if mapping_file.exists():
+            try:
+                with open(mapping_file, "r", encoding="utf-8") as f:
+                    doc_mapping = json.load(f)
+            except Exception:
+                pass
+
         # Estimate tokens as approx chars / 4 (20k tokens ~ 80,000 chars)
         max_chars = getattr(self.args, "max_doc_chars", 80000)
         eligible = []
         for doc in corpus:
-            text = doc.get("text", "")
+            raw_id = doc.get("id") or doc.get("doc_id", "")
+            canon_id = doc_mapping.get(raw_id, raw_id)
+            text = doc.get("content") or doc.get("text") or doc.get("contents") or doc.get("body") or ""
             doc_len = len(text)
             if doc_len > 0 and doc_len <= max_chars:
                 eligible.append({
-                    "doc_id": doc["id"],
+                    "doc_id": canon_id,
+                    "orig_id": raw_id,
                     "text": text,
                     "chars": doc_len,
                     "est_tokens": doc_len // 4,
@@ -137,6 +150,10 @@ class WikiQualityAuditor:
         eligible.sort(key=lambda d: d["chars"])
         limit = getattr(self.args, "limit", 40)
         selected = eligible[:limit]
+        if not selected:
+            print(f"Warning: No eligible documents found under {max_chars} chars.")
+            return []
+
         print(f"Selected {len(selected)} smallest documents (all <= 20,000 tokens, length: {selected[0]['chars']} to {selected[-1]['chars']} chars).")
         return selected
 
