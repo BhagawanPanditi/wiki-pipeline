@@ -341,7 +341,7 @@ async def enrich_graph_via_jaccard(
                     max_tokens=settings.max_tokens or 256,
                     args=args,
                     task="judge",
-                    check_truncation=False,
+                    max_growth=0,
                 )
                 parsed = parse_xml_relation(raw_text)
                 return parsed if parsed else f"co-occurs with via {ents_str}"

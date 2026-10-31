@@ -323,7 +323,7 @@ class WikiDocumentConsolidatorPipeline:
                         args=self.args,
                         cfg=getattr(self, "cfg", None),
                         task="judge",
-                        check_truncation=True,
+                        max_growth=1,
                     )
                     clusters = parse_xml_merge_clusters(raw_text)
                     if batch_pbar is not None:

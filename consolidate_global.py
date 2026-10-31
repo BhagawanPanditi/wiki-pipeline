@@ -155,7 +155,7 @@ async def verify_merge_batch(client: Any, batch: List[Tuple[Dict[str, Any], Dict
         max_tokens=settings.max_tokens or 2048,
         args=args,
         task="judge",
-        check_truncation=True,
+        max_growth=0,
     )
     return parse_xml_merge_verdicts(raw_text)
 
