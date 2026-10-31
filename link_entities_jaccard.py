@@ -107,6 +107,10 @@ async def enrich_graph_via_jaccard(
             norm_a = normalize_entity(alias)
             if len(norm_a) > 2:
                 title_lookup[norm_a] = title
+        for sub in c.get("subtopics", []):
+            norm_s = normalize_entity(sub)
+            if len(norm_s) > 2:
+                title_lookup[norm_s] = title
 
         raw_entities = c.get("entities", [])
         norm_set = set()

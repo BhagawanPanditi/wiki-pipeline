@@ -234,11 +234,19 @@ run_domain_pipeline() {
             --resume "${EXTRA_ARGS[@]}"
 
     # Stage 9: Final Consolidation & Wiki Export
-    run_stage 9 "Final Consolidation & Hybrid Wiki Export" \
+    run_stage 9 "Final Consolidation & Wiki Export" \
         python3 final_consolidation.py \
             --wiki_path "$wiki_path" \
             $THINKING_FLAG \
             --resume "${EXTRA_ARGS[@]}"
+
+    # Stage 10: Benchmark Quality & Fact Retention Audit (Top 40 docs < 20k tokens)
+    run_stage 10 "Benchmark Quality & Fact Retention Audit" \
+        python3 audit_wiki_quality.py \
+            --wiki_path "$wiki_path" \
+            --corpus_path "$corpus_path" \
+            --limit 40 \
+            $THINKING_FLAG "${EXTRA_ARGS[@]}"
 
     echo ""
     echo "=============================================================================="
