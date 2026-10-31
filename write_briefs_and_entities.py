@@ -66,11 +66,14 @@ class BriefAndEntities(BaseModel):
 # ── XML Parsing Helper ────────────────────────────────────────────────────────
 
 def parse_xml_brief_and_entities(text: str) -> BriefAndEntities:
-    """Parse <brief> and <entities> XML blocks directly. Fails loud if tags are missing."""
+    """Parse <brief> and <entities> XML blocks.
+    Handles standard XML and models that close <brief> with </entities> or transition straight into entities.
+    """
     if not text:
         raise ValueError("Empty response received from LLM")
 
-    brief_m = re.search(r"<brief>(.*?)</brief>", text, re.DOTALL | re.IGNORECASE)
+    # Brief: opened by <brief>, closed by </brief>, or by <entities> / </entities> / end of string
+    brief_m = re.search(r"<brief>(.*?)(?:</brief>|</entities>|<entities>|\Z)", text, re.DOTALL | re.IGNORECASE)
     if not brief_m or not brief_m.group(1).strip():
         raise ValueError("Missing or empty <brief> block in LLM response")
 
@@ -80,13 +83,17 @@ def parse_xml_brief_and_entities(text: str) -> BriefAndEntities:
     brief = " ".join(raw_brief.split())
 
     entities = []
+    # Entities: look inside <entities>...</entities>, or if the model typo'd opening tags, scan after the brief
     entities_m = re.search(r"<entities>(.*?)</entities>", text, re.DOTALL | re.IGNORECASE)
-    if not entities_m:
-        raise ValueError("Missing <entities> block in LLM response")
+    if entities_m and entities_m.group(1).strip():
+        raw_entities = entities_m.group(1).strip().splitlines()
+    else:
+        after_brief = text[brief_m.end():]
+        raw_entities = after_brief.strip().splitlines()
 
-    raw_entities = entities_m.group(1).strip().splitlines()
     for line in raw_entities:
         cleaned = re.sub(r"^[-*•\d\.\s]+", "", line).strip()
+        cleaned = re.sub(r"</?entities>", "", cleaned, flags=re.IGNORECASE).strip()
         if cleaned and len(cleaned) > 2 and len(cleaned) < 80:
             entities.append(cleaned)
 
