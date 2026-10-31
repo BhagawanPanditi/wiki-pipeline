@@ -454,9 +454,7 @@ Analyze factual retention, completeness, and extraction quality according to the
                 "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ])
             for d in docs:
-                v = d.get("summary_verdict", "").replace("\n", " ")
-                if len(v) > 90:
-                    v = v[:87] + "..."
+                v = d.get("summary_verdict", "").replace("\n", " ").strip()
                 lines.append(
                     f"| `{d['doc_id']}` | {d['doc_chars']} (~{d['est_tokens']}) | {d['cited_paragraphs_count']} | {d['cited_concepts_count']} | **{d['fact_retention_score']}%** | **{d['concept_quality_score']}%** | {v} |"
                 )
