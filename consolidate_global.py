@@ -165,6 +165,17 @@ def global_consolidate(domain_dir: Path, args: Any):
     consolidated_dir = domain_dir / "consolidated"
     concepts_dir = domain_dir / "concepts"
     log_file = domain_dir / "global_consolidation.json"
+    global_concepts_file = domain_dir / "global_concepts.json"
+
+    if getattr(args, "resume", False) and global_concepts_file.exists():
+        manifest_file = domain_dir / "stages" / f"{STAGE}.done.json"
+        if manifest_file.exists():
+            try:
+                verify_stage_manifest(domain_dir, STAGE)
+                print(f"Stage 6 ({STAGE}) already completed. Manifest verified. Skipping.")
+                return
+            except Exception:
+                pass
 
     if not consolidated_dir.exists():
         raise FileNotFoundError(f"No consolidated directory found at {consolidated_dir}. Run document consolidation first.")
@@ -370,6 +381,23 @@ def global_consolidate(domain_dir: Path, args: Any):
     atomic_write_json(domain_dir / "global_concepts.json", {"concepts": global_concepts})
 
     # F-11 & F-12: Write individual concept files using deterministic, collision-free slugs
+    # Preserve existing briefs/entities if concepts/ already had them
+    existing_enrichments: Dict[str, Tuple[str, List[str]]] = {}
+    for old_f in concepts_dir.glob("*.json"):
+        try:
+            with open(old_f, "r", encoding="utf-8") as f:
+                disk_data = json.load(f)
+                if disk_data.get("brief"):
+                    br = disk_data.get("brief")
+                    ent = disk_data.get("entities", [])
+                    t = disk_data.get("title")
+                    if t:
+                        existing_enrichments[t] = (br, ent)
+                    if disk_data.get("slug"):
+                        existing_enrichments[disk_data["slug"]] = (br, ent)
+        except Exception:
+            pass
+
     # Clean previous files to prevent stale _1/_2 duplicates on re-runs
     print("Writing concepts to concepts/ by unique slug...")
     for old_f in concepts_dir.glob("*.json"):
@@ -383,6 +411,9 @@ def global_consolidate(domain_dir: Path, args: Any):
         if not slug:
             slug = generate_stable_slug(gc["title"], used_slugs)
             gc["slug"] = slug
+        enr = existing_enrichments.get(gc["title"]) or existing_enrichments.get(slug)
+        if enr and not gc.get("brief"):
+            gc["brief"], gc["entities"] = enr
         file_path = concepts_dir / f"{slug}.json"
         atomic_write_json(file_path, gc)
 

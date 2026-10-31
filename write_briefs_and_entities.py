@@ -239,6 +239,22 @@ class BriefAndEntitiesPipeline:
             failed=0,
         )
 
+    def _has_disk_enrichment(self, c: Dict[str, Any]) -> bool:
+        """Check if concept already has an enriched brief on disk."""
+        slug = c.get("slug")
+        if not slug:
+            slug = sanitize_filename(c.get("title", "")) or "unnamed_concept"
+        c_file = self.concepts_dir / f"{slug}.json"
+        if c_file.exists():
+            try:
+                with open(c_file, "r", encoding="utf-8") as cf:
+                    d = json.load(cf)
+                    if d.get("brief"):
+                        return True
+            except Exception:
+                pass
+        return False
+
     async def run(self):
         print(f"Loading concepts from {self.global_concepts_file}...")
         with open(self.global_concepts_file, "r", encoding="utf-8") as f:
@@ -246,7 +262,11 @@ class BriefAndEntitiesPipeline:
             concepts = data.get("concepts", [])
 
         total = len(concepts)
-        pending = [c for c in concepts if not self.checkpoint.get(c.get("title", ""), False)]
+        # An item is pending only if it's missing from checkpoint OR missing its brief on disk
+        pending = [
+            c for c in concepts 
+            if not (self.checkpoint.get(c.get("title", ""), False) and self._has_disk_enrichment(c))
+        ]
 
         print(f"Total concepts: {total} | Pending brief & entity extraction: {len(pending)}")
         settings = self.settings
