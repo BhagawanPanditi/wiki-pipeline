@@ -8,7 +8,8 @@ Implements F-36:
 
 import hashlib
 import re
-from typing import Iterable, List, Optional, Set
+from collections import defaultdict
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from utils.atomic_io import sanitize_filename
 
