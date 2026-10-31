@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from config import _read_config
-from utils.atomic_io import atomic_write_json
+from utils.atomic_io import atomic_write_json, atomic_write_text
 from utils.cli import build_parser, resolve_settings
 from utils.corpus import load_corpus
 from utils.errors import StageBudget
@@ -245,6 +245,168 @@ Analyze factual retention, completeness, and extraction quality according to the
         print(f"Average Concept Quality:      {avg_quality:.1f}%")
         print(f"Report Saved To:              {self.report_file}")
         print("=" * 65 + "\n")
+
+        self.generate_audit_markdown(summary)
+
+    def generate_audit_markdown(self, summary: Dict[str, Any]) -> None:
+        """Generate comprehensive audit.md in wiki directory combining all pipeline metrics."""
+        audit_md_path = self.wiki_path / "audit.md"
+        print(f"Compiling complete pipeline audit into {audit_md_path}...")
+
+        lines = [
+            f"# Complete Knowledge Wiki Quality & Pipeline Audit Report: {self.domain.upper()}\n",
+            "> Comprehensive post-pipeline benchmark combining extraction audits, stage deltas, topological island health, link connectivity, word-count distributions, and document fact retention.\n",
+            "## 1. Executive Summary Benchmark\n",
+            "| Metric | Result | Benchmark Status |",
+            "| :--- | :--- | :--- |",
+            f"| **Evaluated Documents (Smallest < 20k tokens)** | `{summary.get('total_documents_audited', 0)}` | Completed |",
+            f"| **Average Factual Retention Score** | `{summary.get('average_fact_retention_score', 0):.1f}%` | {'High Fidelity (>=85%)' if summary.get('average_fact_retention_score', 0) >= 85 else 'Acceptable'} |",
+            f"| **Average Concept Quality Score** | `{summary.get('average_concept_quality_score', 0):.1f}%` | {'High Coherence (>=85%)' if summary.get('average_concept_quality_score', 0) >= 85 else 'Acceptable'} |",
+            f"| **Total Cited Concept Paragraphs Audited** | `{summary.get('total_cited_paragraphs_evaluated', 0)}` | Verified |",
+            "\n---\n",
+        ]
+
+        # 2. Verification Pass 1 & Pass 2 Delta
+        summary_json_path = self.wiki_path / "verification_summary.json"
+        if summary_json_path.exists():
+            try:
+                with open(summary_json_path, "r", encoding="utf-8") as f:
+                    v_data = json.load(f)
+                before = v_data.get("before", {})
+                after = v_data.get("after", {})
+                improvement = v_data.get("improvement", {})
+
+                lines.extend([
+                    "## 2. Extraction Verification Audit & Delta (Pass 1 vs. Pass 2)\n",
+                    f"- **Total Chunks Verified**: {v_data.get('total_chunks_evaluated', before.get('total_chunks', 0))}",
+                    "\n| Verification Metric | Pass 1 (Raw Extraction) | Pass 2 (Refined Extraction) | Absolute Delta | Relative Change |",
+                    "| :--- | :--- | :--- | :--- | :--- |",
+                    f"| **Average Coverage Score** | {before.get('average_coverage', 0):.3f} / 1.000 | {after.get('average_coverage', 0):.3f} / 1.000 | `{improvement.get('average_coverage_delta', 0):+.3f}` | - |",
+                    f"| **Pass Rate (Sufficient Chunks)** | {before.get('pass_rate', 0):.1f}% ({before.get('sufficient_count', 0)}) | {after.get('pass_rate', 0):.1f}% ({after.get('sufficient_count', 0)}) | `{improvement.get('pass_rate_delta', 0):+.1f}p` | `{improvement.get('sufficient_delta', 0):+d} chunks` |",
+                    f"| **Missed Concepts Identified** | {before.get('missed_concepts', 0)} | {after.get('missed_concepts', 0)} | `{improvement.get('missed_concepts_delta', 0):+d}` | `{improvement.get('missed_concepts_pct_change', 0):+.1f}%` |",
+                    f"| **Missed Facts Identified** | {before.get('missed_facts', 0)} | {after.get('missed_facts', 0)} | `{improvement.get('missed_facts_delta', 0):+d}` | `{improvement.get('missed_facts_pct_change', 0):+.1f}%` |",
+                    "\n",
+                ])
+            except Exception as e:
+                lines.append(f"\n*(Notice: Could not parse verification_summary.json: {e})*\n")
+
+        # 3. Graph Topology & Island Report
+        islands_json_path = self.wiki_path / "islands_report.json"
+        if islands_json_path.exists():
+            try:
+                with open(islands_json_path, "r", encoding="utf-8") as f:
+                    isl = json.load(f)
+                reach = isl.get("directed_top_k_reachability", {})
+                lines.extend([
+                    "## 3. Knowledge Graph Topology & Island Audit\n",
+                    "| Graph Topological Metric | Value |",
+                    "| :--- | :--- |",
+                    f"| **Total Concepts in Final Wiki** | `{isl.get('total_concepts', 0)}` |",
+                    f"| **Giant Component Coverage** | **{isl.get('giant_component_coverage_pct', 0):.1f}%** ({isl.get('giant_component_size', 0)}/{isl.get('total_concepts', 0)} concepts) |",
+                    f"| **Total Disconnected Islands** | `{isl.get('total_islands', 0)}` |",
+                    f"| **Completely Isolated Singletons** | `{isl.get('isolated_concepts_count', 0)}` |",
+                    f"| **Primary Inbound Connected Concepts** | `{reach.get('final_primary_inbound_connected', 0)}/{isl.get('total_concepts', 0)}` |",
+                    f"| **Rescued Source-Only Peripheral Links** | `{reach.get('rescued_backlinks_injected', 0)}` |",
+                    f"| **Bidirectionally Connected Concepts** | `{reach.get('final_primary_bidirectional', 0)}` |",
+                    "\n",
+                ])
+            except Exception as e:
+                lines.append(f"\n*(Notice: Could not parse islands_report.json: {e})*\n")
+
+        # 4. Word Count Distribution & Granularity Stats
+        global_concepts_path = self.wiki_path / "global_concepts.json"
+        if global_concepts_path.exists():
+            try:
+                with open(global_concepts_path, "r", encoding="utf-8") as f:
+                    gc_data = json.load(f)
+                concepts = gc_data.get("concepts", [])
+                word_counts = [len(re.findall(r"\b\w+\b", c.get("description", ""))) for c in concepts]
+                link_counts = [len(c.get("outbound_relations", [])) for c in concepts]
+
+                total_c = len(word_counts)
+                if total_c > 0:
+                    word_counts.sort()
+                    avg_wc = sum(word_counts) / total_c
+                    median_wc = word_counts[total_c // 2]
+                    p10 = word_counts[int(total_c * 0.10)]
+                    p90 = word_counts[int(total_c * 0.90)]
+
+                    bins = [
+                        ("0 - 10 words (Stubs)", 0, 10),
+                        ("11 - 20 words (Stubs)", 11, 20),
+                        ("21 - 30 words (Thin)", 21, 30),
+                        ("31 - 50 words (Concise)", 31, 50),
+                        ("51 - 100 words (Standard)", 51, 100),
+                        ("101 - 200 words (Multi-sentence)", 101, 200),
+                        ("201 - 350 words (Comprehensive)", 201, 350),
+                        ("351 - 500 words (Dense Merge)", 351, 500),
+                        ("501 - 750 words (Broad Pillar)", 501, 750),
+                        ("751 - 1000 words (Composite Topic)", 751, 1000),
+                        ("1001+ words (Massive Topic)", 1001, 9999999),
+                    ]
+
+                    lines.extend([
+                        "## 4. Concept Description Word Count Distribution\n",
+                        f"- **Total Concepts Analyzed**: {total_c}",
+                        f"- **Average Word Count**: `{avg_wc:.1f} words`",
+                        f"- **Median Word Count**: `{median_wc} words` (P10: `{p10}`, P90: `{p90}`, Min: `{word_counts[0]}`, Max: `{word_counts[-1]}`)",
+                        "\n| Word Count Range | Concept Count | Percentage | Profile |",
+                        "| :--- | :--- | :--- | :--- |",
+                    ])
+
+                    for label, low, high in bins:
+                        cnt = sum(1 for w in word_counts if low <= w <= high)
+                        pct = (cnt / total_c * 100)
+                        bar = "█" * int(pct / 4)
+                        lines.append(f"| **{label}** | {cnt} | {pct:>5.1f}% | `{bar}` |")
+                    lines.append("\n")
+
+                    # Link Distribution
+                    avg_links = sum(link_counts) / total_c if total_c else 0.0
+                    lines.extend([
+                        "## 5. Related Link Distribution & Connectivity\n",
+                        f"- **Average Outbound Links per Concept**: `{avg_links:.2f}`",
+                        f"- **Max Outbound Links on Hub Concept**: `{max(link_counts) if link_counts else 0}`",
+                        f"- **Zero-Outbound Concepts**: `{sum(1 for l in link_counts if l == 0)}`",
+                        "\n| Link Range | Concept Count | Percentage |",
+                        "| :--- | :--- | :--- |",
+                    ])
+                    link_bins = [
+                        ("0 links", 0, 0),
+                        ("1 - 5 links", 1, 5),
+                        ("6 - 10 links", 6, 10),
+                        ("11 - 15 links (Top Window)", 11, 15),
+                        ("16 - 25 links", 16, 25),
+                        ("26+ links (Hubs)", 26, 99999),
+                    ]
+                    for label, low, high in link_bins:
+                        cnt = sum(1 for l in link_counts if low <= l <= high)
+                        pct = (cnt / total_c * 100)
+                        lines.append(f"| **{label}** | {cnt} | {pct:>5.1f}% |")
+                    lines.append("\n")
+
+            except Exception as e:
+                lines.append(f"\n*(Notice: Could not analyze global_concepts.json: {e})*\n")
+
+        # 6. Detailed Document Fact Retention Breakdown
+        docs = summary.get("documents", [])
+        if docs:
+            lines.extend([
+                "## 6. Document-Level Fact Retention & Quality Sample Breakdown\n",
+                "| Document ID | Chars (~Tokens) | Cited Paras | Concepts | Fact Retention | Concept Quality | Summary Verdict |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            ])
+            for d in docs:
+                v = d.get("summary_verdict", "").replace("\n", " ")
+                if len(v) > 90:
+                    v = v[:87] + "..."
+                lines.append(
+                    f"| `{d['doc_id']}` | {d['doc_chars']} (~{d['est_tokens']}) | {d['cited_paragraphs_count']} | {d['cited_concepts_count']} | **{d['fact_retention_score']}%** | **{d['concept_quality_score']}%** | {v} |"
+                )
+            lines.append("\n")
+
+        atomic_write_text(audit_md_path, "\n".join(lines))
+        print(f"Successfully wrote unified markdown audit to: {audit_md_path}")
 
 
 def main():
