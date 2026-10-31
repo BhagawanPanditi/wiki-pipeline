@@ -112,22 +112,10 @@ _warned_stage_names: set = set()
 
 
 def _stage_override(stage: str) -> Dict[str, Any]:
-    """Return one stage's ``stage_concurrency`` entry from config.json as a dict.
-
-    A plain number is shorthand for ``{"concurrency_per_server": number}``. An
-    object is used as it is. Anything else is an error, so a typo in config.json
-    stops the run rather than being ignored.
-
-    Args:
-        stage: Stage key, for example ``"extract-concepts"``.
-
-    Returns:
-        A dict of overrides, which may be empty.
-
-    Raises:
-        ValueError: If the entry is neither a number nor an object.
-    """
-    raw = load_stage_overrides().get(stage)
+    """Return one stage's ``stage_concurrency`` entry from config.json as a dict."""
+    cfg = _read_config() or {}
+    stage_concurrencies = cfg.get("stage_concurrency", {})
+    raw = stage_concurrencies.get(stage)
     if raw is None:
         return {}
     if isinstance(raw, bool) or not isinstance(raw, (int, float, dict)):
@@ -140,15 +128,10 @@ def _stage_override(stage: str) -> Dict[str, Any]:
 
 
 def _warn_unknown_stage_overrides() -> None:
-    """Report config.json entries that name no LLM stage, once per name.
-
-    Such an entry would otherwise be ignored without a word, and the stage would
-    quietly run with its built-in limits.
-
-    Returns:
-        None. Prints one warning to stderr for each unknown name.
-    """
-    for name in load_stage_overrides():
+    """Report config.json entries that name no LLM stage, once per name."""
+    cfg = _read_config() or {}
+    stage_concurrencies = cfg.get("stage_concurrency", {})
+    for name in stage_concurrencies:
         if name not in STAGE_PROFILES and name not in _warned_stage_names:
             _warned_stage_names.add(name)
             print(f"WARNING: config.json stage_concurrency names '{name}', which is not a "
@@ -162,7 +145,6 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
     Precedence: CLI flag > config.json (stage-specific or top-level).
     There are NO hardcoded python fallbacks; all settings must be explicitly defined.
     """
-    from config import _read_config
     # Read config.json
     cfg = _read_config()
     stage_concurrency_cfg = cfg.get("stage_concurrency", {}) if isinstance(cfg.get("stage_concurrency"), dict) else {}
@@ -285,8 +267,6 @@ def add_common_args(
     include_corpus: bool = False,
 ) -> argparse.ArgumentParser:
     """Attach the argument block shared by every stage script."""
-    profile = get_profile(stage)
-
     parser.add_argument("--wiki_path", "--wiki_dir", dest="wiki_path", type=str, default=None,
                         help="Output folder where wiki data is stored. "
                              "Directory is created automatically if it does not exist.")

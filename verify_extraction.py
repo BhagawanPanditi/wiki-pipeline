@@ -26,8 +26,9 @@ from utils.checkpoint import CheckpointLog
 from utils.chunks import load_cached_chunks
 from utils.cli import build_parser, resolve_settings
 from utils.errors import StageBudget
-from utils.json_repair import clean_json_string
+from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.manifest import write_stage_manifest, verify_stage_manifest
 from utils.reporting import (PASS1_LABEL, PASS1_RESULT, PASS2_LABEL, PASS2_RESULT,
                                     build_improvement, collect_metrics,
                                     format_improvement, format_report, write_summary)
@@ -168,6 +169,9 @@ class WikiVerifierPipeline:
         self.result_filename = PASS1_RESULT if self.phase == 1 else PASS2_RESULT
         log_name = "verification_pass1_log.json" if self.phase == 1 else "verification_pass2_log.json"
         self.verification_log_file = self.base_wiki_dir / log_name
+
+        upstream = "extract-concepts" if self.phase == 1 else "refine-concepts"
+        verify_stage_manifest(self.base_wiki_dir, upstream)
 
         if not self.staging_dir.exists():
             raise FileNotFoundError(
@@ -377,83 +381,35 @@ Output ONLY the <verification>...</verification> block.
             }
             try:
                 return VerificationResult.model_validate(parsed_data)
-            except Exception:
-                pass
+            except Exception as e:
+                raise ValueError(f"Could not validate verification output for {key}: {e}")
 
-        # 3. Fallback to JSON repair if XML parse didn't match
-        try:
-            cleaned_json = clean_json_string(raw_text)
-            parsed_data = json.loads(cleaned_json)
-            if isinstance(parsed_data, dict):
-                if isinstance(parsed_data.get("missing_concepts"), list) and len(parsed_data["missing_concepts"]) > 0:
-                    parsed_data["is_sufficient"] = False
-                if isinstance(parsed_data.get("coverage_score"), (int, float)) and parsed_data["coverage_score"] < 0.85:
-                    parsed_data["is_sufficient"] = False
-                for field in ("missing_concepts", "missing_facts", "hallucinations"):
-                    if isinstance(parsed_data.get(field), list):
-                        seen = set()
-                        deduped = []
-                        for val in parsed_data[field]:
-                            if isinstance(val, str) and val.strip() and val.strip().casefold() not in seen:
-                                seen.add(val.strip().casefold())
-                                deduped.append(val.strip())
-                        parsed_data[field] = deduped
-                return VerificationResult.model_validate(parsed_data)
-        except Exception:
-            pass
-
-        raise ValueError(f"Could not parse verification output for {key}")
+        raise ValueError(f"Could not parse verification XML for {key}")
 
     async def verify_chunk(self, client: Any, item: Dict[str, Any],
                            server_index: int) -> VerificationResult:
-        """One audit call. Retries are owned by the server pool."""
+        """One audit call using call_llm (task='judge'). Retries are owned by the server pool."""
         concepts_json_raw = await asyncio.to_thread(
             item["concepts_file"].read_text, encoding="utf-8"
         )
         user_prompt = self.build_prompt(item, concepts_json_raw)
 
-        cfg_enable = self.cfg.get("enable_thinking") if hasattr(self, "cfg") else None
-        disable_cli = getattr(self.args, "disable_thinking", False)
-        enable_cli = getattr(self.args, "enable_thinking", False)
-
-        if disable_cli or (cfg_enable is False and not enable_cli):
-            extra_body = {
-                "chat_template_kwargs": {"enable_thinking": False},
-                "top_k": 20,
-                "repetition_penalty": 1.0,
-            }
-            temperature = 0.7
-            top_p = 0.80
-            presence_penalty = 1.5
-        elif enable_cli or (cfg_enable is True):
-            extra_body = {
-                "chat_template_kwargs": {"enable_thinking": True},
-            }
-            temperature = 0.1
-            top_p = 0.95
-            presence_penalty = 0.0
-        else:
-            extra_body = None
-            temperature = 0.0
-            top_p = 0.95
-            presence_penalty = 0.0
-
-        response = await client.chat.completions.create(
+        max_model_len = getattr(self.settings, "max_model_len", 65536)
+        content = await call_llm(
+            client=client,
             model=self.settings.model_name,
             messages=[
                 {"role": "system", "content": VERIFICATION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=temperature,
-            top_p=top_p,
-            presence_penalty=presence_penalty,
             max_tokens=self.settings.max_tokens or 4096,
-            extra_body=extra_body,
+            args=self.args,
+            cfg=self.cfg,
+            task="judge",
+            max_growth=0,
+            max_model_len=max_model_len,
         )
-        choice = response.choices[0]
-        if choice.finish_reason == "length":
-            raise ValueError("Verification response truncated: hit max_tokens limit")
-        return self.parse_verification(choice.message.content, item["key"])
+        return self.parse_verification(content, item["key"])
 
     # ── streaming persistence ──────────────────────────────────────────────
     async def persist_result(self, item: Dict[str, Any],
@@ -555,38 +511,21 @@ Output ONLY the <verification>...</verification> block.
         for failure in result.failures:
             self.verification_failures[failure["key"]] = failure["error"]
 
+        result.raise_if_failed(self.stage)
         failed_items = [i["key"] for i in items if not self.checkpoint.is_done(i["key"])]
         if failed_items:
-            # If 90%+ completed (e.g. 49/50), do not abort the entire pipeline; synthesize default audit for the stubborn outlier
-            tolerated_failure_ratio = 0.10
-            if len(failed_items) / max(1, len(items)) <= tolerated_failure_ratio:
-                print(f"[WARN] {len(failed_items)} stubborn chunk(s) remained unverified after all attempts: {failed_items}")
-                print(f"[WARN] Synthesizing default audit for remaining {len(failed_items)} chunk(s) to allow pipeline to continue.")
-                for item in items:
-                    if not self.checkpoint.is_done(item["key"]):
-                        fallback_res = VerificationResult(
-                            coverage_score=0.90,
-                            is_sufficient=True,
-                            missing_concepts=[],
-                            missing_facts=[],
-                            hallucinations=[],
-                            critique="Automated fallback audit synthesized after server returned empty response.",
-                            synthetic=True,
-                        )
-                        await self.persist_result(item, fallback_res)
-                await self.checkpoint.flush()
-            else:
-                self.generate_summary_report()
-                print(f"[ERROR] {len(failed_items)} chunk(s) remain unverified. "
-                      f"Examples: {failed_items[:10]}")
-                first = next(iter(self.verification_failures.values()), "unknown error")
-                raise RuntimeError(
-                    f"Verification phase {self.phase} left {len(failed_items)} chunk(s) "
-                    f"incomplete; rerun the stage with --resume to retry them. "
-                    f"First error: {first}"
-                )
+            self.generate_summary_report()
+            print(f"[ERROR] {len(failed_items)} chunk(s) remain unverified. "
+                  f"Examples: {failed_items[:10]}")
+            first = next(iter(self.verification_failures.values()), "unknown error")
+            raise RuntimeError(
+                f"Verification phase {self.phase} left {len(failed_items)} chunk(s) "
+                f"incomplete; rerun the stage with --resume to retry them. "
+                f"First error: {first}"
+            )
 
         self.generate_summary_report()
+        write_stage_manifest(self.base_wiki_dir, self.stage, expected=len(items), completed=len(items), failed=0)
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
 

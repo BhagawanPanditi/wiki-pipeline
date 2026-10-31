@@ -28,6 +28,7 @@ from utils.errors import StageBudget
 from utils.lemma import canonical_title_key
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.unionfind import UnionFind
 
 STAGE = "consolidate-documents"
@@ -51,13 +52,13 @@ class DocumentConsolidationSchema(BaseModel):
 SYSTEM_PROMPT_CONSOLIDATE = """\
 You are an expert technical knowledge graph consolidator.
 You are given a list of candidate concepts extracted across multiple chunks of the SAME document.
-Because these concepts were extracted independently per chunk, many represent the EXACT SAME subject, entity, software tool, process, condition, or topic under slightly different titles or acronyms.
+Because these concepts were extracted independently per chunk, many represent the EXACT SAME subject, entity, item, process, condition, or topic under slightly different titles or acronyms.
 
 YOUR MISSION:
 Identify groups of concepts that refer to the exact same core concept/subject within this document and should be merged together.
 
 CRITICAL RULES:
-1. MERGE CRITERIA: Merge concepts ONLY if they refer to the exact same canonical subject, entity, tool, process, acronym, or topic.
+1. MERGE CRITERIA: Merge concepts ONLY if they refer to the exact same canonical subject, entity, item, process, acronym, or topic.
 2. DO NOT MERGE DISTINCT CONCEPTS: Do NOT merge distinct sub-components, related but separate concepts, or parent/child hierarchy terms. If two entries differ only by a qualifier that changes meaning (Type I / Type II, Part 1 / Part 2, version numbers, before/after), do NOT merge them.
 3. PRIMARY TITLE SELECTION: Pick the most standard, canonical, explicit title as `primary_title`.
 4. SCOPE: Return only clusters of two or more titles. Titles in `<merged_titles>` must be copied EXACTLY as written in the candidate list.
@@ -156,18 +157,18 @@ def print_concept_word_distribution(concepts: List[Dict[str, Any]], title_label:
     avg_words = sum(word_counts) / total if total else 0
     thin_30 = sum(1 for w in word_counts if w <= 30)
 
-    print(f"\n============================================================")
+    print("\n============================================================")
     print(f"WORD-COUNT DISTRIBUTION [{title_label}] (Total Concepts: {total})")
     print(f"Average Words per Concept: {avg_words:.1f} | Thin Concepts (<= 30 words): {thin_30} ({thin_30 / total * 100:.1f}%)")
-    print(f"------------------------------------------------------------")
+    print("------------------------------------------------------------")
     print(f"{'Word Count Range':<20} {'Count':<10} {'Percentage':<12}")
-    print(f"------------------------------------------------------------")
+    print("------------------------------------------------------------")
     for label, _ in bins:
         count = bin_counts[label]
         pct = (count / total * 100) if total else 0.0
         bar = "█" * int(pct / 4)
         print(f"{label:<20} {count:<10} {pct:>5.1f}%   {bar}")
-    print(f"============================================================\n")
+    print("============================================================\n")
 
 # ── Batching Utilities ────────────────────────────────────────────────────────
 
@@ -210,6 +211,7 @@ class WikiDocumentConsolidatorPipeline:
             raise ValueError("Missing required --wiki_path argument.")
 
         self.base_wiki_dir = Path(wiki_path)
+        verify_stage_manifest(self.base_wiki_dir, "refine-concepts")
         self.staging_dir = self.base_wiki_dir / "staging"
         self.consolidated_dir = self.base_wiki_dir / "consolidated"
         self.log_file = self.base_wiki_dir / "doc_consolidation_log.json"
@@ -386,6 +388,7 @@ class WikiDocumentConsolidatorPipeline:
                 chosen_title = concept_group[0].get("title", "").strip()
 
             aliases_list = []
+            subtopics_list = []
             source_chunks_set = set()
 
             for c in concept_group:
@@ -394,7 +397,7 @@ class WikiDocumentConsolidatorPipeline:
                         aliases_list.append([alias.strip()])
                 for sub in c.get("subtopics", []):
                     if sub.strip().casefold() != chosen_title.casefold():
-                        aliases_list.append([sub.strip()])
+                        subtopics_list.append([sub.strip()])
                 raw_title = c.get("title", "").strip()
                 if raw_title.casefold() != chosen_title.casefold():
                     aliases_list.append([raw_title])
@@ -408,6 +411,7 @@ class WikiDocumentConsolidatorPipeline:
             consolidated_concepts.append({
                 "title": chosen_title,
                 "aliases": union_aliases(aliases_list),
+                "subtopics": union_aliases(subtopics_list),
                 "description": fused_desc,
                 "source_chunks": sorted(list(source_chunks_set)),
             })
@@ -464,7 +468,7 @@ class WikiDocumentConsolidatorPipeline:
 
             pool = pool_for_stage(self.args, settings, STAGE)
             async with pool:
-                await pool.map(
+                res = await pool.map(
                     pending,
                     self.get_merge_clusters,
                     attempts=settings.attempts,
@@ -474,6 +478,7 @@ class WikiDocumentConsolidatorPipeline:
                     attempt_timeout=settings.profile.attempt_timeout,
                     on_result=self.persist_consolidation,
                 )
+                res.raise_if_failed(STAGE)
         else:
             print("All documents are already consolidated!")
 
@@ -495,8 +500,18 @@ class WikiDocumentConsolidatorPipeline:
         total_concepts_after = len(all_consolidated_concepts)
         print_concept_word_distribution(all_consolidated_concepts, title_label="STAGE 5: AFTER DOCUMENT CONSOLIDATION")
 
+        write_stage_manifest(
+            wiki_path=self.base_wiki_dir,
+            stage=STAGE,
+            expected=len(doc_items),
+            completed=len(doc_items),
+            failed=0,
+            concepts_before=total_concepts_before,
+            concepts_after=total_concepts_after,
+        )
+
         print("============================================================")
-        print(f"DOCUMENT CONSOLIDATION COMPLETE")
+        print("DOCUMENT CONSOLIDATION COMPLETE")
         print(f"Documents Processed:         {len(doc_items)}")
         print(f"Concepts Before Merge:       {total_concepts_before}")
         print(f"Concepts After Merge:        {total_concepts_after} (fused {total_concepts_before - total_concepts_after} duplicates)")

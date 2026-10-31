@@ -22,12 +22,13 @@ from typing import Any, Dict, List, Set, Tuple
 import networkx as nx
 from tqdm import tqdm
 
-from utils.atomic_io import atomic_write_json
+from utils.atomic_io import atomic_write_json, sanitize_filename
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
 from utils.lemma import normalize_entity
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.stats import print_link_distribution
 
 STAGE = "link-entities"
@@ -78,6 +79,8 @@ async def enrich_graph_via_jaccard(
 
     if not global_concepts_file.exists():
         raise FileNotFoundError(f"Missing {global_concepts_file}. Complete Stage 7 first.")
+
+    verify_stage_manifest(wiki_path, "write-briefs")
 
     print(f"Loading concepts from {global_concepts_file}...")
     with open(global_concepts_file, "r", encoding="utf-8") as f:
@@ -174,7 +177,6 @@ async def enrich_graph_via_jaccard(
         shared_idf = sum(idf.get(e, 0.0) for e in shared)
         union_idf = sum(idf.get(e, 0.0) for e in union_ents) or 1.0
         idf_score = shared_idf / union_idf
-        jaccard = len(shared) / len(union_ents) if union_ents else 0.0
 
         qualifies = False
         # F-14: Qualify if >= 2 shared entities with sufficient IDF score, OR 1 rare entity
@@ -201,27 +203,35 @@ async def enrich_graph_via_jaccard(
     added_links_by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     new_edges_added = 0
 
-    for t1, t2, jaccard, shared_list, l_type in all_new_links:
+    for t1, t2, score, shared_list, l_type in all_new_links:
         if G.has_edge(t1, t2):
             continue
-        shared_summary = ", ".join(shared_list[:4])
-        rel_text_1 = f"co-occurs with {t2} via {shared_summary}"
-        rel_text_2 = f"co-occurs with {t1} via {shared_summary}"
+        shared_summary = ", ".join(shared_list[:3])
+        if l_type == "title_mention":
+            rel_text_1 = "named in this page's key entities"
+            rel_text_2 = "named in this page's key entities"
+        else:
+            rel_text_1 = f"via: {shared_summary}"
+            rel_text_2 = f"via: {shared_summary}"
 
         link_payload_1 = {
             "target_concept": t2,
             "relation": rel_text_1,
-            "jaccard_similarity": round(jaccard, 3),
+            "overlap_score": round(score, 3),
+            "jaccard_similarity": round(score, 3),  # backward compatibility
             "shared_entities": shared_list,
             "link_type": l_type,
+            "relation_source": "deterministic",
             "source_chunks": []
         }
         link_payload_2 = {
             "target_concept": t1,
             "relation": rel_text_2,
-            "jaccard_similarity": round(jaccard, 3),
+            "overlap_score": round(score, 3),
+            "jaccard_similarity": round(score, 3),  # backward compatibility
             "shared_entities": shared_list,
             "link_type": l_type,
+            "relation_source": "deterministic",
             "source_chunks": []
         }
 
@@ -374,10 +384,16 @@ async def enrich_graph_via_jaccard(
             if not slug:
                 slug = sanitize_filename(c["title"]) or "unnamed_concept"
             file_path = concepts_dir / f"{slug}.json"
-            try:
-                atomic_write_json(file_path, c, fsync_dir=False)
-            except Exception:
-                pass
+            atomic_write_json(file_path, c, fsync_dir=False)
+
+    write_stage_manifest(
+        wiki_path=wiki_path,
+        stage=STAGE,
+        expected=len(concepts),
+        completed=len(concepts),
+        failed=0,
+        edges_added=new_edges_added,
+    )
 
     print("\n============================================================")
     print("STAGE 8: JACCARD ENTITY LINKING COMPLETE")

@@ -5,7 +5,6 @@ into a local `data/` folder as .jsonl files.
 """
 
 import json
-import os
 from pathlib import Path
 from datasets import load_dataset
 

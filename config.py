@@ -28,7 +28,6 @@ startup ("Maximum concurrency for 32,768 tokens per request") without editing co
 """
 
 import json
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 

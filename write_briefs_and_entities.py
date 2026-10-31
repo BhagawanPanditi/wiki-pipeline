@@ -21,7 +21,9 @@ from utils.atomic_io import atomic_write_json, sanitize_filename
 from utils.checkpoint import load_bool_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
 from utils.errors import StageBudget
+from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.manifest import verify_stage_manifest, write_stage_manifest
 
 STAGE = "write-briefs"
 
@@ -36,12 +38,12 @@ Your task is to analyze a comprehensive concept description and produce two vita
 RULES FOR BRIEF:
 - 1-3 complete sentences, about 25-60 words. If the description is under ~60 words, write ONE accurate sentence; never pad or infer.
 - Keep exact numbers, metrics, and identifiers. Silently omit internal provenance IDs like [doc_...].
-- No noise: do not add conversational filler ("This concept describes...").
+- No noise: do not add conversational filler.
 
 RULES FOR ENTITIES (5-12):
 - Specific named things in the text: proper names, standard terms of art, identifiers, quantities with units, named methods, or rules.
-- Use the standard singular, unqualified surface form ("Protein Kinase", not "the protein kinases that...").
-- Exclude vague words that would apply to almost any concept in the field (for example: "data", "process", "result", "method", "system", "approach", "information").
+- Use the standard singular, unqualified surface form.
+- Exclude words so vague they would fit almost any concept in the corpus.
 - Each entity 1-4 words in Title Case.
 
 OUTPUT FORMAT:
@@ -64,37 +66,32 @@ class BriefAndEntities(BaseModel):
 # ── XML Parsing Helper ────────────────────────────────────────────────────────
 
 def parse_xml_brief_and_entities(text: str) -> BriefAndEntities:
-    """Parse <brief> and <entities> XML blocks directly."""
+    """Parse <brief> and <entities> XML blocks directly. Fails loud if tags are missing."""
     if not text:
-        return BriefAndEntities()
+        raise ValueError("Empty response received from LLM")
 
-    brief = ""
     brief_m = re.search(r"<brief>(.*?)</brief>", text, re.DOTALL | re.IGNORECASE)
-    if brief_m:
-        raw_brief = brief_m.group(1).strip()
-        # Strip citation brackets like [doc_...::chunk_...] or [canon_...]
-        raw_brief = re.sub(r"\[(?:doc_|canon_)[^\]]+\]", "", raw_brief)
-        brief = " ".join(raw_brief.split())
+    if not brief_m or not brief_m.group(1).strip():
+        raise ValueError("Missing or empty <brief> block in LLM response")
+
+    raw_brief = brief_m.group(1).strip()
+    # Strip citation brackets like [doc_...::chunk_...]
+    raw_brief = re.sub(r"\[(?:doc_|canon_)[^\]]+\]", "", raw_brief)
+    brief = " ".join(raw_brief.split())
 
     entities = []
     entities_m = re.search(r"<entities>(.*?)</entities>", text, re.DOTALL | re.IGNORECASE)
-    if entities_m:
-        raw_entities = entities_m.group(1).strip().splitlines()
-        for line in raw_entities:
-            cleaned = re.sub(r"^[-*•\d\.\s]+", "", line).strip()
-            if cleaned and len(cleaned) > 2 and len(cleaned) < 80:
-                entities.append(cleaned)
+    if not entities_m:
+        raise ValueError("Missing <entities> block in LLM response")
 
-    # Fallback to JSON if model emitted json
-    if not brief and "{" in text:
-        try:
-            m = re.search(r"\{.*\}", text, re.DOTALL)
-            if m:
-                payload = json.loads(m.group(0))
-                brief = payload.get("brief", "").strip()
-                entities = payload.get("entities", [])
-        except Exception:
-            pass
+    raw_entities = entities_m.group(1).strip().splitlines()
+    for line in raw_entities:
+        cleaned = re.sub(r"^[-*•\d\.\s]+", "", line).strip()
+        if cleaned and len(cleaned) > 2 and len(cleaned) < 80:
+            entities.append(cleaned)
+
+    if not entities:
+        raise ValueError("Zero valid entities found in <entities> block")
 
     return BriefAndEntities(brief=brief, entities=entities)
 
@@ -116,6 +113,8 @@ class BriefAndEntitiesPipeline:
             raise FileNotFoundError(
                 f"Missing {self.global_concepts_file}. Complete Stage 6 (consolidate_global.py) first."
             )
+
+        verify_stage_manifest(self.domain_dir, "consolidate-global")
 
         self.concepts_dir.mkdir(parents=True, exist_ok=True)
         if getattr(args, "resume", False):
@@ -142,66 +141,31 @@ class BriefAndEntitiesPipeline:
         aliases = ", ".join(item.get("aliases", []))
         description = item.get("description", "")
 
-        # Guard: truncate huge hub concept descriptions to prevent context overflow / HTTP 400
-        # Budget ~10,000 words (~12,000-14,000 tokens): first 20 sentences + evenly spaced remainder
-        sentences = re.split(r'(?<=[.!?])\s+', description.strip())
-        if len(sentences) > 40:
-            head = sentences[:20]
-            tail = sentences[20:]
-            # Sample up to 20 sentences from tail
-            step = max(1, len(tail) // 20)
-            sampled_tail = tail[::step][:20]
-            guarded_desc = " ".join(head + sampled_tail)
-        else:
-            guarded_desc = description
-
         user_prompt = f"CONCEPT TITLE: \"{title}\"\n"
         if aliases:
             user_prompt += f"ALIASES: {aliases}\n"
-        user_prompt += f"\nFULL DESCRIPTION:\n{guarded_desc}\n"
+        user_prompt += f"\nFULL DESCRIPTION:\n{description}\n"
 
-        extra_body: Dict[str, Any] = {}
-        model_kwargs: Dict[str, Any] = {}
-        if getattr(self.args, "disable_thinking", False):
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-            model_kwargs = {
-                "temperature": 0.7,
-                "top_p": 0.80,
-                "presence_penalty": 1.5,
-                "extra_body": extra_body,
-            }
-        else:
-            model_kwargs = {
-                "temperature": 0.1,
-            }
-
-        response = await client.chat.completions.create(
+        max_model_len = getattr(self.args, "max_model_len", None) or (self.cfg.get("max_model_len") if hasattr(self, "cfg") else None)
+        raw_text = await call_llm(
+            client=client,
             model=self.settings.model_name,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_BRIEF_ENTITIES},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=self.settings.max_tokens or 2048,
-            **model_kwargs
+            max_tokens=self.settings.max_tokens or 1024,
+            args=self.args,
+            cfg=getattr(self, "cfg", None),
+            task="generate",
+            max_growth=0,
+            max_model_len=max_model_len,
         )
-        raw_text = response.choices[0].message.content or ""
-        result = parse_xml_brief_and_entities(raw_text)
-
-        # Fallback if brief is missing: take first 2 sentences from description
-        if not result.brief:
-            sentences = re.split(r'(?<=[.!?])\s+', description.strip())
-            result.brief = " ".join(sentences[:2])
-            item["brief_source"] = "fallback"
-        else:
-            item["brief_source"] = "llm"
-
-        return result
+        return parse_xml_brief_and_entities(raw_text)
 
     async def persist_concept_brief(self, item: Dict[str, Any], res: BriefAndEntities):
         item["brief"] = res.brief
         item["entities"] = res.entities
-        if "brief_source" not in item:
-            item["brief_source"] = "llm"
 
         # Update individual concept JSON in concepts/ using stable slug (F-12)
         slug = item.get("slug")
@@ -218,9 +182,13 @@ class BriefAndEntitiesPipeline:
                 self.flush_count = 0
 
     def assemble_and_save(self, concepts: List[Dict[str, Any]]):
-        """Assemble enriched concepts from disk and update global_concepts.json atomically."""
+        """Assemble enriched concepts from disk and update global_concepts.json atomically.
+        Fails loud if any concept is missing its LLM-generated brief.
+        """
         print(f"Assembling enriched concepts from {self.concepts_dir}...")
         assembled_concepts = []
+        missing_briefs = []
+
         for c in concepts:
             slug = c.get("slug")
             if not slug:
@@ -230,25 +198,33 @@ class BriefAndEntitiesPipeline:
                 try:
                     with open(c_file, "r", encoding="utf-8") as cf:
                         disk_data = json.load(cf)
-                        if "brief" in disk_data:
+                        if disk_data.get("brief"):
                             c["brief"] = disk_data["brief"]
-                        if "entities" in disk_data:
+                        if disk_data.get("entities"):
                             c["entities"] = disk_data["entities"]
-                        if "brief_source" in disk_data:
-                            c["brief_source"] = disk_data["brief_source"]
                 except Exception:
                     pass
-            # Fallback if brief is still missing: derive from first 2 sentences
+
             if not c.get("brief"):
-                sentences = re.split(r'(?<=[.!?])\s+', c.get("description", "").strip())
-                c["brief"] = " ".join(sentences[:2])
-                c["brief_source"] = "fallback"
-            if "entities" not in c:
-                c["entities"] = []
+                missing_briefs.append(c.get("title", slug))
             assembled_concepts.append(c)
+
+        if missing_briefs:
+            raise RuntimeError(
+                f"Stage 7 incomplete: {len(missing_briefs)} concept(s) missing LLM brief. "
+                f"Examples: {missing_briefs[:10]}. Not writing global_concepts.json."
+            )
 
         print(f"Updating {self.global_concepts_file} with briefs and entities...")
         atomic_write_json(self.global_concepts_file, {"concepts": assembled_concepts})
+
+        write_stage_manifest(
+            wiki_path=self.domain_dir,
+            stage=STAGE,
+            expected=len(concepts),
+            completed=len(assembled_concepts),
+            failed=0,
+        )
 
     async def run(self):
         print(f"Loading concepts from {self.global_concepts_file}...")
@@ -269,7 +245,7 @@ class BriefAndEntitiesPipeline:
 
                 pool = pool_for_stage(self.args, settings, STAGE)
                 async with pool:
-                    await pool.map(
+                    res = await pool.map(
                         pending,
                         self.generate_brief_and_entities,
                         attempts=settings.attempts,
@@ -279,8 +255,7 @@ class BriefAndEntitiesPipeline:
                         attempt_timeout=settings.profile.attempt_timeout,
                         on_result=self.persist_concept_brief,
                     )
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            print("\nInterrupted! Flushing progress and assembling enriched concepts...")
+                    res.raise_if_failed(STAGE)
         finally:
             save_log_sync(self.log_file, self.checkpoint)
             self.assemble_and_save(concepts)

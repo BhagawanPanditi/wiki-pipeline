@@ -23,12 +23,12 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 from utils.atomic_io import atomic_write_json
-from utils.checkpoint import load_json_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
-from utils.concept_ops import fuse_descriptions, generate_stable_slug, union_aliases
+from utils.concept_ops import fuse_descriptions, generate_stable_slug
 from utils.lemma import canonical_title_key
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.stats import print_concept_word_distribution
 from utils.unionfind import UnionFind
 
@@ -51,7 +51,7 @@ You are an expert knowledge consolidator evaluating candidate concepts across do
 You are given candidate pairs of concepts that share identical titles, plural/spelling variants, or title-to-alias alignments.
 Each concept is presented with its Canonical Title, Aliases, and a ~40-word Context Snippet from its description.
 
-Your task is to determine whether both concepts refer to the EXACT SAME subject, entity, tool, process, condition, or topic.
+Your task is to determine whether both concepts refer to the EXACT SAME subject, entity, item, process, condition, or topic.
 
 CRITICAL RULES:
 1. MERGE (is_same_entity: true): Only if both concepts denote the identical subject (e.g., direct synonymous naming or alternative formal titles for the same entity).
@@ -169,6 +169,8 @@ def global_consolidate(domain_dir: Path, args: Any):
     if not consolidated_dir.exists():
         raise FileNotFoundError(f"No consolidated directory found at {consolidated_dir}. Run document consolidation first.")
 
+    verify_stage_manifest(domain_dir, "consolidate-documents")
+
     # 1. Load All Consolidated Concepts from per-document folders
     all_raw_concepts = []
     doc_files = sorted(list(consolidated_dir.glob("*/concepts.json")))
@@ -198,7 +200,7 @@ def global_consolidate(domain_dir: Path, args: Any):
         t = c.get("title", "").strip()
         if not t:
             continue
-        key = canonical_lemma_key(t)
+        key = canonical_title_key(t)
         lemma_groups.setdefault(key, []).append(c)
 
     candidate_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -219,15 +221,15 @@ def global_consolidate(domain_dir: Path, args: Any):
     alias_map: Dict[str, List[Dict[str, Any]]] = {}
     for c in all_raw_concepts:
         for alias in c.get("aliases", []):
-            clean_al = canonical_lemma_key(alias)
+            clean_al = canonical_title_key(alias)
             if len(clean_al) > 2:
                 alias_map.setdefault(clean_al, []).append(c)
 
     for c in all_raw_concepts:
-        norm_title = canonical_lemma_key(c.get("title", ""))
+        norm_title = canonical_title_key(c.get("title", ""))
         if norm_title in alias_map:
             for match in alias_map[norm_title]:
-                if canonical_lemma_key(match.get("title", "")) != norm_title:
+                if canonical_title_key(match.get("title", "")) != norm_title:
                     pk = tuple(sorted([c.get("title", ""), match.get("title", "")]))
                     if pk not in seen_pair_keys:
                         seen_pair_keys.add(pk)
@@ -239,7 +241,8 @@ def global_consolidate(domain_dir: Path, args: Any):
     # F-09: Union-find is keyed strictly by exact normalized title (strip().casefold())
     # Lemma keys are used purely to generate candidate pairs; union happens ONLY on LLM approval
     uf = UnionFind()
-    canonical_choices: Dict[str, str] = {}
+    # N-10: Key canonical choices by member title rather than ephemeral union root
+    title_to_chosen_canonical: Dict[str, str] = {}
     for c in all_raw_concepts:
         t = c.get("title", "").strip()
         if t:
@@ -252,7 +255,6 @@ def global_consolidate(domain_dir: Path, args: Any):
         batches = [candidate_pairs[i:i + batch_size] for i in range(0, len(candidate_pairs), batch_size)]
 
         async def run_verification():
-            nonlocal approved_merges
             pool = pool_for_stage(args, settings, STAGE)
 
             async def handler(client, batch, server_index):
@@ -267,16 +269,15 @@ def global_consolidate(domain_dir: Path, args: Any):
                             c1, c2 = batch[idx]
                             if verdict.is_same_entity:
                                 t1, t2 = c1["title"].strip(), c2["title"].strip()
-                                root1, root2 = uf.find(t1.casefold()), uf.find(t2.casefold())
                                 uf.union(t1.casefold(), t2.casefold())
-                                new_root = uf.find(t1.casefold())
                                 approved_merges += 1
-                                # F-10: Record LLM's chosen_canonical_title
+                                # F-10 & N-10: Record LLM's chosen_canonical_title for both members
                                 if verdict.chosen_canonical_title.strip():
-                                    canonical_choices[new_root] = verdict.chosen_canonical_title.strip()
+                                    title_to_chosen_canonical[t1.casefold()] = verdict.chosen_canonical_title.strip()
+                                    title_to_chosen_canonical[t2.casefold()] = verdict.chosen_canonical_title.strip()
 
             async with pool:
-                await pool.map(
+                res = await pool.map(
                     batches,
                     handler,
                     attempts=settings.attempts,
@@ -285,6 +286,7 @@ def global_consolidate(domain_dir: Path, args: Any):
                     attempt_timeout=settings.profile.attempt_timeout,
                     on_result=on_batch_result,
                 )
+                res.raise_if_failed(STAGE)
 
         asyncio.run(run_verification())
         print(f"LLM confirmed and approved {approved_merges} concept merges.")
@@ -304,10 +306,15 @@ def global_consolidate(domain_dir: Path, args: Any):
     used_slugs: Set[str] = set()
 
     for root, concepts in tqdm(final_groups.items(), desc="Fusing global concept attributes"):
-        # F-10: Prefer LLM chosen canonical title > most frequent title > shortest title
-        if root in canonical_choices:
-            chosen_title = canonical_choices[root]
-        else:
+        # F-10 & N-10: Prefer LLM chosen canonical title from any group member > frequency > shortest
+        chosen_title = None
+        for c in concepts:
+            c_norm = c.get("title", "").strip().casefold()
+            if c_norm in title_to_chosen_canonical:
+                chosen_title = title_to_chosen_canonical[c_norm]
+                break
+
+        if not chosen_title:
             title_counter = Counter(c.get("title", "").strip() for c in concepts)
             # Sort by frequency descending, then length ascending
             sorted_candidates = sorted(title_counter.items(), key=lambda kv: (-kv[1], len(kv[0])))
@@ -377,6 +384,15 @@ def global_consolidate(domain_dir: Path, args: Any):
         atomic_write_json(file_path, gc)
 
     assert len(set(c["slug"] for c in global_concepts)) == len(global_concepts), "Slug collision detected!"
+
+    write_stage_manifest(
+        wiki_path=domain_dir,
+        stage=STAGE,
+        expected=raw_concepts_count,
+        completed=len(global_concepts),
+        failed=0,
+        approved_merges=approved_merges,
+    )
 
     # Print final word count distribution across global concepts
     print_concept_word_distribution(global_concepts, title_label="STAGE 6: AFTER GLOBAL CONSOLIDATION")

@@ -382,7 +382,6 @@ class ServerPool:
 
         async def worker(server_index: int) -> None:
             """Consume items dynamically as this server becomes ready."""
-            nonlocal outstanding
             while True:
                 if budget is not None:
                     budget.check(self.label)

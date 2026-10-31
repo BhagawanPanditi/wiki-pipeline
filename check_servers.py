@@ -8,7 +8,7 @@ via GET /models to verify liveness and responsiveness before pipeline tasks laun
 
 import sys
 import httpx
-from config import load_global_config, load_stage_overrides
+from config import load_global_config
 
 def main():
     """Probe every configured LLM server and report which are healthy.
@@ -21,7 +21,6 @@ def main():
         unreachable, so a caller can tell the two apart."""
     try:
         raw_servers, model = load_global_config()
-        overrides = load_stage_overrides()
     except ValueError as exc:
         print(f"ERROR: {exc}")
         sys.exit(2)

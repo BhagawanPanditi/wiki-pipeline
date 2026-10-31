@@ -24,8 +24,9 @@ from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
 from utils.chunks import load_cached_chunks
 from utils.cli import build_parser, resolve_settings
 from utils.errors import StageBudget
-from utils.json_repair import clean_json_string
+from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.manifest import write_stage_manifest, verify_stage_manifest
 
 STAGE = "refine-concepts"
 
@@ -108,13 +109,18 @@ Output factual updates to existing Pass 1 concepts using <update_concept>...</up
 <additional_description>Dense factual sentences containing newly extracted facts or details to append to the existing description.</additional_description>
 </update_concept>
 
-If the existing extraction is already complete and no updates or new concepts are needed, output nothing.
+If the existing extraction is already complete and no updates or new concepts are needed, output strictly:
+<no_changes/>
 """
 
 # ── XML Parsing Helper for Refinement ────────────────────────────────────────
 
 def parse_xml_refinement(text: str) -> Pass2ExtractionSchema:
     if not text:
+        raise ValueError("Empty refinement response")
+
+    # Explicit empty form contract (Audit v3 Section 3.3)
+    if "<no_changes/>" in text or "<no_changes />" in text:
         return Pass2ExtractionSchema()
 
     new_concepts: List[Concept] = []
@@ -167,33 +173,8 @@ def parse_xml_refinement(text: str) -> Pass2ExtractionSchema:
             additional_description=additional_desc
         ))
 
-    # Fallback to JSON repair if no XML tags found
-    if not new_concepts and not concept_updates and "{" in text:
-        try:
-            cleaned_json = clean_json_string(text)
-            parsed = json.loads(cleaned_json)
-            if isinstance(parsed, dict):
-                nc_list = []
-                for c in parsed.get("new_concepts", []):
-                    if isinstance(c, dict) and c.get("title"):
-                        nc_list.append(Concept(
-                            title=c["title"],
-                            aliases=c.get("aliases", []),
-                            description=c.get("description", "")
-                        ))
-                cu_list = []
-                for u in parsed.get("concept_updates", []):
-                    if isinstance(u, dict) and u.get("title"):
-                        sentences = u.get("additional_description_sentences", [])
-                        add_desc = " ".join(sentences) if isinstance(sentences, list) else str(u.get("additional_description", ""))
-                        cu_list.append(ConceptUpdate(
-                            title=u["title"],
-                            additional_aliases=u.get("additional_aliases", []),
-                            additional_description=add_desc
-                        ))
-                return Pass2ExtractionSchema(new_concepts=nc_list, concept_updates=cu_list)
-        except Exception:
-            pass
+    if not new_concepts and not concept_updates:
+        raise ValueError("Refinement response contained neither valid XML updates/new concepts nor <no_changes/>")
 
     return Pass2ExtractionSchema(new_concepts=new_concepts, concept_updates=concept_updates)
 
@@ -222,6 +203,8 @@ class WikiSecondPassPipeline:
         self.staging_dir = self.base_wiki_dir / "staging"
         self.cache_dir = self.base_wiki_dir / "cache"
         self.pass2_log_file = self.base_wiki_dir / "pass2_log.json"
+
+        verify_stage_manifest(self.base_wiki_dir, "extract-concepts")
 
         if not self.staging_dir.exists():
             raise FileNotFoundError(f"Staging directory missing at {self.staging_dir}. Run Pass 1 extraction first.")
@@ -301,7 +284,6 @@ class WikiSecondPassPipeline:
     async def extract_pass2_refinement(self, client, item: Dict[str, Any],
                                        server_index: int) -> Pass2ExtractionSchema:
         """Queries the LLM for second-pass deltas and missing facts."""
-        key = item["key"]
         pass1_lines = []
         concepts_list = item["pass1_concepts"]
         if isinstance(concepts_list, dict):
@@ -338,56 +320,24 @@ EXISTING EXTRACTED CONCEPTS (PASS 1):
 Compare the CURRENT CHUNK against EXISTING EXTRACTED CONCEPTS.
 If any primary concepts were missed, output them as <new_concept>.
 If any quantitative metrics, bounds, or key facts were missed from existing concepts, output <update_concept> with the exact factual sentences to append.
-If the existing extraction is already factually complete, output nothing.
+If the existing extraction is already factually complete, output strictly <no_changes/>.
 """
-        raw_text = None
-        finish_reason = None
-        try:
-            cfg_enable = self.cfg.get("enable_thinking") if hasattr(self, "cfg") else None
-            disable_cli = getattr(self.args, "disable_thinking", False)
-            enable_cli = getattr(self.args, "enable_thinking", False)
-
-            if disable_cli or (cfg_enable is False and not enable_cli):
-                extra_body = {
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    "top_k": 20,
-                    "repetition_penalty": 1.0,
-                }
-                temperature = 0.7
-                top_p = 0.80
-                presence_penalty = 1.5
-            elif enable_cli or (cfg_enable is True):
-                extra_body = {
-                    "chat_template_kwargs": {"enable_thinking": True},
-                }
-                temperature = 0.1
-                top_p = 0.95
-                presence_penalty = 0.0
-            else:
-                extra_body = None
-                temperature = 0.1
-                top_p = 0.95
-                presence_penalty = 0.0
-
-            response = await client.chat.completions.create(
-                model=self.settings.model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_PASS2},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                presence_penalty=presence_penalty,
-                max_tokens=self.settings.max_tokens,
-                extra_body=extra_body,
-            )
-
-            choice = response.choices[0]
-            raw_text = choice.message.content or ""
-            return parse_xml_refinement(raw_text)
-
-        except Exception:
-            raise
+        max_model_len = getattr(self.settings, "max_model_len", 65536)
+        raw_text = await call_llm(
+            client=client,
+            model=self.settings.model_name,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_PASS2},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=self.settings.max_tokens or 16000,
+            args=self.args,
+            cfg=self.cfg,
+            task="generate",
+            max_growth=1,
+            max_model_len=max_model_len,
+        )
+        return parse_xml_refinement(raw_text)
 
     async def persist_refinement(self, item: Dict[str, Any],
                                  delta: Pass2ExtractionSchema) -> None:
@@ -538,6 +488,8 @@ If the existing extraction is already factually complete, output nothing.
         for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
             print(f"  {url:<40} {count}")
 
+        result.raise_if_failed(STAGE)
+
         failed_items = [i["key"] for i in items if not self.pass2_log.get(i["key"], False)]
         if failed_items:
             print(f"[ERROR] {len(failed_items)} chunk(s) remain incomplete after Pass 2 retries. Examples: {failed_items[:10]}")
@@ -545,6 +497,7 @@ If the existing extraction is already factually complete, output nothing.
                 f"Pass 2 left {len(failed_items)} chunk(s) incomplete; rerun with --resume after checking server health."
             )
 
+        write_stage_manifest(self.base_wiki_dir, STAGE, expected=len(items), completed=len(items), failed=0)
         print(f"\nPass 2 refinement successfully finished for domain: {self.domain}! All {len(items)} chunks are complete.")
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Stage 9: Final Consolidation, Hybrid Link Ranking & Clean Markdown Wiki Export.
--------------------------------------------------------------------------------
+"""Stage 9: Final Consolidation, Semantic Link Ranking & Clean Markdown Wiki Export.
+---------------------------------------------------------------------------------
 Executes final quality consolidation, link ranking, and wiki generation:
 1. Macro Alphabetical & Deep LLM Verification: Catches remaining near-duplicates or junk.
-2. Hybrid Link Ranking: Ranks outbound relations using Jaccard, Containment, and Cosine.
+2. Semantic Link Ranking: Ranks outbound relations using Jaccard & Asymmetric Containment.
 3. Reciprocal Rescue: Connects peripheral nodes with zero inbound links.
 4. Clean Markdown Wiki Export: Exports pure markdown concept pages (no YAML frontmatter),
    single-line grep-friendly concept_index.md, and entity_index.md.
@@ -15,137 +15,25 @@ Usage:
 import asyncio
 import json
 import re
-import time
-import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import networkx as nx
-import numpy as np
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from utils.atomic_io import atomic_write_json, atomic_write_text
+from utils.atomic_io import atomic_write_json, atomic_write_text, sanitize_filename
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.citation_utils import clean_chunk_citations
 from utils.cli import build_parser, resolve_settings
-from utils.concept_ops import fuse_descriptions, generate_stable_slug
-from utils.llm_params import call_llm
+from utils.concept_ops import generate_stable_slug
 from utils.llm_pool import pool_for_stage
+from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.stats import print_link_distribution
-from utils.unionfind import UnionFind
 
 STAGE = "final-macro-scan"
 DEEP_STAGE = "final-deep-verify"
-
-_embed_cursor = 0
-
-def _get_next_embed_endpoint(servers: List[str]) -> str:
-    global _embed_cursor
-    s = servers[_embed_cursor % len(servers)].rstrip("/")
-    _embed_cursor += 1
-    return f"{s}/embeddings" if not s.endswith("/embeddings") else s
-
-
-def embed_batch_remote(
-    texts: List[str],
-    servers: List[str],
-    model: str,
-    max_chars: int = 4000,
-) -> np.ndarray:
-    """Computes L2-normalized embeddings across GPU embedding servers."""
-    if not texts:
-        return np.zeros((0, 1), dtype=np.float32)
-    truncated = [t[:max_chars] if t else "empty" for t in texts]
-    batch_size = 64
-    all_embeddings = []
-    for i in tqdm(range(0, len(truncated), batch_size), desc="Computing Concept Embeddings"):
-        chunk = truncated[i : i + batch_size]
-        payload = json.dumps({
-            "model": model,
-            "input": chunk,
-        }).encode("utf-8")
-        done = False
-        for _ in range(4):
-            url = _get_next_embed_endpoint(servers)
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    items = sorted(data["data"], key=lambda x: x["index"])
-                    all_embeddings.extend([item["embedding"] for item in items])
-                    done = True
-                    break
-            except Exception:
-                time.sleep(1)
-        if not done:
-            raise RuntimeError(f"Embedding failed for batch {i}..{i+batch_size}")
-
-    arr = np.array(all_embeddings, dtype=np.float32)
-    norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-10
-    return arr / norms
-
-
-def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "STAGE 9: FINAL CONSOLIDATED GRAPH"):
-    """Compute and print histogram distribution of related links across all concepts with dynamic bins (bin width = 5)."""
-    if not concepts:
-        print(f"\n[{title_label}] No concepts found.")
-        return
-
-    counts = [len(c.get("outbound_relations", [])) for c in concepts]
-    total = len(counts)
-    avg_links = sum(counts) / total if total else 0.0
-    max_count = max(counts) if counts else 0
-
-    bins = [("0 links", 0, 0)]
-    step = 5
-    curr = 1
-    while curr <= max_count:
-        upper = curr + step - 1
-        bins.append((f"{curr} - {upper} links", curr, upper))
-        curr += step
-
-    bin_counts = {label: 0 for label, _, _ in bins}
-    for count in counts:
-        for label, low, high in bins:
-            if low <= count <= high:
-                bin_counts[label] += 1
-                break
-
-    print(f"\n============================================================")
-    print(f"RELATED LINKS DISTRIBUTION [{title_label}] (Total Concepts: {total})")
-    print(f"Average Links per Concept: {avg_links:.2f} | Max Links: {max_count} | Disconnected Concepts (0 links): {bin_counts['0 links']} ({bin_counts['0 links'] / total * 100:.1f}%)")
-    print(f"------------------------------------------------------------")
-    print(f"{'Links Range':<20} {'Concept Count':<15} {'Percentage':<12}")
-    print(f"------------------------------------------------------------")
-    for label, _, _ in bins:
-        c_count = bin_counts[label]
-        pct = (c_count / total * 100) if total else 0.0
-        bar = "█" * int(pct / 2)
-        print(f"{label:<20} {c_count:<15} {pct:>5.1f}%   {bar}")
-    print(f"============================================================\n")
-
-
-def format_yaml_frontmatter(title: str, brief: str, aliases: List[str], entities: List[str]) -> str:
-    """Format robust YAML frontmatter with title, brief, aliases, and key entities."""
-    lines = ["---"]
-    lines.append(f"title: {json.dumps(title, ensure_ascii=False)}")
-    lines.append(f"brief: {json.dumps(brief, ensure_ascii=False)}")
-    if aliases:
-        lines.append("aliases:")
-        for a in aliases:
-            lines.append(f"  - {json.dumps(a, ensure_ascii=False)}")
-    else:
-        lines.append("aliases: []")
-    if entities:
-        lines.append("key_entities:")
-        for e in entities:
-            lines.append(f"  - {json.dumps(e, ensure_ascii=False)}")
-    else:
-        lines.append("key_entities: []")
-    lines.append("---\n")
-    return "\n".join(lines)
 
 
 # ── XML System Prompt for Alphabet Macro Scan (Domain-Agnostic) ──────────────
@@ -326,64 +214,21 @@ class FinalConsolidationPipeline:
         self.pre_consolidation_backup = self.wiki_path / "global_concepts_pre_consolidation.json"
         self.md_dir = self.wiki_path / "concepts_md"
         self.islands_file = self.wiki_path / "islands_report.json"
-        self.embeddings_file = self.wiki_path / "leaf_embeddings.npy"
         self.macro_settings = resolve_settings(args, STAGE)
         self.deep_settings = resolve_settings(args, DEEP_STAGE)
 
         if not self.global_concepts_file.exists():
             raise FileNotFoundError(f"Missing {self.global_concepts_file}. Run Stage 7 & 8 first.")
 
-    def _compute_or_load_embeddings(self, concepts: List[Dict[str, Any]]) -> Optional[np.ndarray]:
-        """
-        Computes or loads normalized embeddings for all surviving concepts, ordered by `sanitize_filename(title)`
-        so that `leaf_embeddings.npy` is directly reusable by `build_concept_hierarchy.py`!
-        """
-        if getattr(self.args, "skip_embeddings", False):
-            return None
-
-        embed_servers = getattr(self.args, "embed_servers", None)
-        embed_model = getattr(self.args, "embed_model", None)
-        if not embed_servers or not embed_model:
-            print("Notice: --embed_servers and --embed_model not fully specified; skipping embeddings.")
-            return None
-
-        # Sort concepts by slug (`sanitize_filename(title)`) so order matches `sorted(concepts_md.glob("*.md"))`
-        concepts.sort(key=lambda c: sanitize_filename(c["title"]) or "unnamed_concept")
-
-        if self.embeddings_file.exists() and not getattr(self.args, "recompute_embeddings", False):
-            try:
-                cached = np.load(self.embeddings_file)
-                if len(cached) == len(concepts):
-                    print(f"[Embeddings] Loaded cached embeddings from {self.embeddings_file} (shape: {cached.shape}).")
-                    return cached
-            except Exception:
-                pass
-
-        print(f"[Embeddings] Computing GPU embeddings for {len(concepts)} concepts via {embed_servers}...")
-        texts = [
-            f"{c['title']}\n{c.get('brief', '')}\n{clean_chunk_citations(c.get('description', ''))[:2000]}"
-            for c in concepts
-        ]
-        try:
-            embs = embed_batch_remote(texts, servers=embed_servers, model=embed_model)
-            np.save(self.embeddings_file, embs)
-            print(f"[Embeddings] Saved normalized embeddings to {self.embeddings_file} (shape: {embs.shape}).")
-            return embs
-        except Exception as e:
-            print(f"[Embeddings] Warning: GPU embedding call failed ({e}). Falling back to Jaccard + Containment scoring.")
-            return None
-
     def _rank_links_and_inject_rescue_backlinks(
         self,
         final_concepts: List[Dict[str, Any]],
-        embeddings: Optional[np.ndarray],
         primary_cap: int = 15,
         rescue_slots: int = 2,
     ) -> Dict[str, Any]:
         """
-        1. Computes Hybrid Link Score for every outbound relation:
-           `hybrid_score = 0.40 * Jaccard + 0.30 * Asymmetric_Containment + 0.30 * Cosine_Similarity`
-           (If embeddings are unavailable, uses `0.55 * Jaccard + 0.45 * Asymmetric_Containment`).
+        1. Computes Link Score for every outbound relation using Jaccard & Asymmetric Containment:
+           `hybrid_score = 0.55 * Jaccard + 0.45 * Asymmetric_Containment`.
         2. Sorts outbound relations by (`verified_by_llm`, `hybrid_score`, `jaccard_similarity`) descending.
         3. Identifies peripheral/specialized concepts that have `primary_in_degree == 0` under the Top-`primary_cap`
            truncation (i.e. concepts whose outbound links point to hubs, but no hub includes them in its Top-15).
@@ -396,7 +241,7 @@ class FinalConsolidationPipeline:
             for c in final_concepts
         }
 
-        # Step 1: Compute Hybrid Score for all outbound relations
+        # Step 1: Compute Score for all outbound relations
         for idx_a, c in enumerate(final_concepts):
             t_a_low = c["title"].lower()
             ents_a = entity_sets.get(t_a_low, set())
@@ -404,7 +249,6 @@ class FinalConsolidationPipeline:
             for rel in c.get("outbound_relations", []):
                 t_b = rel.get("target_concept", "").strip()
                 t_b_low = t_b.lower()
-                idx_b = title_to_idx.get(t_b_low)
                 ents_b = entity_sets.get(t_b_low, set())
 
                 inter_len = len(ents_a & ents_b)
@@ -423,14 +267,7 @@ class FinalConsolidationPipeline:
 
                 rel["jaccard_similarity"] = round(float(jacc), 3)
                 rel["containment_score"] = round(float(containment), 3)
-
-                if embeddings is not None and idx_b is not None:
-                    cos_sim = max(0.0, float(embeddings[idx_a] @ embeddings[idx_b]))
-                    rel["cosine_similarity"] = round(cos_sim, 3)
-                    hybrid = 0.40 * jacc + 0.30 * containment + 0.30 * cos_sim
-                else:
-                    hybrid = 0.55 * jacc + 0.45 * containment
-
+                hybrid = 0.55 * jacc + 0.45 * containment
                 rel["hybrid_score"] = round(float(hybrid), 3)
 
             # F-19: Final ranking: (verified_by_llm, link_type_rank, hybrid_score)
@@ -599,6 +436,7 @@ class FinalConsolidationPipeline:
         asyncio.run(self.run_async())
 
     async def run_async(self):
+        verify_stage_manifest(self.base_wiki_dir, "link-entities")
         print(f"Loading concepts from {self.global_concepts_file}...")
         with open(self.global_concepts_file, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -897,9 +735,24 @@ class FinalConsolidationPipeline:
         canonical_title_map: Dict[str, str] = {}
 
         for root, group in grouped_concepts.items():
+            # N-05: Carry the chosen canonical title and its stable slug
             title_counter = Counter(c["title"] for c in group)
             chosen_title = title_counter.most_common(1)[0][0]
             canonical_title_map[root] = chosen_title
+
+            # Find slug of the chosen title member, or of any member with a slug
+            chosen_slug = None
+            for c in group:
+                if c["title"].lower() == chosen_title.lower() and c.get("slug"):
+                    chosen_slug = c["slug"]
+                    break
+            if not chosen_slug:
+                for c in group:
+                    if c.get("slug"):
+                        chosen_slug = c["slug"]
+                        break
+            if not chosen_slug:
+                chosen_slug = sanitize_filename(chosen_title)
 
             merged_aliases = set()
             merged_entities = set()
@@ -941,6 +794,7 @@ class FinalConsolidationPipeline:
 
             final_concepts.append({
                 "title": chosen_title,
+                "slug": chosen_slug,
                 "brief": chosen_brief,
                 "aliases": sorted(list(merged_aliases)),
                 "entities": sorted(list(merged_entities)),
@@ -950,6 +804,8 @@ class FinalConsolidationPipeline:
             })
 
         concept_by_name = {c["title"].lower(): c for c in final_concepts}
+        # N-05: Ensure every concept has a unique slug
+        assert len(set(c["slug"] for c in final_concepts)) == len(final_concepts), "Duplicate slug in final_concepts!"
 
         # 5. Remap Outbound Relations & REMOVE SELF-LOOPS
         print("Remapping relations and removing self-loops...")
@@ -974,7 +830,10 @@ class FinalConsolidationPipeline:
                     fused_relations[canonical_target] = {
                         "target_concept": canonical_target,
                         "relation": rel.get("relation", ""),
+                        "overlap_score": rel.get("overlap_score") or rel.get("jaccard_similarity"),
                         "jaccard_similarity": rel.get("jaccard_similarity"),
+                        "link_type": rel.get("link_type", "entity_overlap"),
+                        "verified_by_llm": rel.get("verified_by_llm", False),
                         "shared_entities": rel.get("shared_entities", []),
                         "source_chunks": list(rel.get("source_chunks", []))
                     }
@@ -987,6 +846,7 @@ class FinalConsolidationPipeline:
                     j2 = rel.get("jaccard_similarity") or 0.0
                     if j2 > j1:
                         fused_relations[canonical_target]["jaccard_similarity"] = j2
+                        fused_relations[canonical_target]["overlap_score"] = j2
 
             c["outbound_relations"] = list(fused_relations.values())
             del c["_raw_relations"]
@@ -1007,14 +867,16 @@ class FinalConsolidationPipeline:
                 union_len = len(ents1 | ents2)
                 calc_jacc = round(len(shared_ents) / union_len, 3) if union_len > 0 else 0.0
 
-                rel_text = f"Verified related: {reason}" if reason else "Functionally related in technical domain context."
+                rel_text = f"Verified: {reason}" if reason else "Directly related in context."
 
                 if root2.lower() not in targets1:
                     c1_obj["outbound_relations"].append({
                         "target_concept": root2,
                         "relation": rel_text,
+                        "overlap_score": calc_jacc,
                         "jaccard_similarity": calc_jacc,
                         "shared_entities": shared_ents,
+                        "link_type": "llm_verified",
                         "source_chunks": [],
                         "verified_by_llm": True
                     })
@@ -1022,15 +884,18 @@ class FinalConsolidationPipeline:
                     for r in c1_obj["outbound_relations"]:
                         if r["target_concept"].lower() == root2.lower():
                             r["verified_by_llm"] = True
+                            r["link_type"] = "llm_verified"
                             if reason and reason not in r.get("relation", ""):
-                                r["relation"] = f"{r.get('relation', '')} (Verified: {reason})".strip()
+                                r["relation"] = f"{r.get('relation', '')} ({reason})".strip()
 
                 if root1.lower() not in targets2:
                     c2_obj["outbound_relations"].append({
                         "target_concept": root1,
                         "relation": rel_text,
+                        "overlap_score": calc_jacc,
                         "jaccard_similarity": calc_jacc,
                         "shared_entities": shared_ents,
+                        "link_type": "llm_verified",
                         "source_chunks": [],
                         "verified_by_llm": True
                     })
@@ -1038,16 +903,15 @@ class FinalConsolidationPipeline:
                     for r in c2_obj["outbound_relations"]:
                         if r["target_concept"].lower() == root1.lower():
                             r["verified_by_llm"] = True
+                            r["link_type"] = "llm_verified"
                             if reason and reason not in r.get("relation", ""):
-                                r["relation"] = f"{r.get('relation', '')} (Verified: {reason})".strip()
+                                r["relation"] = f"{r.get('relation', '')} ({reason})".strip()
 
-        # 5b. Compute GPU Embeddings + Hybrid Score Ranking + Reciprocal Rescue Backlinks
+        # 5b. Score Ranking + Reciprocal Rescue Backlinks
         primary_cap = getattr(self.args, "max_primary_links", 15)
         rescue_slots = getattr(self.args, "rescue_slots", 2)
-        leaf_embs = self._compute_or_load_embeddings(final_concepts)
         directed_link_stats = self._rank_links_and_inject_rescue_backlinks(
             final_concepts,
-            embeddings=leaf_embs,
             primary_cap=primary_cap,
             rescue_slots=rescue_slots,
         )
@@ -1059,14 +923,15 @@ class FinalConsolidationPipeline:
 
         concepts_dir = self.wiki_path / "concepts"
         if concepts_dir.is_dir():
+            print("Syncing final consolidated concepts into concepts/ by unique slug...")
             surviving_files = set()
             for c in final_concepts:
-                c_fname = f"{sanitize_filename(c['title'])}.json"
+                slug = c.get("slug")
+                if not slug:
+                    slug = sanitize_filename(c['title']) or "unnamed_concept"
+                c_fname = f"{slug}.json"
                 surviving_files.add(c_fname)
-                try:
-                    atomic_write_json(concepts_dir / c_fname, c, fsync_dir=False)
-                except Exception:
-                    pass
+                atomic_write_json(concepts_dir / c_fname, c, fsync_dir=False)
             for old_file in concepts_dir.glob("*.json"):
                 if old_file.name not in surviving_files:
                     try:
@@ -1193,7 +1058,7 @@ class FinalConsolidationPipeline:
             atomic_write_text(md_path, "\n".join(md_content))
 
         # 8. Export Single-Line concept_index.md (optimized for grep)
-        print(f"Generating single-line grep-friendly concept_index.md...")
+        print("Generating single-line grep-friendly concept_index.md...")
         concept_index_entries.sort(key=lambda x: x[1].lower())
         c_lines = ["# Concept Index\n"]
         for slug, c_title, c_brief in concept_index_entries:
@@ -1208,7 +1073,7 @@ class FinalConsolidationPipeline:
         atomic_write_text(self.md_dir / "concept_index.md", "\n".join(c_lines))
 
         # 9. Export entity_index.md (mapping entities and aliases to concepts)
-        print(f"Generating entity_index.md...")
+        print("Generating entity_index.md...")
         sorted_entities = sorted(entity_to_concepts.keys(), key=lambda x: x.lower())
         e_lines = ["# Entity Index\n"]
         for ent in sorted_entities:
@@ -1230,6 +1095,16 @@ class FinalConsolidationPipeline:
         if removed_stale > 0:
             print(f"Cleaned up {removed_stale} stale/merged/pruned Markdown file(s) from {self.md_dir}.")
 
+        write_stage_manifest(
+            wiki_path=self.wiki_path,
+            stage="final-consolidation",
+            expected=len(concepts),
+            completed=len(final_concepts),
+            failed=0,
+            islands=len(components),
+            giant_component_coverage=round(coverage, 2),
+        )
+
         print("\n============================================================")
         print("STAGE 9: FINAL CONSOLIDATION & WIKI EXPORT COMPLETE")
         print(f"Total Concepts in Wiki:      {len(final_concepts)}")
@@ -1238,13 +1113,12 @@ class FinalConsolidationPipeline:
         print(f"Rescued Source-Only Links:   {directed_link_stats['rescued_backlinks_injected']}")
         print(f"Primary Inbound Connected:   {directed_link_stats['final_primary_inbound_connected']}/{len(final_concepts)}")
         print(f"Markdown Wiki Exported:      {self.md_dir}")
-        print(f"Embeddings Cache Written:    {self.embeddings_file}")
         print(f"Island Report Written:       {self.islands_file}")
         print("============================================================\n")
 
 
 def main():
-    parser = build_parser(stage=STAGE, description="Final knowledge graph consolidation, hybrid link ranking, island audit and markdown wiki export", include_resume=True)
+    parser = build_parser(stage=STAGE, description="Final knowledge graph consolidation, link ranking, island audit and markdown wiki export", include_resume=True)
     parser.add_argument("--skip_macro_scan", action="store_true",
                         help="Skip LLM alphabetical macro scan and use fast in-memory candidate scan.")
     parser.add_argument("--skip_deep_verify", action="store_true",
@@ -1253,14 +1127,6 @@ def main():
                         help="Maximum primary related links with full explanations on Markdown pages (remainder listed compactly).")
     parser.add_argument("--rescue_slots", type=int, default=2,
                         help="Number of slots within --max_primary_links reserved for reciprocal rescue backlinks to source-only nodes (default: 2).")
-    parser.add_argument("--embed_servers", nargs="+", default=None,
-                        help="vLLM embedding server endpoints for cosine similarity link scoring.")
-    parser.add_argument("--embed_model", type=str, default=None,
-                        help="Embedding model name (e.g. Qwen/Qwen3-Embedding-8B).")
-    parser.add_argument("--skip_embeddings", action="store_true",
-                        help="Skip GPU embedding computation and rank links by Jaccard + Containment only.")
-    parser.add_argument("--recompute_embeddings", action="store_true",
-                        help="Force recomputation of leaf_embeddings.npy even if cache exists.")
     args = parser.parse_args()
 
     pipeline = FinalConsolidationPipeline(args)

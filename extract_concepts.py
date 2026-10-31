@@ -25,9 +25,10 @@ from utils.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
                           build_units, cache_manifest, deduplicate,
                           load_corpus, resolve_corpus_path,
                           save_run_config)
-from utils.errors import PermanentFailure, StageBudget
-from utils.llm_params import TruncatedOutput, call_llm
+from utils.errors import StageBudget
+from utils.llm_params import call_llm
 from utils.llm_pool import ServerPool
+from utils.manifest import write_stage_manifest
 
 STAGE = "extract-concepts"
 
@@ -270,7 +271,6 @@ class WikiExtractorPipeline:
         return all_chunks
 
     async def extract_chunk(self, client, chunk_data: Dict[str, Any], server_index: int) -> ChunkExtractionSchema:
-        key = f"{chunk_data['doc_id']}::{chunk_data['chunk_id']}"
         user_prompt = f"""\
 CONTEXT BEFORE:
 {chunk_data['context_before']}
@@ -283,6 +283,7 @@ CONTEXT AFTER:
 
 Extract the substantive concepts from CURRENT CHUNK now according to the system instructions.
 """
+        max_model_len = getattr(self.args, "max_model_len", None) or (self.cfg.get("max_model_len") if hasattr(self, "cfg") else None)
         raw_text = await call_llm(
             client=client,
             model=self.settings.model_name,
@@ -294,7 +295,8 @@ Extract the substantive concepts from CURRENT CHUNK now according to the system 
             args=self.args,
             cfg=getattr(self, "cfg", None),
             task="generate",
-            check_truncation=True,
+            max_growth=1,
+            max_model_len=max_model_len,
         )
 
         completed_concepts = parse_xml_concepts(raw_text)
@@ -379,6 +381,7 @@ Extract the substantive concepts from CURRENT CHUNK now according to the system 
             )
 
         await save_log_async(self.log_file, self.extraction_log)
+        result.raise_if_failed(STAGE)
 
         print("Requests served per server:")
         for url, count in sorted(result.per_server.items(), key=lambda kv: -kv[1]):
@@ -390,6 +393,13 @@ Extract the substantive concepts from CURRENT CHUNK now according to the system 
             print(f"[ERROR] {len(failed_chunks)} chunk(s) incomplete after retries. Examples: {failed_keys[:10]}")
             raise RuntimeError(f"Pass 1 left {len(failed_chunks)} chunk(s) incomplete; rerun with --resume.")
 
+        write_stage_manifest(
+            wiki_path=self.base_wiki_dir,
+            stage=STAGE,
+            expected=len(all_chunks),
+            completed=len(all_chunks) - len(failed_chunks),
+            failed=len(failed_chunks),
+        )
         print(f"\nSuccessfully finished extraction for: {self.base_wiki_dir.name}! All {len(all_chunks)} chunks are valid.")
 
 # ── CLI Entrypoint ────────────────────────────────────────────────────────────
