@@ -281,7 +281,14 @@ async def enrich_graph_via_jaccard(
             if not t2 or t2.lower() == t1.lower() or t2 not in concept_by_title:
                 continue
             r_text = rel.get("relation", "")
-            if not r_text or "Functionally related via" in r_text or r_text.startswith("Functionally related"):
+            # Synthesize meaningful LLM phrases for all uncharacterized edges or generic placeholders
+            is_generic = (
+                not r_text 
+                or r_text.startswith("via:") 
+                or "named in this page" in r_text 
+                or "Functionally related" in r_text
+            )
+            if is_generic:
                 pk = ":::".join(sorted([t1, t2]))
                 if pk not in pairs_to_synthesize:
                     b2 = concept_by_title[t2].get("brief", "") or concept_by_title[t2].get("description", "")[:250]

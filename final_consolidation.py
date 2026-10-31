@@ -1027,6 +1027,17 @@ class FinalConsolidationPipeline:
                 md_content.append("## Overview\n")
                 md_content.append(f"{brief}\n")
 
+            # Ensure document citations are present at the end of Description if not already embedded
+            doc_citations = []
+            for sc in c.get("source_chunks", []):
+                doc_id = sc.split("::")[0] if "::" in sc else sc
+                if doc_id and doc_id not in doc_citations:
+                    doc_citations.append(doc_id)
+
+            if doc_citations and not any(f"[{did}]" in desc for did in doc_citations):
+                citation_suffix = " " + " ".join(f"[{did}]" for did in doc_citations)
+                desc = desc.rstrip() + citation_suffix
+
             md_content.append("## Description\n")
             md_content.append(f"{desc}\n")
 
