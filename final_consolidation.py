@@ -436,7 +436,7 @@ class FinalConsolidationPipeline:
         asyncio.run(self.run_async())
 
     async def run_async(self):
-        verify_stage_manifest(self.base_wiki_dir, "link-entities")
+        verify_stage_manifest(self.wiki_path, "link-entities")
         print(f"Loading concepts from {self.global_concepts_file}...")
         with open(self.global_concepts_file, "r", encoding="utf-8") as f:
             data = json.load(f)
