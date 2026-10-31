@@ -121,7 +121,11 @@ class BriefAndEntitiesPipeline:
                 f"Missing {self.global_concepts_file}. Complete Stage 6 (consolidate_global.py) first."
             )
 
-        verify_stage_manifest(self.domain_dir, "consolidate-global")
+        # Check manifest from either decompose-concepts (Stage 7) or consolidate-global (Stage 6)
+        try:
+            verify_stage_manifest(self.domain_dir, "decompose-concepts")
+        except RuntimeError:
+            verify_stage_manifest(self.domain_dir, "consolidate-global")
 
         self.concepts_dir.mkdir(parents=True, exist_ok=True)
         if getattr(args, "resume", False):

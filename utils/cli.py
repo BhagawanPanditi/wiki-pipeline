@@ -43,9 +43,10 @@ STAGE_PROFILES: Dict[str, StageProfile] = {
     "refine-concepts":        StageProfile("refine-concepts", 8, 2400.0, 50.0, 16000),
     "verify-pass2":           StageProfile("verify-pass2", 12, 2400.0, 50.0, 16000),
 
-    # ── Stage 5: Document & Stage 6: Global Consolidation ───────────────
+    # ── Stage 5: Document & Stage 6: Global Consolidation & Subtopic Decomp ────
     "consolidate-documents":  StageProfile("consolidate-documents", 8, 4500.0, 30.0, 32000),
     "consolidate-global":     StageProfile("consolidate-global", 8, 800.0, 30.0, 8192),
+    "decompose-concepts":     StageProfile("decompose-concepts", 12, 1200.0, 30.0, 6144),
 
     # ── Stage 7: Briefs & Entities, Stage 8: Semantic Jaccard Links ─────
     "write-briefs":           StageProfile("write-briefs", 32, 90.0, 30.0, 1536),

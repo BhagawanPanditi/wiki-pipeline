@@ -55,7 +55,7 @@ TARGET_DOMAIN="${1:-sustainable_living}"
 shift || true
 
 FROM_STAGE=1
-TO_STAGE=10
+TO_STAGE=11
 DISABLE_THINKING=true
 EXTRA_ARGS=()
 
@@ -219,29 +219,37 @@ run_domain_pipeline() {
             $THINKING_FLAG \
             --resume "${EXTRA_ARGS[@]}"
 
-    # Stage 7: Briefs & Entities
-    run_stage 7 "Briefs & Entities Extraction" \
+    # Stage 7: Subtopic Decomposition (Splits >600 word concepts into pillar + subtopics)
+    run_stage 7 "Subtopic Decomposition" \
+        python3 decompose_large_concepts.py \
+            --wiki_path "$wiki_path" \
+            --word_threshold 600 \
+            $THINKING_FLAG \
+            --resume "${EXTRA_ARGS[@]}"
+
+    # Stage 8: Briefs & Entities
+    run_stage 8 "Briefs & Entities Extraction" \
         python3 write_briefs_and_entities.py \
             --wiki_path "$wiki_path" \
             $THINKING_FLAG \
             --resume "${EXTRA_ARGS[@]}"
 
-    # Stage 8: Jaccard Linking & LLM Relationship Synthesis
-    run_stage 8 "Jaccard Linking & Relation Synthesis" \
+    # Stage 9: Jaccard Linking & LLM Relationship Synthesis
+    run_stage 9 "Jaccard Linking & Relation Synthesis" \
         python3 link_entities_jaccard.py \
             --wiki_path "$wiki_path" \
             $THINKING_FLAG \
             --resume "${EXTRA_ARGS[@]}"
 
-    # Stage 9: Final Consolidation & Wiki Export
-    run_stage 9 "Final Consolidation & Wiki Export" \
+    # Stage 10: Final Consolidation & Wiki Export
+    run_stage 10 "Final Consolidation & Wiki Export" \
         python3 final_consolidation.py \
             --wiki_path "$wiki_path" \
             $THINKING_FLAG \
             --resume "${EXTRA_ARGS[@]}"
 
-    # Stage 10: Benchmark Quality & Fact Retention Audit (Top 40 docs < 20k tokens)
-    run_stage 10 "Benchmark Quality & Fact Retention Audit" \
+    # Stage 11: Benchmark Quality & Fact Retention Audit (Top 40 docs < 20k tokens)
+    run_stage 11 "Benchmark Quality & Fact Retention Audit" \
         python3 audit_wiki_quality.py \
             --wiki_path "$wiki_path" \
             --corpus_path "$input_corpus" \
