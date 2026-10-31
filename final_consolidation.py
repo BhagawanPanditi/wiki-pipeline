@@ -1027,17 +1027,48 @@ class FinalConsolidationPipeline:
                 md_content.append(f"{brief}\n")
 
             # Format description into clean distinct paragraphs per source document with citations at the end of each paragraph
-            raw_paras = [p.strip() for p in re.split(r"\n\s*\n", desc) if p.strip()]
             doc_citations = []
             for sc in c.get("source_chunks", []):
                 doc_id = sc.split("::")[0] if "::" in sc else sc
                 if doc_id and doc_id not in doc_citations:
                     doc_citations.append(doc_id)
 
+            # If description came from multiple documents but lacks paragraph breaks, reconstruct distinct per-document paragraphs from consolidated/
+            consolidated_dir = self.wiki_path / "consolidated"
+            reconstructed_paras = []
+            if len(doc_citations) > 1 and "\n\n" not in desc and consolidated_dir.exists():
+                title_norm = title.strip().casefold()
+                for did in doc_citations:
+                    cf = consolidated_dir / did / "concepts.json"
+                    if cf.exists():
+                        try:
+                            with open(cf, "r", encoding="utf-8") as f:
+                                c_list = json.load(f).get("concepts", [])
+                                matched = None
+                                for cand in c_list:
+                                    if cand.get("title", "").strip().casefold() == title_norm:
+                                        matched = cand
+                                        break
+                                    if any(a.strip().casefold() == title_norm for a in cand.get("aliases", [])):
+                                        matched = cand
+                                        break
+                                if matched and matched.get("description"):
+                                    p_txt = matched["description"].strip()
+                                    p_txt = re.sub(r"\[(?:doc_|canon_)[A-Za-z0-9_-]+::[A-Za-z0-9_-]+\]", "", p_txt).strip()
+                                    if f"[{did}]" not in p_txt:
+                                        p_txt = f"{p_txt} [{did}]"
+                                    reconstructed_paras.append(p_txt)
+                        except Exception:
+                            pass
+
+            if reconstructed_paras:
+                raw_paras = reconstructed_paras
+            else:
+                raw_paras = [p.strip() for p in re.split(r"\n\s*\n", desc) if p.strip()]
+
             formatted_paras = []
             for i, p in enumerate(raw_paras):
                 p_clean = p.rstrip()
-                # Check if paragraph has document citation
                 has_cite = bool(re.search(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+\s*\]", p_clean))
                 if not has_cite and i < len(doc_citations):
                     p_clean = f"{p_clean} [{doc_citations[i]}]"
