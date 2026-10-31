@@ -27,7 +27,7 @@ from utils.atomic_io import atomic_write_json, atomic_write_text, sanitize_filen
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.citation_utils import clean_chunk_citations
 from utils.cli import build_parser, resolve_settings
-from utils.concept_ops import generate_stable_slug
+from utils.concept_ops import fuse_descriptions_by_document, generate_stable_slug
 from utils.llm_pool import pool_for_stage
 from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.stats import print_link_distribution
@@ -791,7 +791,7 @@ class FinalConsolidationPipeline:
             merged_aliases.discard(chosen_title)
             merged_subtopics.discard(chosen_title)
             chosen_brief = max(briefs, key=len) if briefs else ""
-            fused_desc = clean_chunk_citations(" ".join(description_sentences))
+            fused_desc = fuse_descriptions_by_document(group)
 
             raw_relations = []
             for c in group:
@@ -873,7 +873,10 @@ class FinalConsolidationPipeline:
                 union_len = len(ents1 | ents2)
                 calc_jacc = round(len(shared_ents) / union_len, 3) if union_len > 0 else 0.0
 
-                rel_text = f"Verified: {reason}" if reason else "Directly related in context."
+                # When linking verified pairs, use a concise relationship label rather than dumping long justifications
+                rel_text = "directly related topic"
+                if reason and len(reason.split()) <= 8 and not any(kw in reason.lower() for kw in ["distinct", "aspects of", "two concepts", "focuses on"]):
+                    rel_text = reason.rstrip(".")
 
                 if root2.lower() not in targets1:
                     c1_obj["outbound_relations"].append({
@@ -891,8 +894,6 @@ class FinalConsolidationPipeline:
                         if r["target_concept"].lower() == root2.lower():
                             r["verified_by_llm"] = True
                             r["link_type"] = "llm_verified"
-                            if reason and reason not in r.get("relation", ""):
-                                r["relation"] = f"{r.get('relation', '')} ({reason})".strip()
 
                 if root1.lower() not in targets2:
                     c2_obj["outbound_relations"].append({
@@ -910,8 +911,6 @@ class FinalConsolidationPipeline:
                         if r["target_concept"].lower() == root1.lower():
                             r["verified_by_llm"] = True
                             r["link_type"] = "llm_verified"
-                            if reason and reason not in r.get("relation", ""):
-                                r["relation"] = f"{r.get('relation', '')} ({reason})".strip()
 
         # 5b. Score Ranking + Reciprocal Rescue Backlinks
         primary_cap = getattr(self.args, "max_primary_links", 15)
@@ -1027,19 +1026,29 @@ class FinalConsolidationPipeline:
                 md_content.append("## Overview\n")
                 md_content.append(f"{brief}\n")
 
-            # Ensure document citations are present at the end of Description if not already embedded
+            # Format description into clean distinct paragraphs per source document with citations at the end of each paragraph
+            raw_paras = [p.strip() for p in re.split(r"\n\s*\n", desc) if p.strip()]
             doc_citations = []
             for sc in c.get("source_chunks", []):
                 doc_id = sc.split("::")[0] if "::" in sc else sc
                 if doc_id and doc_id not in doc_citations:
                     doc_citations.append(doc_id)
 
-            if doc_citations and not any(f"[{did}]" in desc for did in doc_citations):
-                citation_suffix = " " + " ".join(f"[{did}]" for did in doc_citations)
-                desc = desc.rstrip() + citation_suffix
+            formatted_paras = []
+            for i, p in enumerate(raw_paras):
+                p_clean = p.rstrip()
+                # Check if paragraph has document citation
+                has_cite = bool(re.search(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+\s*\]", p_clean))
+                if not has_cite and i < len(doc_citations):
+                    p_clean = f"{p_clean} [{doc_citations[i]}]"
+                formatted_paras.append(p_clean)
 
+            if not formatted_paras and desc:
+                formatted_paras = [desc]
+
+            desc_text = "\n\n".join(formatted_paras)
             md_content.append("## Description\n")
-            md_content.append(f"{desc}\n")
+            md_content.append(f"{desc_text}\n")
 
             if relations:
                 md_content.append("## Related\n")
@@ -1052,9 +1061,25 @@ class FinalConsolidationPipeline:
                     r_text = rel.get("relation", "").strip()
                     tgt_obj = concept_by_name.get(tgt.lower())
                     tgt_slug = tgt_obj.get("slug") if tgt_obj else generate_stable_slug(tgt)
+
+                    # Clean relation explanation: strip nested parenthetical justifications and dangling prepositions
                     if r_text:
-                        rel_desc = r_text.rstrip(".")
-                        md_content.append(f"- [[{tgt_slug}|{tgt}]] ({rel_desc})")
+                        # Strip concatenated justification like: "phrase (The two concepts represent distinct...)"
+                        r_text = re.sub(r"\s*\([^)]*(?:The two concepts|aspects of|closely related|distinct)[^)]*\)", "", r_text, flags=re.IGNORECASE).strip()
+                        if r_text.lower().startswith("verified:"):
+                            inner = r_text[9:].strip()
+                            r_text = "directly related topic" if any(w in inner.lower() for w in ["distinct", "aspects", "focuses"]) or len(inner) > 60 else inner
+
+                        # Clean trailing prepositions/articles like: "is a refractive error affecting the" -> "is a refractive error affecting this system"
+                        words = r_text.split()
+                        dangling = {"the", "a", "an", "of", "to", "in", "with", "by", "for", "from", "on", "into", "at"}
+                        while words and words[-1].lower() in dangling:
+                            words.pop()
+                        rel_desc = " ".join(words).rstrip(".")
+                        if rel_desc:
+                            md_content.append(f"- [[{tgt_slug}|{tgt}]] ({rel_desc})")
+                        else:
+                            md_content.append(f"- [[{tgt_slug}|{tgt}]]")
                     else:
                         md_content.append(f"- [[{tgt_slug}|{tgt}]]")
 

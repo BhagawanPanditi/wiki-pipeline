@@ -57,7 +57,7 @@ def fuse_descriptions(descriptions: List[str], max_tokens: int = 1500) -> str:
             if not s_clean:
                 continue
             # Compare lowercase text without brackets/citations
-            norm = re.sub(r"\[doc_\d+\]", "", s_clean).casefold().strip()
+            norm = re.sub(r"\[(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[A-Za-z0-9_-]+)?\]", "", s_clean).casefold().strip()
             norm = " ".join(norm.split())
             if norm and norm not in seen_sentences:
                 seen_sentences.add(norm)
@@ -65,6 +65,66 @@ def fuse_descriptions(descriptions: List[str], max_tokens: int = 1500) -> str:
 
     fused = " ".join(fused_sentences)
     return fused
+
+
+def fuse_descriptions_by_document(concept_list: List[Dict[str, Any]]) -> str:
+    """Fuse concept descriptions keeping extractions from each document as separate paragraphs,
+    with document citations positioned at the end of each respective paragraph.
+    """
+    doc_to_descs: Dict[str, List[str]] = defaultdict(list)
+    doc_order: List[str] = []
+
+    for c in concept_list:
+        doc_id = None
+        for sc in c.get("source_chunks", []):
+            if sc:
+                doc_id = sc.split("::")[0] if "::" in sc else sc
+                break
+        if not doc_id:
+            # Fallback check for in-text citation
+            m = re.search(r"\[\s*([A-Za-z0-9_-]+)(?:::[^\]]+)?\s*\]", c.get("description", ""))
+            if m:
+                doc_id = m.group(1)
+
+        key = doc_id or "unknown"
+        if key not in doc_to_descs:
+            doc_order.append(key)
+        desc = c.get("description", "").strip()
+        if desc:
+            doc_to_descs[key].append(desc)
+
+    paragraphs = []
+    for doc_id in doc_order:
+        descs = doc_to_descs[doc_id]
+        seen_sents: Set[str] = set()
+        sents: List[str] = []
+
+        for d in descs:
+            for s in re.split(r'(?<=[.!?])\s+', d.strip()):
+                s_clean = s.strip()
+                if not s_clean:
+                    continue
+                # Strip raw chunk citations like [doc_...::chunk_...]
+                s_clean = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+::[A-Za-z0-9_-]+\s*\]", "", s_clean).strip()
+                norm = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+\s*\]", "", s_clean).casefold().strip()
+                norm = " ".join(norm.split())
+                if norm and norm not in seen_sents:
+                    seen_sents.add(norm)
+                    sents.append(s_clean)
+
+        if not sents:
+            continue
+
+        para = " ".join(sents).strip()
+        para = re.sub(r"\s+([.,;:!?])", r"\1", para)
+
+        # Place the document citation cleanly at the end of this document's paragraph
+        if doc_id != "unknown" and f"[{doc_id}]" not in para:
+            para = f"{para} [{doc_id}]"
+
+        paragraphs.append(para)
+
+    return "\n\n".join(paragraphs)
 
 
 def union_aliases(alias_lists: Iterable[List[str]]) -> List[str]:

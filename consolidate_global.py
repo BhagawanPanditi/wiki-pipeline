@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from utils.atomic_io import atomic_write_json
 from utils.cli import build_parser, resolve_settings
-from utils.concept_ops import fuse_descriptions, generate_stable_slug
+from utils.concept_ops import fuse_descriptions, fuse_descriptions_by_document, generate_stable_slug
 from utils.lemma import canonical_title_key
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
@@ -351,7 +351,7 @@ def global_consolidate(domain_dir: Path, args: Any):
                 if sc.strip():
                     global_source_chunks.add(sc.strip())
 
-        fused_desc = fuse_descriptions([c.get("description", "") for c in concepts])
+        fused_desc = fuse_descriptions_by_document(concepts)
         final_aliases = sorted([a for a in merged_aliases_set if a.casefold() != chosen_title.casefold()])
         final_subtopics = sorted([s for s in merged_subtopics_set if s.casefold() != chosen_title.casefold()])
 
