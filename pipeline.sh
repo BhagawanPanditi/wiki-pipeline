@@ -55,7 +55,7 @@ TARGET_DOMAIN="${1:-sustainable_living}"
 shift || true
 
 FROM_STAGE=1
-TO_STAGE=9
+TO_STAGE=10
 DISABLE_THINKING=true
 EXTRA_ARGS=()
 
@@ -244,7 +244,7 @@ run_domain_pipeline() {
     run_stage 10 "Benchmark Quality & Fact Retention Audit" \
         python3 audit_wiki_quality.py \
             --wiki_path "$wiki_path" \
-            --corpus_path "$corpus_path" \
+            --corpus_path "$input_corpus" \
             --limit 40 \
             $THINKING_FLAG "${EXTRA_ARGS[@]}"
 
