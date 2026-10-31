@@ -5376,7 +5376,7 @@ if __name__ == "__main__":
 
 
 # ==============================================================================
-# FILE: consolidate_global.py (427 lines)
+# FILE: consolidate_global.py (429 lines)
 # ==============================================================================
 
 #!/usr/bin/env python3
@@ -5772,10 +5772,12 @@ def global_consolidate(domain_dir: Path, args: Any):
     write_stage_manifest(
         wiki_path=domain_dir,
         stage=STAGE,
-        expected=raw_concepts_count,
+        expected=len(global_concepts),
         completed=len(global_concepts),
         failed=0,
+        raw_input_concepts=raw_concepts_count,
         approved_merges=approved_merges,
+        duplicates_fused=raw_concepts_count - len(global_concepts),
     )
 
     # Print final word count distribution across global concepts
