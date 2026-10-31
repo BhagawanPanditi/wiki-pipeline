@@ -402,14 +402,54 @@ Analyze factual retention, completeness, and extraction quality according to the
                         lines.append(f"| **{label}** | {cnt} | {pct:>5.1f}% |")
                     lines.append("\n")
 
+                    # Multi-Source Provenance Stats
+                    source_doc_counts = []
+                    for c in concepts:
+                        docs = {sc.split("::")[0] for sc in c.get("source_chunks", []) if sc}
+                        if not docs:
+                            # fallback: find document citations in description
+                            desc_docs = set(re.findall(r"\[\s*([A-Za-z0-9_-]+)(?:::[^\]]+)?\s*\]", c.get("description", "")))
+                            docs = {d for d in desc_docs if d.startswith("doc_") or d.startswith("canon_")}
+                        source_doc_counts.append(len(docs))
+
+                    single_source = sum(1 for s in source_doc_counts if s == 1)
+                    multi_source = sum(1 for s in source_doc_counts if s > 1)
+                    zero_source = sum(1 for s in source_doc_counts if s == 0)
+                    max_sources = max(source_doc_counts) if source_doc_counts else 0
+
+                    lines.extend([
+                        "## 6. Multi-Source Concept Fusion & Provenance Statistics\n",
+                        f"- **Multi-Source Concepts (Cross-Document Fused)**: **{multi_source}** ({multi_source/total_c*100:.1f}%)",
+                        f"- **Single-Source Concepts**: `{single_source}` ({single_source/total_c*100:.1f}%)",
+                        f"- **Max Documents Citing a Single Concept**: `{max_sources}`",
+                        "\n| Number of Source Documents | Concept Count | Percentage | Profile |",
+                        "| :--- | :--- | :--- | :--- |",
+                    ])
+                    doc_bins = [
+                        ("1 Source Document", 1, 1),
+                        ("2 Source Documents", 2, 2),
+                        ("3 - 5 Source Documents", 3, 5),
+                        ("6 - 10 Source Documents", 6, 10),
+                        ("11+ Source Documents (Major Corpus Hubs)", 11, 99999),
+                    ]
+                    if zero_source > 0:
+                        doc_bins.insert(0, ("0 Source Documents (Orphan)", 0, 0))
+
+                    for label, low, high in doc_bins:
+                        cnt = sum(1 for s in source_doc_counts if low <= s <= high)
+                        pct = (cnt / total_c * 100) if total_c else 0.0
+                        bar = "█" * int(pct / 4)
+                        lines.append(f"| **{label}** | {cnt} | {pct:>5.1f}% | `{bar}` |")
+                    lines.append("\n")
+
             except Exception as e:
                 lines.append(f"\n*(Notice: Could not analyze global_concepts.json: {e})*\n")
 
-        # 6. Detailed Document Fact Retention Breakdown
+        # 7. Detailed Document Fact Retention Breakdown
         docs = summary.get("documents", [])
         if docs:
             lines.extend([
-                "## 6. Document-Level Fact Retention & Quality Sample Breakdown\n",
+                "## 7. Document-Level Fact Retention & Quality Sample Breakdown\n",
                 "| Document ID | Chars (~Tokens) | Cited Paras | Concepts | Fact Retention | Concept Quality | Summary Verdict |",
                 "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ])
