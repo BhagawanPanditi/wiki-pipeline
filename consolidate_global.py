@@ -324,6 +324,7 @@ def global_consolidate(domain_dir: Path, args: Any):
         slug = generate_stable_slug(chosen_title, used_slugs)
 
         merged_aliases_set = set()
+        merged_subtopics_set = set()
         global_source_chunks = set()
 
         for c in concepts:
@@ -333,7 +334,7 @@ def global_consolidate(domain_dir: Path, args: Any):
                     merged_aliases_set.add(a.strip())
             for s in c.get("subtopics", []):
                 if s.strip():
-                    merged_aliases_set.add(s.strip())
+                    merged_subtopics_set.add(s.strip())
 
             for sc in c.get("source_chunks", []):
                 if sc.strip():
@@ -341,11 +342,13 @@ def global_consolidate(domain_dir: Path, args: Any):
 
         fused_desc = fuse_descriptions([c.get("description", "") for c in concepts])
         final_aliases = sorted([a for a in merged_aliases_set if a.casefold() != chosen_title.casefold()])
+        final_subtopics = sorted([s for s in merged_subtopics_set if s.casefold() != chosen_title.casefold()])
 
         global_concepts.append({
             "title": chosen_title,
             "slug": slug,
             "aliases": final_aliases,
+            "subtopics": final_subtopics,
             "description": fused_desc,
             "source_chunks": sorted(list(global_source_chunks)),
         })

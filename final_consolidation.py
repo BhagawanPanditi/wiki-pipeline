@@ -755,6 +755,7 @@ class FinalConsolidationPipeline:
                 chosen_slug = sanitize_filename(chosen_title)
 
             merged_aliases = set()
+            merged_subtopics = set()
             merged_entities = set()
             merged_chunks = set()
             seen_sentences = set()
@@ -766,6 +767,9 @@ class FinalConsolidationPipeline:
                 for a in c.get("aliases", []):
                     if a.strip():
                         merged_aliases.add(a.strip())
+                for s in c.get("subtopics", []):
+                    if s.strip():
+                        merged_subtopics.add(s.strip())
                 for ent in c.get("entities", []):
                     if ent.strip():
                         merged_entities.add(ent.strip())
@@ -785,6 +789,7 @@ class FinalConsolidationPipeline:
                             description_sentences.append(s_clean)
 
             merged_aliases.discard(chosen_title)
+            merged_subtopics.discard(chosen_title)
             chosen_brief = max(briefs, key=len) if briefs else ""
             fused_desc = clean_chunk_citations(" ".join(description_sentences))
 
@@ -797,6 +802,7 @@ class FinalConsolidationPipeline:
                 "slug": chosen_slug,
                 "brief": chosen_brief,
                 "aliases": sorted(list(merged_aliases)),
+                "subtopics": sorted(list(merged_subtopics)),
                 "entities": sorted(list(merged_entities)),
                 "description": fused_desc,
                 "source_chunks": sorted(list(merged_chunks)),
@@ -990,6 +996,7 @@ class FinalConsolidationPipeline:
             desc = clean_chunk_citations(c.get("description", ""))
             relations = c.get("outbound_relations", [])
             aliases = [a.strip() for a in c.get("aliases", []) if a.strip()]
+            subtopics = [s.strip() for s in c.get("subtopics", []) if s.strip()]
             entities = [e.strip() for e in c.get("entities", []) if e.strip()]
 
             slug = c.get("slug") or generate_stable_slug(title)
@@ -1000,15 +1007,19 @@ class FinalConsolidationPipeline:
             # Track for concept_index.md
             concept_index_entries.append((slug, title, brief))
 
-            # Track for entity_index.md (both key entities and aliases)
+            # Track for entity_index.md (key entities, aliases, and subtopics)
             for ent in entities:
                 entity_to_concepts[ent].add((slug, title))
             for al in aliases:
                 entity_to_concepts[al].add((slug, title))
+            for st in subtopics:
+                entity_to_concepts[st].add((slug, title))
 
             md_content = [f"# {title}\n"]
             if aliases:
                 md_content.append(f"**Aliases**: {', '.join(aliases)}\n")
+            if subtopics:
+                md_content.append(f"**Covers**: {', '.join(subtopics)}\n")
             if entities:
                 md_content.append(f"**Key Entities**: {', '.join(entities[:15])}\n")
 
