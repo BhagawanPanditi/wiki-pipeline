@@ -143,7 +143,11 @@ def print_concept_word_distribution(concepts: List[Dict[str, Any]], title_label:
         ("31 - 50 words", lambda w: 31 <= w <= 50),
         ("51 - 100 words", lambda w: 51 <= w <= 100),
         ("101 - 200 words", lambda w: 101 <= w <= 200),
-        ("201+ words", lambda w: w > 200),
+        ("201 - 350 words", lambda w: 201 <= w <= 350),
+        ("351 - 500 words", lambda w: 351 <= w <= 500),
+        ("501 - 750 words", lambda w: 501 <= w <= 750),
+        ("751 - 1000 words", lambda w: 751 <= w <= 1000),
+        ("1001+ words", lambda w: w > 1000),
     ]
 
     bin_counts = {label: 0 for label, _ in bins}
