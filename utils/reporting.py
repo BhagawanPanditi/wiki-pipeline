@@ -30,6 +30,7 @@ class VerificationMetrics:
     pass_rate: float = 0.0
     missed_concepts: int = 0
     missed_facts: int = 0
+    synthetic_count: int = 0
     sample_missed_concepts: List[str] = None  # type: ignore[assignment]
     sample_missed_facts: List[str] = None  # type: ignore[assignment]
 
@@ -88,6 +89,9 @@ def collect_metrics(staging_dir: Path, *, label: str,
 
         data = read_json(result_file, default=None)
         if not isinstance(data, dict) or "coverage_score" not in data:
+            continue
+        if data.get("synthetic", False):
+            metrics.synthetic_count += 1
             continue
         metrics.total_chunks += 1
         try:

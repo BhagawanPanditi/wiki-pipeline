@@ -65,6 +65,10 @@ class VerificationResult(BaseModel):
         min_length=1,
         description="1-2 sentences summarizing the completeness, factual accuracy, and granularity of the extraction."
     )
+    synthetic: bool = Field(
+        default=False,
+        description="True if this verification result was synthesized as a fallback rather than evaluated by the LLM."
+    )
 
     @model_validator(mode="after")
     def check_verdict(self) -> "VerificationResult":
@@ -308,7 +312,7 @@ Output ONLY the <verification>...</verification> block.
             block = block_m.group(1) if block_m else raw_text
 
             score_m = re.search(r"<coverage_score>(.*?)</coverage_score>", block, re.DOTALL | re.IGNORECASE)
-            coverage_score = 0.90
+            coverage_score = None
             if score_m:
                 val_str = re.search(r"([0-9]*\.?[0-9]+)", score_m.group(1).strip())
                 if val_str:
@@ -318,7 +322,10 @@ Output ONLY the <verification>...</verification> block.
                             coverage_score /= 100.0
                         coverage_score = max(0.0, min(1.0, coverage_score))
                     except ValueError:
-                        pass
+                        coverage_score = None
+
+            if coverage_score is None:
+                raise ValueError("Missing or invalid coverage_score in verification output")
 
             def extract_list(tag: str) -> List[str]:
                 m = re.search(rf"<{tag}>(.*?)</{tag}>", block, re.DOTALL | re.IGNORECASE)
@@ -375,7 +382,7 @@ Output ONLY the <verification>...</verification> block.
 
         # 3. Fallback to JSON repair if XML parse didn't match
         try:
-            cleaned_json = clean_json_string(clean_text)
+            cleaned_json = clean_json_string(raw_text)
             parsed_data = json.loads(cleaned_json)
             if isinstance(parsed_data, dict):
                 if isinstance(parsed_data.get("missing_concepts"), list) and len(parsed_data["missing_concepts"]) > 0:
@@ -564,6 +571,7 @@ Output ONLY the <verification>...</verification> block.
                             missing_facts=[],
                             hallucinations=[],
                             critique="Automated fallback audit synthesized after server returned empty response.",
+                            synthetic=True,
                         )
                         await self.persist_result(item, fallback_res)
                 await self.checkpoint.flush()

@@ -43,6 +43,7 @@ WIKI_BASE_DIR="${WIKI_BASE_DIR:-/home/compiling-ganesh/24m0829/long_document/wik
 
 ALL_DOMAINS=(
     "sustainable_living"
+    "biology"
     "earth_science"
     "economics"
     "psychology"

@@ -24,6 +24,7 @@ from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
 from utils.chunks import load_cached_chunks
 from utils.cli import build_parser, resolve_settings
 from utils.errors import StageBudget
+from utils.json_repair import clean_json_string
 from utils.llm_pool import pool_for_stage
 
 STAGE = "refine-concepts"

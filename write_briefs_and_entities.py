@@ -30,25 +30,22 @@ STAGE = "write-briefs"
 SYSTEM_PROMPT_BRIEF_ENTITIES = """\
 You are an expert knowledge agent.
 Your task is to analyze a comprehensive concept description and produce two vital outputs in ONE pass:
-1. A condensed BRIEF (< 5 lines, 2-3 dense factual sentences, ~40-60 words).
-2. A list of IMPORTANT ENTITIES mentioned in the text.
+1. A condensed BRIEF (1-3 sentences, ~25-60 words).
+2. A list of 5 to 12 IMPORTANT ENTITIES mentioned in the text.
 
 RULES FOR BRIEF:
-- Length: Exactly 2 to 3 dense, well-formed complete sentences (< 5 lines, ~40-60 words).
-- Content: State the core definition, primary role, key parameters, or functional purpose.
-- Exactness: Retain exact numbers, metrics, or specifications where relevant.
-- No Citations: SILENTLY OMIT all paper citations, DOIs, and internal provenance IDs like [doc_...].
-- No Noise: Silently omit conversational filler and output a clean paragraph.
+- 1-3 complete sentences, about 25-60 words. If the description is under ~60 words, write ONE accurate sentence; never pad or infer.
+- Keep exact numbers, metrics, and identifiers. Silently omit internal provenance IDs like [doc_...].
+- No noise: do not add conversational filler ("This concept describes...").
 
-RULES FOR IMPORTANT ENTITIES:
-- Extract salient, specific entities, terms, identifiers, tools, components, metrics, or methods mentioned in the text.
-- Strictly EXCLUDE:
-  * Overly generic empty words (e.g. "thing", "stuff", "data", "info", "system", "process", "result", "aspect").
-  * Trivial conversational filler or generic single common nouns without domain specificity.
-- Keep each entity to 1-4 words in Title Case.
+RULES FOR ENTITIES (5-12):
+- Specific named things in the text: proper names, standard terms of art, identifiers, quantities with units, named methods, or rules.
+- Use the standard singular, unqualified surface form ("Protein Kinase", not "the protein kinases that...").
+- Exclude vague words that would apply to almost any concept in the field (for example: "data", "process", "result", "method", "system", "approach", "information").
+- Each entity 1-4 words in Title Case.
 
 OUTPUT FORMAT:
-Output ONLY the <brief>...</brief> and <entities>...</entities> XML blocks with no introductory or concluding text:
+Output ONLY the <brief>...</brief> and <entities>...</entities> XML blocks:
 <brief>
 First dense sentence defining the core concept and its primary role. Second sentence explaining the primary mechanism, rule, or parameter.
 </brief>
@@ -89,9 +86,9 @@ def parse_xml_brief_and_entities(text: str) -> BriefAndEntities:
                 entities.append(cleaned)
 
     # Fallback to JSON if model emitted json
-    if not brief and "{" in clean_text:
+    if not brief and "{" in text:
         try:
-            m = re.search(r"\{.*\}", clean_text, re.DOTALL)
+            m = re.search(r"\{.*\}", text, re.DOTALL)
             if m:
                 payload = json.loads(m.group(0))
                 brief = payload.get("brief", "").strip()
@@ -145,10 +142,23 @@ class BriefAndEntitiesPipeline:
         aliases = ", ".join(item.get("aliases", []))
         description = item.get("description", "")
 
+        # Guard: truncate huge hub concept descriptions to prevent context overflow / HTTP 400
+        # Budget ~10,000 words (~12,000-14,000 tokens): first 20 sentences + evenly spaced remainder
+        sentences = re.split(r'(?<=[.!?])\s+', description.strip())
+        if len(sentences) > 40:
+            head = sentences[:20]
+            tail = sentences[20:]
+            # Sample up to 20 sentences from tail
+            step = max(1, len(tail) // 20)
+            sampled_tail = tail[::step][:20]
+            guarded_desc = " ".join(head + sampled_tail)
+        else:
+            guarded_desc = description
+
         user_prompt = f"CONCEPT TITLE: \"{title}\"\n"
         if aliases:
             user_prompt += f"ALIASES: {aliases}\n"
-        user_prompt += f"\nFULL DESCRIPTION:\n{description}\n"
+        user_prompt += f"\nFULL DESCRIPTION:\n{guarded_desc}\n"
 
         extra_body: Dict[str, Any] = {}
         model_kwargs: Dict[str, Any] = {}
@@ -181,21 +191,23 @@ class BriefAndEntitiesPipeline:
         if not result.brief:
             sentences = re.split(r'(?<=[.!?])\s+', description.strip())
             result.brief = " ".join(sentences[:2])
+            item["brief_source"] = "fallback"
+        else:
+            item["brief_source"] = "llm"
 
         return result
 
     async def persist_concept_brief(self, item: Dict[str, Any], res: BriefAndEntities):
         item["brief"] = res.brief
         item["entities"] = res.entities
+        if "brief_source" not in item:
+            item["brief_source"] = "llm"
 
-        # Update individual concept JSON in concepts/
-        safe_name = sanitize_filename(item["title"]) or "unnamed_concept"
-        file_path = self.concepts_dir / f"{safe_name}.json"
-        counter = 1
-        while file_path.exists() and not file_path.is_file():
-            file_path = self.concepts_dir / f"{safe_name}_{counter}.json"
-            counter += 1
-
+        # Update individual concept JSON in concepts/ using stable slug (F-12)
+        slug = item.get("slug")
+        if not slug:
+            slug = sanitize_filename(item["title"]) or "unnamed_concept"
+        file_path = self.concepts_dir / f"{slug}.json"
         atomic_write_json(file_path, item)
 
         async with self.log_lock:
@@ -210,8 +222,10 @@ class BriefAndEntitiesPipeline:
         print(f"Assembling enriched concepts from {self.concepts_dir}...")
         assembled_concepts = []
         for c in concepts:
-            safe_name = sanitize_filename(c.get("title", "")) or "unnamed_concept"
-            c_file = self.concepts_dir / f"{safe_name}.json"
+            slug = c.get("slug")
+            if not slug:
+                slug = sanitize_filename(c.get("title", "")) or "unnamed_concept"
+            c_file = self.concepts_dir / f"{slug}.json"
             if c_file.exists():
                 try:
                     with open(c_file, "r", encoding="utf-8") as cf:
@@ -220,12 +234,15 @@ class BriefAndEntitiesPipeline:
                             c["brief"] = disk_data["brief"]
                         if "entities" in disk_data:
                             c["entities"] = disk_data["entities"]
+                        if "brief_source" in disk_data:
+                            c["brief_source"] = disk_data["brief_source"]
                 except Exception:
                     pass
             # Fallback if brief is still missing: derive from first 2 sentences
             if not c.get("brief"):
                 sentences = re.split(r'(?<=[.!?])\s+', c.get("description", "").strip())
                 c["brief"] = " ".join(sentences[:2])
+                c["brief_source"] = "fallback"
             if "entities" not in c:
                 c["entities"] = []
             assembled_concepts.append(c)

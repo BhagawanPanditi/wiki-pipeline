@@ -9,6 +9,7 @@ Usage:
     python3 extract_concepts.py --input_path /path/to/domain.jsonl --wiki_path /path/to/wiki
 """
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -25,6 +26,7 @@ from utils.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
                           load_corpus, resolve_corpus_path,
                           save_run_config)
 from utils.errors import PermanentFailure, StageBudget
+from utils.llm_params import TruncatedOutput, call_llm
 from utils.llm_pool import ServerPool
 
 STAGE = "extract-concepts"
@@ -34,6 +36,7 @@ STAGE = "extract-concepts"
 class Concept(BaseModel):
     title: str = Field(description="Exact canonical title (1-6 words, singular).")
     aliases: List[str] = Field(default_factory=list, description="Explicit acronyms or alternate names.")
+    subtopics: List[str] = Field(default_factory=list, description="Narrower absorbed subtopics or parameters.")
     description: str = Field(description="Single dense factual paragraph retaining all metrics and details.")
 
 class ChunkExtractionSchema(BaseModel):
@@ -57,27 +60,29 @@ TITLES AND ALIASES:
 - Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the canonical name any other document would use for the same subject, ensuring concepts merge cleanly across sources.
 - Aliases: Semicolon-separated list of acronyms, alternate designations, or specific minor sub-topics/parameters absorbed into this concept. If none, leave empty.
 
-WHAT IS A CONCEPT (UNIVERSAL DEFINITION):
-A concept is a canonical, self-contained, semantically coherent unit of knowledge that captures a meaningful subject or body of information, along with its relevant facts, properties, and relationships. It is independent of document boundaries, can be consolidated and enriched across multiple sources, and is not merely a keyword or arbitrary text chunk.
-- Scope: Concepts may represent any meaningful subject across domains (e.g., architectures, software libraries, algorithms, financial entities, scientific phenomena, operational procedures, policies, historical events, or core definitions).
-- Granularity & Standalone Subtopics: Any distinct subtopic or specialized theme that contains substantial information (typically 300 to 600+ words/tokens with its own details, properties, or comparisons) SHOULD be extracted as an independent, standalone concept.
-- Avoid Trivial Fragmentation: Do not create thin 1-2 sentence stub concepts for trivial sub-steps or single isolated numbers; absorb those minor facts directly into the description of their parent concept and record their specific names in <aliases>.
-- Do not extract meta-labels ("Introduction", "Chapter 1", "Overview") or whole-chunk summaries.
+SIZE GUIDELINES (words):
+- A well-formed concept description is typically 150-450 words.
+- If a topic has fewer than ~45 words of substance in this chunk, do not create a concept; absorb its facts into the parent concept's description and record its name in <subtopics>.
+- If one topic spans well over 700 words in this chunk, split at natural thematic boundaries into separate concepts.
+- Never pad. Do not restate the title in every sentence or add commentary ("This concept covers...").
 
-COMPREHENSIVE INFORMATION RETENTION (ZERO FACT LOSS):
-- Capture all substantive information present in the chunk inside the appropriate concept descriptions. Leave no meaningful informational content unabsorbed.
-- Descriptions must preserve exact concrete details rather than high-level generalizations: retain specific names, identifiers, terms, numbers, metrics, operational conditions, rules, relationships, chronology, and attributions.
-- Descriptions must be dense, self-contained paragraphs that explicitly name the subject and stand entirely on their own.
+ALIASES vs SUBTOPICS:
+- <aliases>: only true synonyms, acronyms, and alternate names for THIS concept.
+- <subtopics>: names of narrower parameters, variants, or sub-steps whose facts you absorbed into this description.
+
+EMPTY CASE:
+If the CURRENT CHUNK has no substantive informational content, output exactly: <no_concepts/>
 
 OUTPUT FORMAT:
 Output ONLY completed <concept>...</concept> XML blocks with no introductory or concluding text:
 <concept>
 <title>Exact Canonical Title</title>
 <aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
+<subtopics>Absorbed Subtopic 1; Absorbed Subtopic 2</subtopics>
 <description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all substantive facts, properties, and specific details from this chunk.</description>
 </concept>
 
-If no substantive concepts exist in the chunk, output nothing.
+If no substantive concepts exist in the chunk, output exactly: <no_concepts/>
 """
 
 # ── XML Parsing Helper ────────────────────────────────────────────────────────
@@ -113,9 +118,16 @@ def parse_xml_concepts(text: str) -> List[Concept]:
             raw_aliases = aliases_m.group(1).strip()
             aliases = [a.strip() for a in re.split(r"[;,]", raw_aliases) if a.strip()]
 
+        subtopics = []
+        subtopics_m = re.search(r"<subtopics>(.*?)</subtopics>", block, re.DOTALL | re.IGNORECASE)
+        if subtopics_m:
+            raw_subs = subtopics_m.group(1).strip()
+            subtopics = [s.strip() for s in re.split(r"[;,]", raw_subs) if s.strip()]
+
         concepts.append(Concept(
             title=title,
             aliases=aliases,
+            subtopics=subtopics,
             description=description,
         ))
 
@@ -269,52 +281,35 @@ CURRENT CHUNK:
 CONTEXT AFTER:
 {chunk_data['context_after']}
 
-Extract the substantive concepts from CURRENT CHUNK now. If you need to think, put all thinking strictly inside <think>...</think>, followed immediately by <concept>...</concept> blocks.
+Extract the substantive concepts from CURRENT CHUNK now according to the system instructions.
 """
-        # Determine thinking mode & sampling parameters
-        cfg_enable = self.cfg.get("enable_thinking") if hasattr(self, "cfg") else None
-        disable_cli = getattr(self.args, "disable_thinking", False)
-        enable_cli = getattr(self.args, "enable_thinking", False)
-
-        if disable_cli or (cfg_enable is False and not enable_cli):
-            # Qwen Instruct / Non-thinking Mode
-            extra_body = {
-                "chat_template_kwargs": {"enable_thinking": False},
-                "top_k": 20,
-                "repetition_penalty": 1.0,
-            }
-            temperature = 0.7
-            top_p = 0.80
-            presence_penalty = 1.5
-        elif enable_cli or (cfg_enable is True):
-            extra_body = {
-                "chat_template_kwargs": {"enable_thinking": True},
-            }
-            temperature = 0.1
-            top_p = 0.95
-            presence_penalty = 0.0
-        else:
-            extra_body = None
-            temperature = 0.1
-            top_p = 0.95
-            presence_penalty = 0.0
-
-        response = await client.chat.completions.create(
+        raw_text = await call_llm(
+            client=client,
             model=self.settings.model_name,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=temperature,
-            top_p=top_p,
-            presence_penalty=presence_penalty,
             max_tokens=self.settings.max_tokens,
-            extra_body=extra_body,
+            args=self.args,
+            cfg=getattr(self, "cfg", None),
+            task="generate",
+            check_truncation=True,
         )
 
-        choice = response.choices[0]
-        raw_text = choice.message.content or ""
         completed_concepts = parse_xml_concepts(raw_text)
+
+        # F-04: Disambiguate empty output from failure
+        # If output has neither <concept> nor sentinel <no_concepts/>, and chunk has substance, raise recoverable error to retry
+        if not completed_concepts and "<no_concepts" not in raw_text.lower():
+            chunk_text = chunk_data.get("current_chunk", "")
+            chunk_word_count = len(chunk_text.split())
+            if chunk_word_count > 150:
+                raise ValueError(
+                    f"LLM produced no concepts and missing <no_concepts/> sentinel for non-empty chunk "
+                    f"({chunk_word_count} words). Retrying."
+                )
+
         return ChunkExtractionSchema(concepts=completed_concepts)
 
     async def persist_extraction(self, chunk_data: Dict[str, Any], extracted: ChunkExtractionSchema) -> None:

@@ -105,15 +105,18 @@ def classify_error(exc: BaseException) -> str:
         if isinstance(exc, openai.APIStatusError):
             return _classify_status(getattr(exc, "status_code", 500))
 
+    # ── programming / invariant bugs (must never retry) ────────────────────
+    if isinstance(exc, (NameError, AttributeError, ImportError, TypeError, AssertionError)):
+        return PERMANENT
+
     # ── malformed / truncated model output ─────────────────────────────────
     if isinstance(exc, json.JSONDecodeError):
         return RECOVERABLE
     if ValidationError is not None and isinstance(exc, ValidationError):
         return RECOVERABLE
-    if isinstance(exc, (ValueError, KeyError, TypeError, AttributeError, IndexError,
+    if isinstance(exc, (ValueError, KeyError, IndexError,
                         StopIteration, UnicodeDecodeError)):
-        # Includes the "Response truncated: Hit max_tokens limit" ValueErrors
-        # raised by the extraction stages.
+        # Includes recoverable parse failures and length truncation exceptions
         return RECOVERABLE
 
     return RECOVERABLE

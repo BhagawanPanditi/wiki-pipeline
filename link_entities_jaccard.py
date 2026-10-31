@@ -14,6 +14,7 @@ Usage:
 import asyncio
 import json
 import re
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
@@ -21,27 +22,37 @@ from typing import Any, Dict, List, Set, Tuple
 import networkx as nx
 from tqdm import tqdm
 
-from utils.atomic_io import atomic_write_json, sanitize_filename
+from utils.atomic_io import atomic_write_json
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
+from utils.lemma import normalize_entity
+from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.stats import print_link_distribution
 
 STAGE = "link-entities"
 
 SYSTEM_PROMPT_RELATION_SYNTHESIS = """\
 You are an expert knowledge specialist.
-Given two concepts with their titles, briefs, and key shared entities, characterize their precise direct relationship in a concise, 1-line tag or short phrase (at most 4 to 10 words).
+You are given Concept 1 (the SUBJECT) and Concept 2 (the OBJECT), with their briefs and shared entities.
+Write a phrase P such that "Concept 1 P Concept 2" is true, specific, and directional.
 
 GUIDELINES:
-- Output a concise relationship tag or short phrase (e.g., "primary implementation of", "sub-system component", "counterpart framework in", "underlying dependency for").
-- State the exact relationship directly and compactly.
-- Keep it to a single brief phrase (max 10 words).
-- Absolutely NO conversational filler, meta-phrasing (e.g. "Concept 1 is related to Concept 2 because..."), or multi-sentence paragraphs.
+- Output a concise phrase (3 to 10 words, no trailing punctuation).
+- Prefer specific functional or hierarchical roles:
+  * "is a subtype of"
+  * "implements the protocol of"
+  * "depends on components of"
+  * "is evaluated against"
+  * "serves as a competing alternative to"
+  * "is an operational requirement for"
+- Avoid vague tags like "related to", "connected with", "used with".
+- If only co-occurrence is supported, output: "co-occurs with via <shared entity>".
 
 OUTPUT FORMAT:
-Output ONLY the <relation>...</relation> block with no introductory or concluding text:
+Output ONLY the <relation>...</relation> XML block:
 <relation>
-Concise relationship phrase (max 10 words)
+Concise relationship phrase
 </relation>
 """
 
@@ -52,60 +63,6 @@ def parse_xml_relation(text: str) -> str:
     if rel_m:
         return rel_m.group(1).strip()
     return text.strip().strip('"').strip("'")
-
-def normalize_entity(ent: str) -> str:
-    """Normalize entity text with robust lemmatization for matching."""
-    if not ent:
-        return ""
-    ent = ent.strip().lower()
-    ent = re.sub(r"[^\w\s-]", "", ent)
-    if ent.endswith("ies") and len(ent) > 4:
-        ent = ent[:-3] + "y"
-    elif ent.endswith("es") and len(ent) > 4 and not ent.endswith(("ses", "xes", "ches", "shes")):
-        ent = ent[:-2]
-    elif ent.endswith("s") and len(ent) > 3 and not ent.endswith("ss"):
-        ent = ent[:-1]
-    return ent.strip()
-
-def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "RELATED LINKS"):
-    """Compute and print histogram distribution of related links across all concepts with dynamic bins (bin width = 5)."""
-    if not concepts:
-        print(f"\n[{title_label}] No concepts found.")
-        return
-
-    counts = [len(c.get("outbound_relations", [])) for c in concepts]
-    total = len(counts)
-    avg_links = sum(counts) / total if total else 0.0
-    max_count = max(counts) if counts else 0
-
-    # Build dynamic bins with step=5 up to max_count
-    bins = [("0 links", 0, 0)]
-    step = 5
-    curr = 1
-    while curr <= max_count:
-        upper = curr + step - 1
-        bins.append((f"{curr} - {upper} links", curr, upper))
-        curr += step
-
-    bin_counts = {label: 0 for label, _, _ in bins}
-    for count in counts:
-        for label, low, high in bins:
-            if low <= count <= high:
-                bin_counts[label] += 1
-                break
-
-    print(f"\n============================================================")
-    print(f"RELATED LINKS DISTRIBUTION [{title_label}] (Total Concepts: {total})")
-    print(f"Average Links per Concept: {avg_links:.2f} | Max Links: {max_count} | Disconnected Concepts (0 links): {bin_counts['0 links']} ({bin_counts['0 links'] / total * 100:.1f}%)")
-    print(f"------------------------------------------------------------")
-    print(f"{'Links Range':<20} {'Concept Count':<15} {'Percentage':<12}")
-    print(f"------------------------------------------------------------")
-    for label, _, _ in bins:
-        c_count = bin_counts[label]
-        pct = (c_count / total * 100) if total else 0.0
-        bar = "█" * int(pct / 2)
-        print(f"{label:<20} {c_count:<15} {pct:>5.1f}%   {bar}")
-    print(f"============================================================\n")
 
 async def enrich_graph_via_jaccard(
     args: Any,
@@ -182,62 +139,89 @@ async def enrich_graph_via_jaccard(
 
     print(f"Discovered {len(title_mention_links)} cross-reference links where a concept's title appears in key entities.")
 
-    # 2. Shared Entities & Jaccard Similarity
+    # 2. Shared Entities & IDF-Weighted Qualification (F-14)
+    # Drop entities with df > max(50, 0.02 * N) to prevent broad hub dominance
+    num_concepts = len(concepts)
+    df_ceiling = max(50, int(0.02 * num_concepts))
+    filtered_entity_to_concepts = {
+        ent: titles for ent, titles in entity_to_concepts.items()
+        if len(titles) <= df_ceiling
+    }
+
+    # Precompute IDF for remaining entities
+    idf = {
+        ent: math.log(max(1.0, num_concepts / max(1, len(titles))))
+        for ent, titles in filtered_entity_to_concepts.items()
+    }
+
     pair_shared: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
-    for ent, titles in entity_to_concepts.items():
-        if 1 < len(titles) <= max_hub_threshold:  # Filter out excessively broad generic hubs
+    for ent, titles in filtered_entity_to_concepts.items():
+        if len(titles) > 1:
             t_list = sorted(list(titles))
             for i in range(len(t_list)):
                 for j in range(i + 1, len(t_list)):
                     pair_shared[(t_list[i], t_list[j])].add(ent)
 
-    candidate_links: List[Tuple[str, str, float, List[str]]] = []
+    candidate_links: List[Tuple[str, str, float, List[str], str]] = []
     for (t1, t2), shared in pair_shared.items():
         if G.has_edge(t1, t2):
             continue
         set1 = concept_entities[t1]
         set2 = concept_entities[t2]
-        union_len = len(set1 | set2)
-        jaccard = len(shared) / union_len if union_len > 0 else 0.0
+        union_ents = set1 | set2
+
+        # IDF-weighted overlap score
+        shared_idf = sum(idf.get(e, 0.0) for e in shared)
+        union_idf = sum(idf.get(e, 0.0) for e in union_ents) or 1.0
+        idf_score = shared_idf / union_idf
+        jaccard = len(shared) / len(union_ents) if union_ents else 0.0
 
         qualifies = False
-        if len(shared) >= 2 or jaccard >= min_jaccard:
+        # F-14: Qualify if >= 2 shared entities with sufficient IDF score, OR 1 rare entity
+        if len(shared) >= 2 and idf_score >= 0.08:
             qualifies = True
         elif len(shared) == 1 and min_shared_entities <= 1:
             only_ent = next(iter(shared))
-            if len(entity_to_concepts[only_ent]) <= specific_entity_threshold:
+            if len(entity_to_concepts[only_ent]) <= min(20, specific_entity_threshold):
                 qualifies = True
 
         if qualifies:
-            candidate_links.append((t1, t2, jaccard, sorted(list(shared))))
+            candidate_links.append((t1, t2, idf_score, sorted(list(shared)), "entity_overlap"))
 
-    print(f"Discovered {len(candidate_links)} reciprocal candidate pair(s) meeting semantic criteria.")
+    print(f"Discovered {len(candidate_links)} reciprocal candidate pair(s) meeting IDF semantic criteria.")
 
-    # Merge candidate links
-    all_new_links = title_mention_links + candidate_links
+    # Convert title_mention_links to 5-tuple
+    formatted_title_mentions = [
+        (t1, t2, score, shared, "title_mention")
+        for t1, t2, score, shared in title_mention_links
+    ]
+    all_new_links = formatted_title_mentions + candidate_links
 
     # Establish reciprocal bidirectional links for all qualifying pairs
     added_links_by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     new_edges_added = 0
 
-    for t1, t2, jaccard, shared_list in all_new_links:
+    for t1, t2, jaccard, shared_list, l_type in all_new_links:
         if G.has_edge(t1, t2):
             continue
         shared_summary = ", ".join(shared_list[:4])
-        rel_text = f"Functionally related via shared key entities: {shared_summary}."
+        rel_text_1 = f"co-occurs with {t2} via {shared_summary}"
+        rel_text_2 = f"co-occurs with {t1} via {shared_summary}"
 
         link_payload_1 = {
             "target_concept": t2,
-            "relation": rel_text,
+            "relation": rel_text_1,
             "jaccard_similarity": round(jaccard, 3),
             "shared_entities": shared_list,
+            "link_type": l_type,
             "source_chunks": []
         }
         link_payload_2 = {
             "target_concept": t1,
-            "relation": rel_text,
+            "relation": rel_text_2,
             "jaccard_similarity": round(jaccard, 3),
             "shared_entities": shared_list,
+            "link_type": l_type,
             "source_chunks": []
         }
 
@@ -327,37 +311,26 @@ async def enrich_graph_via_jaccard(
             async def generate_relation(client: Any, item: Dict[str, Any], server_index: int) -> str:
                 ents_str = ", ".join(item["shared_entities"][:8]) if item["shared_entities"] else "Domain context"
                 prompt = (
-                    f"CONCEPT 1: \"{item['concept_1']}\"\n"
+                    f"CONCEPT 1 (SUBJECT): \"{item['concept_1']}\"\n"
                     f"Brief: {item['brief_1']}\n\n"
-                    f"CONCEPT 2: \"{item['concept_2']}\"\n"
+                    f"CONCEPT 2 (OBJECT): \"{item['concept_2']}\"\n"
                     f"Brief: {item['brief_2']}\n\n"
                     f"SHARED KEY ENTITIES: {ents_str}\n"
                 )
-                extra_body: Dict[str, Any] = {}
-                model_kwargs: Dict[str, Any] = {}
-                if getattr(args, "disable_thinking", False):
-                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-                    model_kwargs = {
-                        "temperature": 0.7,
-                        "top_p": 0.80,
-                        "presence_penalty": 1.5,
-                        "extra_body": extra_body,
-                    }
-                else:
-                    model_kwargs = {"temperature": 0.0}
-
-                response = await client.chat.completions.create(
+                raw_text = await call_llm(
+                    client=client,
                     model=settings.model_name,
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT_RELATION_SYNTHESIS},
                         {"role": "user", "content": prompt}
                     ],
                     max_tokens=settings.max_tokens or 256,
-                    **model_kwargs
+                    args=args,
+                    task="judge",
+                    check_truncation=False,
                 )
-                raw_text = response.choices[0].message.content or ""
                 parsed = parse_xml_relation(raw_text)
-                return parsed if parsed else f"Functionally related in context of {ents_str}."
+                return parsed if parsed else f"co-occurs with via {ents_str}"
 
             try:
                 async with pool:
@@ -397,12 +370,10 @@ async def enrich_graph_via_jaccard(
     if concepts_dir.exists():
         print(f"Updating individual concept JSONs in {concepts_dir}/...")
         for c in tqdm(concepts, desc="Writing concept files"):
-            safe_name = sanitize_filename(c["title"]) or "unnamed_concept"
-            file_path = concepts_dir / f"{safe_name}.json"
-            counter = 1
-            while file_path.exists() and not file_path.is_file():
-                file_path = concepts_dir / f"{safe_name}_{counter}.json"
-                counter += 1
+            slug = c.get("slug")
+            if not slug:
+                slug = sanitize_filename(c["title"]) or "unnamed_concept"
+            file_path = concepts_dir / f"{slug}.json"
             try:
                 atomic_write_json(file_path, c, fsync_dir=False)
             except Exception:

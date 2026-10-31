@@ -26,14 +26,20 @@ import numpy as np
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from utils.atomic_io import atomic_write_json, atomic_write_text, sanitize_filename
+from utils.atomic_io import atomic_write_json, atomic_write_text
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.citation_utils import clean_chunk_citations
 from utils.cli import build_parser, resolve_settings
+from utils.concept_ops import fuse_descriptions, generate_stable_slug
+from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.stats import print_link_distribution
+from utils.unionfind import UnionFind
 
 STAGE = "final-macro-scan"
 DEEP_STAGE = "final-deep-verify"
+
+_embed_cursor = 0
 
 def _get_next_embed_endpoint(servers: List[str]) -> str:
     global _embed_cursor
@@ -158,10 +164,10 @@ Examine the list and identify:
 2. "link_pairs": Pairs of IDs that are distinct topics or serialized parts, but MUST have direct reciprocal links:
    - Serialized volumes, versions, or numbered parts (e.g. Part 1 vs Part 2, Type I vs Type II).
    - Direct parent vs sub-category topics.
-3. "prune_ids": List of single IDs that are confirmed web scraping junk, site disclaimers, cookie/privacy notices, navigation menus, publishing metadata stubs, or completely non-substantive fragments.
+3. "prune_ids": Candidates that appear to be web scraping junk, cookie/privacy notices, navigation menus, or boilerplate. (Note: prune candidates are verified deeply before deletion; do not prune a concept merely because its title is unfamiliar).
 
 OUTPUT FORMAT:
-Output ONLY the <macro_candidates>...</macro_candidates> XML block with no introductory or concluding text:
+Output ONLY the <macro_candidates>...</macro_candidates> XML block:
 <macro_candidates>
   <merge_pairs>
     <pair><id_a>1</id_a><id_b>5</id_b></pair>
@@ -174,7 +180,6 @@ Output ONLY the <macro_candidates>...</macro_candidates> XML block with no intro
   </prune_ids>
 </macro_candidates>
 """
-
 
 class MacroScanResult(BaseModel):
     merge_pairs: List[Tuple[int, int]] = []
@@ -221,7 +226,6 @@ def parse_macro_scan(text: str) -> MacroScanResult:
 
     return res
 
-
 # ── XML System Prompt for Deep Verification (Domain-Agnostic) ────────────────
 
 SYSTEM_PROMPT_DEEP_VERIFY = """\
@@ -229,17 +233,18 @@ You are an expert knowledge consolidator performing final quality verification.
 You are given a candidate pair or cluster of concepts with their Canonical Titles, Briefs, and Top Entities.
 
 Determine the definitive action for this group:
-- MERGE: If both concepts represent the EXACT SAME real-world entity, tool, process, rule, or concept.
-- LINK: If concepts are functionally related or co-occur in the same system but are distinct concepts.
-- PRUNE: If one is uninformative web scraping boilerplate, navigational filler, or metadata junk.
+- MERGE: If both concepts represent the EXACT SAME single subject.
+- LINK: If concepts are functionally related, parent/child, version, or part/whole pairs.
+- PRUNE: If one is confirmed boilerplate, navigational junk, or scraping residue.
 - KEEP_SEPARATE: If they are distinct concepts with no direct relationship.
 
 OUTPUT FORMAT:
-Output ONLY the final <verdict>...</verdict> XML block with no introductory or concluding text:
+Output ONLY the final <verdict>...</verdict> XML block:
 <verdict>
-<action>MERGE</action>
-<primary_title>Exact Canonical Title</primary_title>
-<reason>Direct synonymous reference.</reason>
+<action>MERGE | LINK | PRUNE | KEEP_SEPARATE</action>
+<primary_title>Exact Canonical Title to keep for MERGE</primary_title>
+<prune_title>Exact Canonical Title of the junk concept for PRUNE</prune_title>
+<reason>One clear sentence explaining the verdict.</reason>
 </verdict>
 """
 
@@ -247,6 +252,7 @@ Output ONLY the final <verdict>...</verdict> XML block with no introductory or c
 class FinalActionVerdict(BaseModel):
     action: str = "KEEP_SEPARATE"
     primary_title: str = ""
+    prune_title: str = ""
     reason: str = ""
 
 
@@ -260,6 +266,9 @@ def parse_xml_final_action(text: str) -> FinalActionVerdict:
     canon_m = re.search(r"<primary_title>(.*?)</primary_title>", text, re.DOTALL | re.IGNORECASE)
     primary = canon_m.group(1).strip() if canon_m else ""
 
+    prune_m = re.search(r"<prune_title>(.*?)</prune_title>", text, re.DOTALL | re.IGNORECASE)
+    prune = prune_m.group(1).strip() if prune_m else ""
+
     reason_m = re.search(r"<reason>(.*?)</reason>", text, re.DOTALL | re.IGNORECASE)
     reason = reason_m.group(1).strip() if reason_m else ""
 
@@ -270,11 +279,12 @@ def parse_xml_final_action(text: str) -> FinalActionVerdict:
                 payload = json.loads(m.group(0))
                 action = payload.get("action", "KEEP_SEPARATE").upper()
                 primary = payload.get("primary_title", "")
+                prune = payload.get("prune_title", "")
                 reason = payload.get("reason", "")
         except Exception:
             pass
 
-    return FinalActionVerdict(action=action, primary_title=primary, reason=reason)
+    return FinalActionVerdict(action=action, primary_title=primary, prune_title=prune, reason=reason)
 
 
 # ── DisjointSet ───────────────────────────────────────────────────────────────
@@ -401,8 +411,16 @@ class FinalConsolidationPipeline:
                 union_len = len(ents_a | ents_b)
                 min_len = min(len(ents_a), len(ents_b))
 
-                jacc = inter_len / union_len if union_len > 0 else (rel.get("jaccard_similarity") or 0.0)
-                containment = inter_len / min_len if min_len > 0 else jacc
+                recomputed_jacc = inter_len / union_len if union_len > 0 else 0.0
+                # F-19: Keep Stage 8's score as a floor so title mentions remain top-ranked
+                jacc = max(recomputed_jacc, float(rel.get("jaccard_similarity") or 0.0))
+
+                # F-19: Containment only computed when both sets have >= 4 entities
+                if min_len >= 4:
+                    containment = inter_len / min_len
+                else:
+                    containment = jacc
+
                 rel["jaccard_similarity"] = round(float(jacc), 3)
                 rel["containment_score"] = round(float(containment), 3)
 
@@ -415,9 +433,12 @@ class FinalConsolidationPipeline:
 
                 rel["hybrid_score"] = round(float(hybrid), 3)
 
+            # F-19: Final ranking: (verified_by_llm, link_type_rank, hybrid_score)
+            type_rank = {"title_mention": 3, "llm_verified": 2, "entity_overlap": 1}
             c["outbound_relations"].sort(
                 key=lambda r: (
                     1 if r.get("verified_by_llm") else 0,
+                    type_rank.get(r.get("link_type", ""), 1),
                     r.get("hybrid_score", 0.0),
                     r.get("jaccard_similarity", 0.0),
                 ),
@@ -809,24 +830,51 @@ class FinalConsolidationPipeline:
                     decisions.append((pair, FinalActionVerdict(**deep_checkpoint[pk])))
 
         # 3. Sequential Deterministic Application: PRUNE -> MERGE -> LINK
-        pruned_titles: Set[str] = set(prune_candidate_titles)
+        pruned_titles: Set[str] = set()
+        pruned_concept_records: List[Dict[str, Any]] = []
         merge_uf = DisjointSet()
         for c in concepts:
             merge_uf.find(c["title"])
 
         additional_links: List[Tuple[str, str, str]] = []
 
-        # (A) Collect PRUNE from deep verification
+        # (A) Collect PRUNE from deep verification (F-21: explicitly identify target prune_title)
         for (c1, c2), verdict in decisions:
             if verdict.action == "PRUNE":
-                victim = c2["title"] if len(c2.get("description", "")) <= len(c1.get("description", "")) else c1["title"]
-                pruned_titles.add(victim)
+                victim = verdict.prune_title.strip()
+                if not victim:
+                    # Fallback to shorter description if not named
+                    victim = c2["title"] if len(c2.get("description", "")) <= len(c1.get("description", "")) else c1["title"]
+                
+                # Check description length: do not prune substantive concepts (>150 words) without confirmation
+                victim_c = concept_by_name.get(victim.lower())
+                if victim_c:
+                    victim_words = len(victim_c.get("description", "").split())
+                    if victim_words > 150:
+                        print(f"[PRUNE GUARD] Skipped pruning '{victim}': contains {victim_words} words of description.")
+                        continue
+                    pruned_titles.add(victim)
+                    pruned_concept_records.append(victim_c)
 
-        # (B) Collect MERGE
+        if pruned_concept_records:
+            pruned_file = self.wiki_path / "pruned_concepts.json"
+            atomic_write_json(pruned_file, {"pruned_concepts": pruned_concept_records})
+            print(f"Logged {len(pruned_concept_records)} pruned concept(s) to {pruned_file}")
+
+        # (B) Collect MERGE (F-22: Guard against chaining & oversized merges)
         verified_merges = 0
         for (c1, c2), verdict in decisions:
             if verdict.action == "MERGE" and c1["title"] not in pruned_titles and c2["title"] not in pruned_titles:
-                merge_uf.union(c1["title"], c2["title"])
+                t1, t2 = c1["title"], c2["title"]
+                len1 = len(c1.get("description", "").split())
+                len2 = len(c2.get("description", "").split())
+                combined_words = len1 + len2
+                # Reject merge if combined size > 1200 tokens (~900 words) unless one is a stub (<45 words)
+                if combined_words > 900 and min(len1, len2) > 45:
+                    print(f"[MERGE GUARD] Skipped merging large concepts '{t1}' ({len1}w) and '{t2}' ({len2}w). Converting to LINK.")
+                    additional_links.append((t1, t2, "Closely related counterpart in domain."))
+                    continue
+                merge_uf.union(t1, t2)
                 verified_merges += 1
 
         # (C) Collect LINK
@@ -1061,6 +1109,16 @@ class FinalConsolidationPipeline:
         concept_index_entries: List[Tuple[str, str, str]] = []
         entity_to_concepts: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
 
+        # Build reverse index for compact "Referenced by" section (Section 4.3)
+        referenced_by_map: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        for c in final_concepts:
+            src_t = c["title"]
+            src_s = c.get("slug") or generate_stable_slug(src_t)
+            for rel in c.get("outbound_relations", [])[:getattr(self.args, "max_primary_links", 15)]:
+                tgt_t = rel.get("target_concept", "")
+                if tgt_t:
+                    referenced_by_map[tgt_t.lower()].append((src_s, src_t))
+
         for c in tqdm(final_concepts, desc="Exporting Markdown Pages"):
             title = c["title"]
             brief = c.get("brief", "").strip()
@@ -1069,19 +1127,19 @@ class FinalConsolidationPipeline:
             aliases = [a.strip() for a in c.get("aliases", []) if a.strip()]
             entities = [e.strip() for e in c.get("entities", []) if e.strip()]
 
-            safe_name = sanitize_filename(title) or "unnamed_concept"
-            md_filename = f"{safe_name}.md"
+            slug = c.get("slug") or generate_stable_slug(title)
+            md_filename = f"{slug}.md"
             surviving_md_names.add(md_filename)
             md_path = self.md_dir / md_filename
 
             # Track for concept_index.md
-            concept_index_entries.append((safe_name, title, brief))
+            concept_index_entries.append((slug, title, brief))
 
             # Track for entity_index.md (both key entities and aliases)
             for ent in entities:
-                entity_to_concepts[ent].add((safe_name, title))
+                entity_to_concepts[ent].add((slug, title))
             for al in aliases:
-                entity_to_concepts[al].add((safe_name, title))
+                entity_to_concepts[al].add((slug, title))
 
             md_content = [f"# {title}\n"]
             if aliases:
@@ -1105,20 +1163,30 @@ class FinalConsolidationPipeline:
                 for rel in primary_relations:
                     tgt = rel.get("target_concept", "")
                     r_text = rel.get("relation", "").strip()
-                    tgt_slug = sanitize_filename(tgt) or "unnamed_concept"
+                    tgt_obj = concept_by_name.get(tgt.lower())
+                    tgt_slug = tgt_obj.get("slug") if tgt_obj else generate_stable_slug(tgt)
                     if r_text:
-                        # Clean format: - [[slug|Title]] (relation tag)
                         rel_desc = r_text.rstrip(".")
                         md_content.append(f"- [[{tgt_slug}|{tgt}]] ({rel_desc})")
                     else:
                         md_content.append(f"- [[{tgt_slug}|{tgt}]]")
 
+                # Section 4.3: Compact "Referenced by" list guaranteeing reachability from spoke to hub
+                refs = referenced_by_map.get(title.lower(), [])
+                if refs:
+                    md_content.append("\n## Referenced by\n")
+                    ref_links = [f"[[{r_slug}|{r_t}]]" for r_slug, r_t in refs]
+                    md_content.append(", ".join(ref_links))
+
                 if extended_relations:
                     md_content.append("\n## Mentions\n")
-                    compact_links = [
-                        f"[[{sanitize_filename(r.get('target_concept', ''))}|{r.get('target_concept', '')}]]"
-                        for r in extended_relations if r.get("target_concept")
-                    ]
+                    compact_links = []
+                    for r in extended_relations:
+                        tgt = r.get("target_concept", "")
+                        if tgt:
+                            tgt_obj = concept_by_name.get(tgt.lower())
+                            tgt_slug = tgt_obj.get("slug") if tgt_obj else generate_stable_slug(tgt)
+                            compact_links.append(f"[[{tgt_slug}|{tgt}]]")
                     md_content.append(", ".join(compact_links))
                 md_content.append("")
 

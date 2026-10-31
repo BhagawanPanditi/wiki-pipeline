@@ -22,32 +22,17 @@ from typing import Any, Dict, List, Set, Tuple
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from utils.atomic_io import atomic_write_json, sanitize_filename
+from utils.atomic_io import atomic_write_json
+from utils.checkpoint import load_json_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
+from utils.concept_ops import fuse_descriptions, generate_stable_slug, union_aliases
+from utils.lemma import canonical_title_key
+from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.stats import print_concept_word_distribution
+from utils.unionfind import UnionFind
 
 STAGE = "consolidate-global"
-
-def canonical_lemma_key(title: str) -> str:
-    """Normalizes titles to catch typographical plurals, punctuation differences, and spacing."""
-    t = re.sub(r'[-_]+', ' ', title.strip().lower())
-    t = re.sub(r'[^\w\s]', '', t)
-    tokens = t.split()
-    normalized = []
-    for tok in tokens:
-        if tok.endswith("ies") and len(tok) > 4:
-            tok = tok[:-3] + "y"
-        elif tok.endswith("es") and len(tok) > 4 and tok not in {"species", "series", "genes", "diabetes"}:
-            if tok.endswith("sses") or tok.endswith("shes") or tok.endswith("ches") or tok.endswith("xes") or tok.endswith("zes"):
-                tok = tok[:-2]
-            elif tok.endswith("ses") and not tok.endswith("sses"):
-                tok = tok[:-1]
-            else:
-                tok = tok[:-1]
-        elif tok.endswith("s") and len(tok) > 3 and not tok.endswith("ss") and tok not in {"this", "gas", "bias", "lens", "virus", "status", "mucus", "genus"}:
-            tok = tok[:-1]
-        normalized.append(tok)
-    return " ".join(normalized)
 
 def get_context_hint(desc: str, max_words: int = 40) -> str:
     """Extracts first ~40 words from description as rich context for LLM comparison."""
@@ -58,41 +43,6 @@ def get_context_hint(desc: str, max_words: int = 40) -> str:
     if len(words) > max_words:
         snippet += "..."
     return snippet
-
-class UnionFind:
-    """Disjoint Set with iterative path compression and cycle prevention."""
-    def __init__(self):
-        self.parent: Dict[str, str] = {}
-
-    def find(self, item: str) -> str:
-        key = canonical_lemma_key(item)
-        if not key:
-            return ""
-
-        curr = key
-        path = []
-        visited = set()
-
-        while curr in self.parent and self.parent[curr] != curr:
-            if curr in visited:
-                self.parent[curr] = curr
-                break
-            visited.add(curr)
-            path.append(curr)
-            curr = self.parent[curr]
-
-        root = curr
-        for node in path:
-            self.parent[node] = root
-        if root not in self.parent:
-            self.parent[root] = root
-        return root
-
-    def union(self, item1: str, item2: str):
-        root1 = self.find(item1)
-        root2 = self.find(item2)
-        if root1 and root2 and root1 != root2:
-            self.parent[root1] = root2
 
 # ── XML System Prompt for LLM Concept Merge Verification ──────────────────────
 
@@ -156,9 +106,9 @@ def parse_xml_merge_verdicts(text: str) -> List[MergeVerdict]:
         ))
 
     # JSON fallback
-    if not verdicts and "{" in clean_text:
+    if not verdicts and "{" in text:
         try:
-            m = re.search(r"\{.*\}", clean_text, re.DOTALL)
+            m = re.search(r"\{.*\}", text, re.DOTALL)
             if m:
                 payload = json.loads(m.group(0))
                 for item in payload.get("pair_verdicts", []):
@@ -172,56 +122,6 @@ def parse_xml_merge_verdicts(text: str) -> List[MergeVerdict]:
             pass
 
     return verdicts
-
-# ── Word Count Thin Concept Statistics Helper ─────────────────────────────────
-
-def print_concept_word_distribution(concepts: List[Dict[str, Any]], title_label: str = "GLOBAL CONCEPTS"):
-    """Compute and print word count distribution statistics for concept descriptions."""
-    if not concepts:
-        print(f"\n[{title_label}] No concepts found.")
-        return
-
-    word_counts = []
-    for c in concepts:
-        desc = c.get("description", "")
-        words = len(re.findall(r"\b\w+\b", desc))
-        word_counts.append(words)
-
-    bins = [
-        ("0 - 10 words", lambda w: 0 <= w <= 10),
-        ("11 - 20 words", lambda w: 11 <= w <= 20),
-        ("21 - 30 words", lambda w: 21 <= w <= 30),
-        ("31 - 50 words", lambda w: 31 <= w <= 50),
-        ("51 - 100 words", lambda w: 51 <= w <= 100),
-        ("101 - 200 words", lambda w: 101 <= w <= 200),
-        ("201+ words", lambda w: w > 200),
-    ]
-
-    bin_counts = {label: 0 for label, _ in bins}
-    for count in word_counts:
-        for label, fn in bins:
-            if fn(count):
-                bin_counts[label] += 1
-                break
-
-    total = len(word_counts)
-    avg_words = sum(word_counts) / total if total else 0
-    thin_30 = sum(1 for w in word_counts if w <= 30)
-
-    print(f"\n============================================================")
-    print(f"WORD-COUNT DISTRIBUTION [{title_label}] (Total Concepts: {total})")
-    print(f"Average Words per Concept: {avg_words:.1f} | Thin Concepts (<= 30 words): {thin_30} ({thin_30 / total * 100:.1f}%)")
-    print(f"------------------------------------------------------------")
-    print(f"{'Word Count Range':<20} {'Count':<10} {'Percentage':<12}")
-    print(f"------------------------------------------------------------")
-    for label, _ in bins:
-        count = bin_counts[label]
-        pct = (count / total * 100) if total else 0.0
-        bar = "█" * int(pct / 4)
-        print(f"{label:<20} {count:<10} {pct:>5.1f}%   {bar}")
-    print(f"============================================================\n")
-
-# ── Merge Verification Runner ─────────────────────────────────────────────────
 
 def make_candidate_pairs_prompt(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> str:
     blocks = []
@@ -245,32 +145,18 @@ def make_candidate_pairs_prompt(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]
 
 async def verify_merge_batch(client: Any, batch: List[Tuple[Dict[str, Any], Dict[str, Any]]], settings: Any, args: Any) -> List[MergeVerdict]:
     user_prompt = make_candidate_pairs_prompt(batch)
-
-    extra_body: Dict[str, Any] = {}
-    model_kwargs: Dict[str, Any] = {}
-    if getattr(args, "disable_thinking", False):
-        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-        model_kwargs = {
-            "temperature": 0.7,
-            "top_p": 0.80,
-            "presence_penalty": 1.5,
-            "extra_body": extra_body,
-        }
-    else:
-        model_kwargs = {
-            "temperature": 0.0,
-        }
-
-    response = await client.chat.completions.create(
+    raw_text = await call_llm(
+        client=client,
         model=settings.model_name,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT_MERGE_VERIFY},
             {"role": "user", "content": user_prompt}
         ],
-        max_tokens=settings.max_tokens or 8192,
-        **model_kwargs
+        max_tokens=settings.max_tokens or 2048,
+        args=args,
+        task="judge",
+        check_truncation=True,
     )
-    raw_text = response.choices[0].message.content or ""
     return parse_xml_merge_verdicts(raw_text)
 
 # ── Main Pipeline Execution ───────────────────────────────────────────────────
@@ -350,17 +236,14 @@ def global_consolidate(domain_dir: Path, args: Any):
     print(f"Identified {len(candidate_pairs)} candidate merge pair(s) (exact/lemma/alias) with contextual descriptions.")
 
     # 3. LLM Verification of Candidate Pairs
+    # F-09: Union-find is keyed strictly by exact normalized title (strip().casefold())
+    # Lemma keys are used purely to generate candidate pairs; union happens ONLY on LLM approval
     uf = UnionFind()
+    canonical_choices: Dict[str, str] = {}
     for c in all_raw_concepts:
         t = c.get("title", "").strip()
         if t:
-            uf.find(t)
-
-    # Identical strings always union immediately
-    for c in all_raw_concepts:
-        t = c.get("title", "").strip()
-        if t:
-            uf.union(t, t)
+            uf.add(t.casefold())
 
     approved_merges = 0
     if candidate_pairs and not getattr(args, "skip_alias_verification", False):
@@ -383,8 +266,14 @@ def global_consolidate(domain_dir: Path, args: Any):
                         if 0 <= idx < len(batch):
                             c1, c2 = batch[idx]
                             if verdict.is_same_entity:
-                                uf.union(c1["title"], c2["title"])
+                                t1, t2 = c1["title"].strip(), c2["title"].strip()
+                                root1, root2 = uf.find(t1.casefold()), uf.find(t2.casefold())
+                                uf.union(t1.casefold(), t2.casefold())
+                                new_root = uf.find(t1.casefold())
                                 approved_merges += 1
+                                # F-10: Record LLM's chosen_canonical_title
+                                if verdict.chosen_canonical_title.strip():
+                                    canonical_choices[new_root] = verdict.chosen_canonical_title.strip()
 
             async with pool:
                 await pool.map(
@@ -408,56 +297,49 @@ def global_consolidate(domain_dir: Path, args: Any):
         title = c.get("title", "").strip()
         if not title:
             continue
-        final_groups.setdefault(uf.find(title), []).append(c)
+        root = uf.find(title.casefold())
+        final_groups.setdefault(root, []).append(c)
 
     global_concepts = []
+    used_slugs: Set[str] = set()
+
     for root, concepts in tqdm(final_groups.items(), desc="Fusing global concept attributes"):
-        title_counter = Counter(c.get("title", "").strip() for c in concepts)
-        chosen_title = title_counter.most_common(1)[0][0]
+        # F-10: Prefer LLM chosen canonical title > most frequent title > shortest title
+        if root in canonical_choices:
+            chosen_title = canonical_choices[root]
+        else:
+            title_counter = Counter(c.get("title", "").strip() for c in concepts)
+            # Sort by frequency descending, then length ascending
+            sorted_candidates = sorted(title_counter.items(), key=lambda kv: (-kv[1], len(kv[0])))
+            chosen_title = sorted_candidates[0][0]
+
+        # F-12: Assign collision-free stable slug once
+        slug = generate_stable_slug(chosen_title, used_slugs)
 
         merged_aliases_set = set()
         global_source_chunks = set()
-        seen_sentences = set()
-        description_sentences = []
 
         for c in concepts:
             merged_aliases_set.add(c.get("title", "").strip())
             for a in c.get("aliases", []):
                 if a.strip():
                     merged_aliases_set.add(a.strip())
+            for s in c.get("subtopics", []):
+                if s.strip():
+                    merged_aliases_set.add(s.strip())
 
             for sc in c.get("source_chunks", []):
                 if sc.strip():
                     global_source_chunks.add(sc.strip())
 
-        desc_by_chunks: Dict[Tuple[str, ...], List[str]] = {}
-        for c in concepts:
-            desc = c.get("description", "").strip()
-            chunks_key = tuple(sorted(c.get("source_chunks", [])))
-            if desc:
-                for sent in re.split(r'(?<=[.!?])\s+', desc):
-                    clean_sent = sent.strip()
-                    if clean_sent and clean_sent.lower() not in seen_sentences:
-                        seen_sentences.add(clean_sent.lower())
-                        desc_by_chunks.setdefault(chunks_key, []).append(clean_sent)
-                        description_sentences.append(clean_sent)
-
-        cited_paragraphs = []
-        for chunks_tuple, sents in desc_by_chunks.items():
-            if not sents:
-                continue
-            para_text = " ".join(sents)
-            if chunks_tuple:
-                cites = " ".join(f"[{ch}]" for ch in chunks_tuple)
-                para_text = f"{para_text} {cites}"
-            cited_paragraphs.append(para_text)
-
-        final_aliases = sorted([a for a in merged_aliases_set if a.lower() != chosen_title.lower()])
+        fused_desc = fuse_descriptions([c.get("description", "") for c in concepts])
+        final_aliases = sorted([a for a in merged_aliases_set if a.casefold() != chosen_title.casefold()])
 
         global_concepts.append({
             "title": chosen_title,
+            "slug": slug,
             "aliases": final_aliases,
-            "description": "\n\n".join(cited_paragraphs) if cited_paragraphs else " ".join(description_sentences),
+            "description": fused_desc,
             "source_chunks": sorted(list(global_source_chunks)),
         })
 
@@ -477,16 +359,24 @@ def global_consolidate(domain_dir: Path, args: Any):
     print(f"Saving global_concepts.json to {domain_dir}...")
     atomic_write_json(domain_dir / "global_concepts.json", {"concepts": global_concepts})
 
-    print("Saving individual concept files to concepts/...")
+    # F-11 & F-12: Write individual concept files using deterministic, collision-free slugs
+    # Clean previous files to prevent stale _1/_2 duplicates on re-runs
+    print("Writing concepts to concepts/ by unique slug...")
+    for old_f in concepts_dir.glob("*.json"):
+        try:
+            old_f.unlink()
+        except OSError:
+            pass
+
     for gc in global_concepts:
-        safe_name = sanitize_filename(gc["title"]) or "unnamed_concept"
-        file_path = concepts_dir / f"{safe_name}.json"
-        counter = 1
-        while file_path.exists():
-            file_path = concepts_dir / f"{safe_name}_{counter}.json"
-            counter += 1
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(gc, f, indent=2)
+        slug = gc.get("slug")
+        if not slug:
+            slug = generate_stable_slug(gc["title"], used_slugs)
+            gc["slug"] = slug
+        file_path = concepts_dir / f"{slug}.json"
+        atomic_write_json(file_path, gc)
+
+    assert len(set(c["slug"] for c in global_concepts)) == len(global_concepts), "Slug collision detected!"
 
     # Print final word count distribution across global concepts
     print_concept_word_distribution(global_concepts, title_label="STAGE 6: AFTER GLOBAL CONSOLIDATION")

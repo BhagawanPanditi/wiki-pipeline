@@ -22,9 +22,13 @@ from tqdm import tqdm
 from utils.atomic_io import atomic_write_text
 from utils.checkpoint import load_bool_log, save_log_async
 from utils.cli import build_parser, resolve_settings
+from utils.concept_ops import fuse_descriptions, union_aliases
 from utils.corpus import chunking_enabled
 from utils.errors import StageBudget
+from utils.lemma import canonical_title_key
+from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
+from utils.unionfind import UnionFind
 
 STAGE = "consolidate-documents"
 MAX_MERGE_BATCH_CHARS = 30000
@@ -54,19 +58,12 @@ Identify groups of concepts that refer to the exact same core concept/subject wi
 
 CRITICAL RULES:
 1. MERGE CRITERIA: Merge concepts ONLY if they refer to the exact same canonical subject, entity, tool, process, acronym, or topic.
-2. DO NOT MERGE DISTINCT CONCEPTS: Do NOT merge distinct sub-components, related but separate concepts, or parent/child hierarchy terms.
+2. DO NOT MERGE DISTINCT CONCEPTS: Do NOT merge distinct sub-components, related but separate concepts, or parent/child hierarchy terms. If two entries differ only by a qualifier that changes meaning (Type I / Type II, Part 1 / Part 2, version numbers, before/after), do NOT merge them.
 3. PRIMARY TITLE SELECTION: Pick the most standard, canonical, explicit title as `primary_title`.
-4. SCOPE: ONLY include titles that exist in the provided candidate concepts list.
-
-THINKING PROCESS (SANDBOXED):
-- If you need to reason or compare concepts, you MUST do so strictly inside `<think>...</think>` tags at the very start of your response.
-- Once `</think>` is closed, output ONLY the final `<merge_clusters>...</merge_clusters>` XML block.
-- Absolutely NO commentary or notes outside `<think>...</think>` or outside `<merge_clusters>` tags.
+4. SCOPE: Return only clusters of two or more titles. Titles in `<merged_titles>` must be copied EXACTLY as written in the candidate list.
 
 OUTPUT FORMAT:
-<think>
-[Consolidation analysis and deduplication plan]
-</think>
+Output ONLY the <merge_clusters>...</merge_clusters> XML block:
 <merge_clusters>
 <cluster>
 <primary_title>Exact Chosen Canonical Title</primary_title>
@@ -174,24 +171,33 @@ def print_concept_word_distribution(concepts: List[Dict[str, Any]], title_label:
 
 # ── Batching Utilities ────────────────────────────────────────────────────────
 
-def make_merge_batches(concepts: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-    """Group concept title-stubs into token-bounded batches for LLM evaluation."""
-    ordered = sorted(concepts, key=lambda c: str(c.get("title") or "").casefold())
+def make_merge_batches(concepts: List[Dict[str, Any]], overlap: int = 10) -> List[List[Dict[str, Any]]]:
+    """Group concept title-stubs into token-bounded batches with overlap, sorted by lemma key."""
+    # F-13: Sort by lemma key then title so near-duplicates land in the same or adjacent batches
+    ordered = sorted(concepts, key=lambda c: (canonical_title_key(str(c.get("title") or "")), str(c.get("title") or "").casefold()))
     batches: List[List[Dict[str, Any]]] = []
-    batch: List[Dict[str, Any]] = []
-    size = 2
-    for concept in ordered:
-        item_size = len(json.dumps(concept, ensure_ascii=False, separators=(",", ":"))) + 1
-        if item_size + 2 > MAX_MERGE_BATCH_CHARS:
-            continue
-        if batch and (len(batch) >= MAX_MERGE_BATCH_CONCEPTS or size + item_size > MAX_MERGE_BATCH_CHARS):
-            batches.append(batch)
-            batch = []
-            size = 2
-        batch.append(concept)
-        size += item_size
-    if batch:
+    
+    i = 0
+    while i < len(ordered):
+        batch: List[Dict[str, Any]] = []
+        size = 2
+        j = i
+        while j < len(ordered):
+            concept = ordered[j]
+            item_size = len(json.dumps(concept, ensure_ascii=False, separators=(",", ":"))) + 1
+            if batch and (len(batch) >= MAX_MERGE_BATCH_CONCEPTS or size + item_size > MAX_MERGE_BATCH_CHARS):
+                break
+            batch.append(concept)
+            size += item_size
+            j += 1
+        
         batches.append(batch)
+        if j >= len(ordered):
+            break
+        # Advance with overlap so boundary items are compared together
+        step = max(1, len(batch) - overlap)
+        i += step
+
     return batches
 
 # ── Pipeline Implementation ──────────────────────────────────────────────────
@@ -269,7 +275,8 @@ class WikiDocumentConsolidatorPipeline:
             })
 
         batches = make_merge_batches(lightweight_concepts)
-        semaphore = asyncio.Semaphore(16)
+        # F-13: Limit concurrency to 1 within a document so pool concurrency limits are respected
+        semaphore = asyncio.Semaphore(1)
         batch_pbar = None
         if len(batches) > 1:
             batch_pbar = tqdm(total=len(batches), desc=f"  [doc {doc_id[:12]}] {len(raw_concepts)} concepts", leave=False)
@@ -298,33 +305,20 @@ class WikiDocumentConsolidatorPipeline:
                     f"{batch_text}\n"
                 )
 
-                extra_body: Dict[str, Any] = {}
-                model_kwargs: Dict[str, Any] = {}
-                if getattr(self.args, "disable_thinking", False):
-                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-                    model_kwargs = {
-                        "temperature": 0.7,
-                        "top_p": 0.80,
-                        "presence_penalty": 1.5,
-                        "extra_body": extra_body,
-                    }
-                else:
-                    model_kwargs = {
-                        "temperature": 0.1,
-                    }
-
                 try:
-                    response = await client.chat.completions.create(
+                    raw_text = await call_llm(
+                        client=client,
                         model=self.settings.model_name,
                         messages=[
                             {"role": "system", "content": SYSTEM_PROMPT_CONSOLIDATE},
                             {"role": "user", "content": user_prompt}
                         ],
-                        max_tokens=self.settings.max_tokens or 16000,
-                        **model_kwargs
+                        max_tokens=self.settings.max_tokens or 4096,
+                        args=self.args,
+                        cfg=getattr(self, "cfg", None),
+                        task="judge",
+                        check_truncation=True,
                     )
-                    choice = response.choices[0]
-                    raw_text = choice.message.content or ""
                     clusters = parse_xml_merge_clusters(raw_text)
                     if batch_pbar is not None:
                         batch_pbar.update(1)
@@ -352,56 +346,69 @@ class WikiDocumentConsolidatorPipeline:
         )
 
     def execute_programmatic_merge(self, raw_concepts: List[Dict[str, Any]], delta: DocumentConsolidationSchema) -> List[Dict[str, Any]]:
-        """Group identical concepts and fuse their aliases, descriptions, and chunks."""
-        title_map: Dict[str, str] = {}
+        """Group identical concepts and fuse their aliases, descriptions, and chunks using UnionFind."""
+        # F-13: Resolve conflicting or overlapping clusters via UnionFind instead of dict overwrites
+        uf = UnionFind()
+        primary_titles: Dict[str, str] = {}
+
         for cluster in delta.merge_clusters:
             primary = cluster.primary_title.strip()
-            title_map[primary.lower()] = primary
-            for alt in cluster.merged_titles:
-                title_map[alt.strip().lower()] = primary
+            if not primary:
+                continue
+            norm_primary = primary.casefold()
+            uf.add(norm_primary)
+            primary_titles.setdefault(norm_primary, primary)
 
+            for alt in cluster.merged_titles:
+                alt_clean = alt.strip()
+                if alt_clean:
+                    norm_alt = alt_clean.casefold()
+                    uf.add(norm_alt)
+                    uf.union(norm_primary, norm_alt)
+
+        # Map each raw concept to its cluster root
         grouped_concepts: Dict[str, List[Dict[str, Any]]] = {}
         for c in raw_concepts:
             raw_title = c.get("title", "").strip()
             if not raw_title:
                 continue
-            primary_title = title_map.get(raw_title.lower(), raw_title)
-            grouped_concepts.setdefault(primary_title, []).append(c)
+            norm_title = raw_title.casefold()
+            root = uf.find(norm_title)
+            grouped_concepts.setdefault(root, []).append(c)
 
         consolidated_concepts = []
-        for primary_title, concept_group in grouped_concepts.items():
-            aliases_set = set()
+        for root, concept_group in grouped_concepts.items():
+            # Pick canonical display title: LLM primary title > most frequent title
+            candidate_primaries = [primary_titles[item] for item in uf.get_groups().get(root, []) if item in primary_titles]
+            if candidate_primaries:
+                chosen_title = candidate_primaries[0]
+            else:
+                chosen_title = concept_group[0].get("title", "").strip()
+
+            aliases_list = []
             source_chunks_set = set()
 
             for c in concept_group:
                 for alias in c.get("aliases", []):
-                    if alias.strip().lower() != primary_title.lower():
-                        aliases_set.add(alias.strip())
+                    if alias.strip().casefold() != chosen_title.casefold():
+                        aliases_list.append([alias.strip()])
+                for sub in c.get("subtopics", []):
+                    if sub.strip().casefold() != chosen_title.casefold():
+                        aliases_list.append([sub.strip()])
                 raw_title = c.get("title", "").strip()
-                if raw_title.lower() != primary_title.lower():
-                    aliases_set.add(raw_title)
+                if raw_title.casefold() != chosen_title.casefold():
+                    aliases_list.append([raw_title])
 
                 src_chunk = c.get("source_chunk")
                 if src_chunk:
                     source_chunks_set.add(src_chunk)
 
-            description_sentences = []
-            seen_sentences = set()
-            for c in concept_group:
-                desc = c.get("description", "").strip()
-                if desc:
-                    for s in re.split(r'(?<=[.!?])\s+', desc):
-                        s_clean = s.strip()
-                        s_key = s_clean.lower()
-                        if s_clean and s_key not in seen_sentences:
-                            seen_sentences.add(s_key)
-                            description_sentences.append(s_clean)
-            merged_description = " ".join(description_sentences)
+            fused_desc = fuse_descriptions([c.get("description", "") for c in concept_group])
 
             consolidated_concepts.append({
-                "title": primary_title,
-                "aliases": sorted(list(aliases_set)),
-                "description": merged_description,
+                "title": chosen_title,
+                "aliases": union_aliases(aliases_list),
+                "description": fused_desc,
                 "source_chunks": sorted(list(source_chunks_set)),
             })
 
