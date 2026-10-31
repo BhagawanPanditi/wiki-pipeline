@@ -1,9 +1,7 @@
-"""Completion checkpoints shared by the extraction-style stages.
-
-Pass 1, verification, Pass 2 and document consolidation each carried their own
-copies of ``_load_log`` / ``_save_log_sync`` / ``save_log_async``. The copies
-were functionally identical, so they collapse into one implementation here
-plus a small ``CheckpointLog`` helper that owns the flush cadence.
+"""Checkpoint & State Logging Utilities.
+--------------------------------------
+Manages durable JSON completion logs and CheckpointLog state trackers for pipeline
+stages, ensuring completed units are safely skipped on resume.
 """
 
 import asyncio

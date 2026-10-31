@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-import asyncio
+"""Stage 1: Concept Extraction (Pass 1).
+-------------------------------------
+Extracts substantive, canonical concepts from raw document chunks using direct,
+domain-agnostic XML extraction without thinking-mode overhead. Retains concrete
+names, metrics, facts, and attributes while capturing narrow sub-topics in aliases.
+
+Usage:
+    python3 extract_concepts.py --input_path /path/to/domain.jsonl --wiki_path /path/to/wiki
+"""
+
 import json
 import re
 from pathlib import Path
@@ -33,7 +42,7 @@ class ChunkExtractionSchema(BaseModel):
 # ── System Prompt (XML Format) ────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an expert knowledge extractor building an authoritative Knowledge Wiki from raw documents.
+You are an expert knowledge extractor building a Knowledge Wiki from raw documents.
 Your goal is to transform the CURRENT CHUNK into solid, fact-dense concepts that serve as a complete, superior replacement for the raw text. Once extracted, a reader should never need to look at the original chunk.
 
 INPUT & NOISE CLEANING:
@@ -45,38 +54,27 @@ CONTEXT BOUNDARIES:
 - Never invent facts or add outside knowledge.
 
 TITLES AND ALIASES:
-- Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the name any other chunk would use for the same thing, so concepts merge cleanly across chunks.
-- Aliases: Semicolon-separated list of acronyms or alternate names that explicitly appear in the text. If none, leave empty.
+- Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the canonical name any other document would use for the same subject, ensuring concepts merge cleanly across sources.
+- Aliases: Semicolon-separated list of acronyms, alternate designations, or specific minor sub-topics/parameters absorbed into this concept. If none, leave empty.
 
-SOLID CONCEPTS ONLY (NO FRAGMENTATION):
-- Extract only major, solid, well-developed subjects: a core idea, system, entity, method, mechanism, theory, phenomenon, or process.
-- Strictly avoid creating thin, 1-2 sentence stub concepts for minor parameters, properties, sub-steps, or variants. Every minor detail, metric, and property MUST be absorbed directly into the comprehensive description of its primary parent concept.
-- Do not extract meta-labels ("Introduction", "Chapter 1", "Summary") or whole-chunk overviews.
+WHAT IS A CONCEPT (UNIVERSAL DEFINITION):
+A concept is a canonical, self-contained, semantically coherent unit of knowledge that captures a meaningful subject or body of information, along with its relevant facts, properties, and relationships. It is independent of document boundaries, can be consolidated and enriched across multiple sources, and is not merely a keyword or arbitrary text chunk.
+- Scope: Concepts may represent any meaningful subject across domains (e.g., architectures, software libraries, algorithms, financial entities, scientific phenomena, operational procedures, policies, historical events, or core definitions).
+- Granularity & Standalone Subtopics: Any distinct subtopic or specialized theme that contains substantial information (typically 300 to 600+ words/tokens with its own details, properties, or comparisons) SHOULD be extracted as an independent, standalone concept.
+- Avoid Trivial Fragmentation: Do not create thin 1-2 sentence stub concepts for trivial sub-steps or single isolated numbers; absorb those minor facts directly into the description of their parent concept and record their specific names in <aliases>.
+- Do not extract meta-labels ("Introduction", "Chapter 1", "Overview") or whole-chunk summaries.
 
-SQUEEZE THE CHUNK DRY (ZERO FACT LOSS):
-- Every substantive fact, number, parameter, metric, condition, finding, and mechanism in the chunk MUST be captured inside one of the concept descriptions. Leave zero informational content unabsorbed.
-- Descriptions must be comprehensive, dense paragraphs (typically 100 to 250+ words) that explicitly name the subject and stand entirely on their own.
-
-FACTUAL RETENTION MANDATE:
-Descriptions must preserve exact concrete details rather than high-level generalizations:
-1. QUANTITATIVE FACTS & BOUNDS: Exact numbers, statistics, ranges, thresholds, formulas, and measurements.
-2. FORMAL NAMES & TERMS: Specific named entities, tools, techniques, classifications, benchmarks, or formal designations.
-3. CONDITIONS & CONSTRAINTS: Specific operational boundaries, environmental constraints, procedural steps, and dates/years.
-4. ATTRIBUTIONS: Specific author, study, or expert attributions tied to explicit claims.
-
-THINKING PROCESS (SANDBOXED):
-- If you need to analyze the text, plan concept boundaries, or deliberate on facts, you MUST do so strictly inside `<think>...</think>` tags at the very beginning of your response.
-- Once `</think>` is closed, output ONLY the final `<concept>...</concept>` XML blocks.
-- Absolutely NO thinking, reasoning, notes, or scratchpads outside `<think>...</think>` or inside `<concept>` tags.
+COMPREHENSIVE INFORMATION RETENTION (ZERO FACT LOSS):
+- Capture all substantive information present in the chunk inside the appropriate concept descriptions. Leave no meaningful informational content unabsorbed.
+- Descriptions must preserve exact concrete details rather than high-level generalizations: retain specific names, identifiers, terms, numbers, metrics, operational conditions, rules, relationships, chronology, and attributions.
+- Descriptions must be dense, self-contained paragraphs that explicitly name the subject and stand entirely on their own.
 
 OUTPUT FORMAT:
-<think>
-[Optional analysis and concept boundary planning]
-</think>
+Output ONLY completed <concept>...</concept> XML blocks with no introductory or concluding text:
 <concept>
 <title>Exact Canonical Title</title>
 <aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
-<description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all raw quantitative metrics, parameter bounds, specific findings, and detailed statements from this chunk.</description>
+<description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all substantive facts, properties, and specific details from this chunk.</description>
 </concept>
 
 If no substantive concepts exist in the chunk, output nothing.
@@ -85,16 +83,11 @@ If no substantive concepts exist in the chunk, output nothing.
 # ── XML Parsing Helper ────────────────────────────────────────────────────────
 
 def parse_xml_concepts(text: str) -> List[Concept]:
-    """Parse all completed <concept>...</concept> blocks from raw LLM output, resilient to CoT/thinking artifacts."""
+    """Parse all completed <concept>...</concept> blocks directly from raw LLM output."""
     if not text:
         return []
 
-    # 1. Strip thinking tags (closed or truncated) emitted by reasoning models
-    text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<thought>.*?(?:</thought>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-
     concepts = []
-    # 2. Match non-nested <concept> blocks (ensures any outer scratchpad or drafting <concept> is skipped)
     blocks = re.findall(r"<concept>((?:(?!<concept>).)*?)</concept>", text, re.DOTALL | re.IGNORECASE)
     for block in blocks:
         title_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
@@ -239,58 +232,20 @@ class WikiExtractorPipeline:
 
         tokenizer = None
         if chunking:
+            print(f"Loading instant offline tiktoken (cl100k_base) for chunking ({chunk_size} tokens, {overlap} overlap)...")
+            import tiktoken
             tok_arg = getattr(self.args, "tokenizer", None)
-            if tok_arg in ("tiktoken", "cl100k_base", "o200k_base"):
-                enc_name = "o200k_base" if tok_arg == "o200k_base" else "cl100k_base"
-                print(f"Using instant offline tiktoken ({enc_name})...")
-                import tiktoken
-                enc = tiktoken.get_encoding(enc_name)
-                class TiktokenWrapper:
-                    def encode(self, text: str) -> list:
-                        return enc.encode(text, disallowed_special=())
-                    def decode(self, tokens: list, skip_special_tokens: bool = True) -> str:
-                        return enc.decode(tokens)
-                tokenizer = TiktokenWrapper()
-            else:
-                from transformers import AutoTokenizer
-                print(f"Loading tokenizer for chunking ({chunk_size} tokens, {overlap} overlap)...")
-                tok_candidates = []
-                if tok_arg:
-                    tok_candidates.append(tok_arg)
-                tok_candidates.extend([
-                    self.settings.model_name,
-                    "Qwen/Qwen2.5-32B-Instruct",
-                    "Qwen/Qwen2.5-14B-Instruct",
-                    "Qwen/Qwen2.5-7B-Instruct",
-                    "Qwen/Qwen2-7B-Instruct",
-                ])
+            enc_name = "o200k_base" if tok_arg == "o200k_base" else "cl100k_base"
+            enc = tiktoken.get_encoding(enc_name)
 
-                # Try local cache first for all candidates to avoid network hangs
-                for name in tok_candidates:
-                    try:
-                        tokenizer = AutoTokenizer.from_pretrained(
-                            name, trust_remote_code=True, local_files_only=True)
-                        print(f"Successfully loaded local tokenizer: {name}")
-                        break
-                    except Exception:
-                        continue
+            class TiktokenWrapper:
+                def encode(self, text: str) -> list:
+                    return enc.encode(text, disallowed_special=())
 
-                # Fallback to tiktoken if no local transformers model found
-                if tokenizer is None:
-                    try:
-                        print("Local HuggingFace tokenizer not found; falling back to instant tiktoken (cl100k_base)...")
-                        import tiktoken
-                        enc = tiktoken.get_encoding("cl100k_base")
-                        class TiktokenWrapper:
-                            def encode(self, text: str) -> list:
-                                return enc.encode(text, disallowed_special=())
-                            def decode(self, tokens: list, skip_special_tokens: bool = True) -> str:
-                                return enc.decode(tokens)
-                        tokenizer = TiktokenWrapper()
-                    except ImportError:
-                        primary = tok_candidates[0]
-                        print(f"Downloading/loading tokenizer: {primary}...")
-                        tokenizer = AutoTokenizer.from_pretrained(primary, trust_remote_code=True)
+                def decode(self, tokens: list, skip_special_tokens: bool = True) -> str:
+                    return enc.decode(tokens)
+
+            tokenizer = TiktokenWrapper()
         else:
             print("Chunking disabled: treating each document as a single unit.")
 
@@ -359,73 +314,7 @@ Extract the substantive concepts from CURRENT CHUNK now. If you need to think, p
 
         choice = response.choices[0]
         raw_text = choice.message.content or ""
-        finish_reason = choice.finish_reason
-
         completed_concepts = parse_xml_concepts(raw_text)
-
-        # ── Truncation Handling via Continuation ──────────────────────────────
-        if finish_reason == "length":
-            # Detect unclosed concept block
-            last_open_idx = raw_text.rfind("<concept>")
-            last_close_idx = raw_text.rfind("</concept>")
-            incomplete_title = None
-
-            if last_open_idx > last_close_idx:
-                unclosed_block = raw_text[last_open_idx:]
-                title_m = re.search(r"<title>(.*?)(?:</title>|\n|$)", unclosed_block, re.DOTALL | re.IGNORECASE)
-                if title_m and title_m.group(1).strip():
-                    incomplete_title = title_m.group(1).strip()
-
-            already_titles = [c.title for c in completed_concepts]
-            cut_off_desc = f"'{incomplete_title}'" if incomplete_title else "the last incomplete concept"
-
-            continuation_prompt = f"""\
-You were extracting concepts from the CURRENT CHUNK, but hit the token limit.
-
-ALREADY COMPLETED CONCEPTS:
-{', '.join(already_titles) if already_titles else 'None'}
-
-TASK:
-Continue extracting for the rest of the CURRENT CHUNK.
-Start by providing the complete <concept> block for {cut_off_desc}, then continue extracting any remaining concepts from the CURRENT CHUNK.
-Output in the exact same <concept>...</concept> XML format. If you need to think, do so strictly inside <think>...</think>.
-"""
-            # Valid prefix of prior response up to last completed concept
-            assistant_content = raw_text[:last_close_idx + len("</concept>")] if last_close_idx != -1 else raw_text
-
-            try:
-                cont_response = await client.chat.completions.create(
-                    model=self.settings.model_name,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                        {"role": "assistant", "content": assistant_content},
-                        {"role": "user", "content": continuation_prompt}
-                    ],
-                    temperature=temperature,
-                    top_p=top_p,
-                    presence_penalty=presence_penalty,
-                    max_tokens=self.settings.max_tokens,
-                    extra_body=extra_body,
-                )
-                cont_text = cont_response.choices[0].message.content or ""
-                continued_concepts = parse_xml_concepts(cont_text)
-
-                # Merge and deduplicate by canonical title
-                merged_concepts = list(completed_concepts)
-                seen_titles = {c.title.lower() for c in completed_concepts}
-                for cc in continued_concepts:
-                    if cc.title.lower() not in seen_titles:
-                        seen_titles.add(cc.title.lower())
-                        merged_concepts.append(cc)
-
-                return ChunkExtractionSchema(concepts=merged_concepts)
-            except Exception:
-                # If continuation fails, return the completed concepts salvaged so far
-                if completed_concepts:
-                    return ChunkExtractionSchema(concepts=completed_concepts)
-                raise PermanentFailure(f"{key}: response truncated and continuation failed.")
-
         return ChunkExtractionSchema(concepts=completed_concepts)
 
     async def persist_extraction(self, chunk_data: Dict[str, Any], extracted: ChunkExtractionSchema) -> None:

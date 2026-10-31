@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
+"""Stage 6: Global Cross-Document Concept Consolidation.
+------------------------------------------------------
+Unifies duplicate and variant concepts across the entire corpus:
+1. Fast indexing finds exact title matches, lemma variants, and title-to-alias pairs.
+2. Parallel LLM calls verify whether candidate pairs denote the exact same subject.
+3. Disjoint Set (Union-Find) fuses confirmed merges, combining titles, aliases,
+   descriptions, and document citations into global_concepts.json.
+
+Usage:
+    python3 consolidate_global.py --wiki_path /path/to/wiki
 """
-Global Concept Consolidation Pass (LLM-Verified Exact, Lemma & Alias Merging)
-------------------------------------------------------------------------------
-Fuses concepts across all documents in the corpus using LLM verification:
-- Candidate pairs with identical titles, lemma plurals, punctuation differences,
-  or title-to-alias alignments are identified.
-- Context provided to LLM: Title, Aliases, and first ~40-50 words of Description.
-- LLM confirms whether both concepts refer to the exact same canonical entity.
-- Disjoint Set / UnionFind applies confirmed merges.
-- Exports global_concepts.json and concepts/<title>.json with provenance citations.
-- Outputs thin concept statistics (word-count distribution) before and after.
-"""
+
 
 import asyncio
 import json
@@ -27,36 +27,6 @@ from utils.cli import build_parser, resolve_settings
 from utils.llm_pool import pool_for_stage
 
 STAGE = "consolidate-global"
-
-STOP_WORDS = {
-    'a', 'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', 'aren',
-    "aren't", 'as', 'at', 'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but',
-    'by', 'can', 'couldn', "couldn't", 'd', 'did', 'didn', "didn't", 'do', 'does', 'doesn', "doesn't",
-    'doing', 'don', "don't", 'down', 'during', 'each', 'few', 'for', 'from', 'further', 'had', 'hadn',
-    "hadn't", 'has', 'hasn', "hasn't", 'have', 'haven', "haven't", 'having', 'he', 'her', 'here',
-    'hers', 'herself', 'him', 'himself', 'his', 'how', 'i', 'if', 'in', 'into', 'is', 'isn', "isn't",
-    'it', "it's", 'its', 'itself', 'just', 'll', 'm', 'ma', 'me', 'mightn', "mightn't", 'more', 'most',
-    'mustn', "mustn't", 'my', 'myself', 'needn', "needn't", 'no', 'nor', 'not', 'now', 'o', 'of', 'off',
-    'on', 'once', 'only', 'or', 'other', 'our', 'ours', 'ourselves', 'out', 'over', 'own', 're', 's',
-    'same', 'shan', "shan't", 'she', "she's", 'should', "should've", 'shouldn', "shouldn't", 'so',
-    'some', 'such', 't', 'than', 'that', "that'll", 'the', 'their', 'theirs', 'them', 'themselves',
-    'then', 'there', 'these', 'they', 'this', 'those', 'through', 'to', 'too', 'under', 'until', 'up',
-    've', 'very', 'was', 'wasn', "wasn't", 'we', 'were', 'weren', "weren't", 'what', 'when', 'where',
-    'which', 'while', 'who', 'whom', 'why', 'will', 'with', 'won', "won't", 'wouldn', "wouldn't", 'y',
-    'you', "you'd", "you'll", "you're", "you've", 'your', 'yours', 'yourself', 'yourselves'
-}
-
-STRUCTURAL_BOILERPLATE_REGEXES = [
-    r'^(table of contents|contents|outline of .*|overview of .*)$',
-    r'^(references|see also|further reading|bibliography|notes|external links)$',
-    r'^(history of .*|introduction to .*|timeline of .*)$',
-    r'^(glossary of .*|index of .*|list of .*)$',
-    r'^(main article|primary topic|disambiguation page)$',
-]
-
-def is_boilerplate_concept(title: str) -> bool:
-    t = title.strip().lower()
-    return any(re.match(pattern, t) for pattern in STRUCTURAL_BOILERPLATE_REGEXES)
 
 def canonical_lemma_key(title: str) -> str:
     """Normalizes titles to catch typographical plurals, punctuation differences, and spacing."""
@@ -127,26 +97,19 @@ class UnionFind:
 # ── XML System Prompt for LLM Concept Merge Verification ──────────────────────
 
 SYSTEM_PROMPT_MERGE_VERIFY = """\
-You are an expert technical knowledge graph consolidator evaluating candidate concepts across documents.
+You are an expert knowledge consolidator evaluating candidate concepts across documents.
 You are given candidate pairs of concepts that share identical titles, plural/spelling variants, or title-to-alias alignments.
 Each concept is presented with its Canonical Title, Aliases, and a ~40-word Context Snippet from its description.
 
-Your task is to determine whether both concepts refer to the EXACT SAME real-world entity, process, tool, gene, condition, or technical subject.
+Your task is to determine whether both concepts refer to the EXACT SAME subject, entity, tool, process, condition, or topic.
 
 CRITICAL RULES:
-1. MERGE (is_same_entity: true): Only if both concepts denote the identical subject (e.g., 'Amyotrophic Lateral Sclerosis' and 'Lou Gehrig's Disease', or 'Photosynthesis' and 'Photosynthetic Process').
-2. KEEP SEPARATE (is_same_entity: false): Do NOT merge if one is an acronym that is polysemous, or if one is a sub-component/subtype of the other (e.g. 'T Cell' vs 'Cell', 'Cornea' vs 'Retina').
-3. When in doubt, prefer FALSE. Keeping concepts separate preserves graph integrity.
-
-THINKING PROCESS (SANDBOXED):
-- If you need to reason or compare pairs, put all thinking strictly inside `<think>...</think>` at the very start of your response.
-- Once `</think>` is closed, output ONLY the final `<verdicts>...</verdicts>` XML block.
-- Absolutely NO commentary or notes outside `<think>...</think>` or outside `<verdicts>` tags.
+1. MERGE (is_same_entity: true): Only if both concepts denote the identical subject (e.g., direct synonymous naming or alternative formal titles for the same entity).
+2. KEEP SEPARATE (is_same_entity: false): Do NOT merge if one is an acronym that is polysemous, or if one is a sub-component/subtype/variant of the other.
+3. When in doubt, prefer FALSE. Keeping concepts separate preserves integrity.
 
 OUTPUT FORMAT:
-<think>
-[Comparison notes]
-</think>
+Output ONLY the final <verdicts>...</verdicts> XML block with no introductory or concluding text:
 <verdicts>
 <verdict>
 <pair_index>1</pair_index>
@@ -164,15 +127,12 @@ class MergeVerdict(BaseModel):
     reason: str = ""
 
 def parse_xml_merge_verdicts(text: str) -> List[MergeVerdict]:
-    """Parse <verdicts> blocks into MergeVerdict objects, stripping thinking tags."""
+    """Parse <verdicts> blocks into MergeVerdict objects."""
     if not text:
         return []
 
-    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
-
     verdicts: List[MergeVerdict] = []
-    blocks = re.findall(r"<verdict>(.*?)</verdict>", clean_text, re.DOTALL | re.IGNORECASE)
+    blocks = re.findall(r"<verdict>(.*?)</verdict>", text, re.DOTALL | re.IGNORECASE)
     for block in blocks:
         idx_m = re.search(r"<pair_index>(\d+)</pair_index>", block, re.IGNORECASE)
         idx = int(idx_m.group(1)) if idx_m else len(verdicts) + 1
@@ -325,22 +285,22 @@ def global_consolidate(domain_dir: Path, args: Any):
 
     # 1. Load All Consolidated Concepts from per-document folders
     all_raw_concepts = []
-    doc_files = sorted(list(consolidated_dir.glob("canon_*/concepts.json")))
+    doc_files = sorted(list(consolidated_dir.glob("*/concepts.json")))
     if not doc_files:
         raise RuntimeError(f"No consolidated concept files found under {consolidated_dir}")
 
-    print(f"Loading concepts from {len(doc_files)} canonical document folders...")
+    print(f"Loading concepts from {len(doc_files)} document folders...")
     for doc_file in doc_files:
         with open(doc_file, "r", encoding="utf-8") as f:
             data = json.load(f)
             for c in data.get("concepts", []):
                 t = c.get("title", "").strip()
-                if not t or is_boilerplate_concept(t):
+                if not t:
                     continue
                 all_raw_concepts.append(c)
 
     raw_concepts_count = len(all_raw_concepts)
-    print(f"Total concepts loaded (after dropping scraping boilerplate): {raw_concepts_count}")
+    print(f"Total concepts loaded: {raw_concepts_count}")
 
     # Display initial word-count distribution before global merge
     print_concept_word_distribution(all_raw_concepts, title_label="STAGE 6: BEFORE GLOBAL CONSOLIDATION")
@@ -374,7 +334,7 @@ def global_consolidate(domain_dir: Path, args: Any):
     for c in all_raw_concepts:
         for alias in c.get("aliases", []):
             clean_al = canonical_lemma_key(alias)
-            if len(clean_al) > 3 and clean_al not in STOP_WORDS:
+            if len(clean_al) > 2:
                 alias_map.setdefault(clean_al, []).append(c)
 
     for c in all_raw_concepts:

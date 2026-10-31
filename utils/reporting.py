@@ -1,13 +1,8 @@
-"""Verification metrics and the Pass 1 -> Pass 2 improvement report.
+"""Verification reporting and Pass 1 vs Pass 2 quality comparison metrics.
 
-Verification runs twice: once over Pass 1 output and again over the concepts
-Pass 2 merged in. Both runs score the same chunks against the same source text,
-so the two averages are directly comparable and their difference is the
-measurable improvement Pass 2 bought.
-
-Pass 2 must not read the second run's results - it consumes the first run's
-``missing_concepts`` / ``missing_facts`` as its repair instructions - so the
-two runs write to separate filenames and are summarised together at the end.
+Aggregates extraction quality metrics (concept coverage, precision, citation accuracy)
+between initial Pass 1 extraction and Pass 2 refinement. Writes verification summaries
+and comparative reports to disk.
 """
 
 from dataclasses import asdict, dataclass

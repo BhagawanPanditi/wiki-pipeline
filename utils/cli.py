@@ -1,21 +1,7 @@
-"""Shared CLI plumbing and per-stage tuning profiles.
-
-Every stage script repeated the same argparse block and the same hardcoded
-httpx timeout. This module owns both, and adds a per-stage concurrency default
-derived from the serving configuration rather than a single global 50.
-
-Concurrency is bounded by KV cache, not by the client. On 2x A40 with
-tensor-parallel-size 2 and --max-model-len 32768, a 27B model in BF16 leaves
-roughly 32 GB for KV cache (~130k tokens). Each in-flight request reserves
-prompt + max_tokens, so the sustainable fan-out scales inversely with
-max_tokens:
-
-    pass1/pass2 (8192 out, ~10k prompt)  -> ~8 per server
-    briefs / reverse relations (256 out) -> ~40-48 per server
-
-vLLM prints the exact figures at startup as "GPU KV cache size" and "Maximum
-concurrency for 32,768 tokens per request"; override these defaults in
-config.json under "stage_concurrency" to match your real numbers.
+"""Shared CLI Configuration & Dynamic Per-Stage Tuning Profiles.
+-------------------------------------------------------------
+Provides unified argument parsing, default stage profiles, and dynamic
+per-stage settings resolution (concurrencies, max_tokens, timeouts) from config.json.
 """
 
 import argparse
@@ -51,31 +37,21 @@ class StageProfile:
 
 
 STAGE_PROFILES: Dict[str, StageProfile] = {
-    # ── extraction & refinement (structured concept generation) ────────
-    # max_tokens set to 16000, timeouts increased for large chunk batches
+    # ── Stage 1: Extraction & Stage 3: Refinement ───────────────────────
     "extract-concepts":       StageProfile("extract-concepts", 64, 2400.0, 50.0, 16000),
     "verify-pass1":           StageProfile("verify-pass1", 12, 2400.0, 50.0, 16000),
     "refine-concepts":        StageProfile("refine-concepts", 8, 2400.0, 50.0, 16000),
     "verify-pass2":           StageProfile("verify-pass2", 12, 2400.0, 50.0, 16000),
 
-    # ── document & global consolidation ─────────────────────────────────
+    # ── Stage 5: Document & Stage 6: Global Consolidation ───────────────
     "consolidate-documents":  StageProfile("consolidate-documents", 8, 4500.0, 30.0, 32000),
     "consolidate-global":     StageProfile("consolidate-global", 8, 800.0, 30.0, 8192),
 
-
-    # ── stub resolution & folding ───────────────────────────────────────
-    # resolve-stubs fans out chunks 5x per stub: concurrency 2 = 10 in-flight requests per server
-    "resolve-stubs":          StageProfile("resolve-stubs", 2, 600.0, 30.0, 6144),
-    "fold-thin-concepts":     StageProfile("fold-thin-concepts", 12, 360.0, 20.0, 6144),
-
-    # ── graph enrichment & links (lightweight output payloads) ──────────
-    # Concurrency 8 per server prevents TCP connection queue saturation on vLLM
+    # ── Stage 7: Briefs & Entities, Stage 8: Semantic Jaccard Links ─────
     "write-briefs":           StageProfile("write-briefs", 32, 90.0, 30.0, 1536),
     "link-entities":          StageProfile("link-entities", 32, 60.0, 30.0, 512),
-    "audit-islands":          StageProfile("audit-islands", 16, 360.0, 20.0, 3072),
-    "add-reverse-links":      StageProfile("add-reverse-links", 32, 240.0, 60.0, 1536),
 
-    # ── final consolidation (macro scan & deep verify) ──────────────────
+    # ── Stage 9: Final Consolidation (Macro Scan & Deep Verify) ─────────
     "final-macro-scan":       StageProfile("final-macro-scan", 8, 600.0, 20.0, 6144),
     "final-deep-verify":      StageProfile("final-deep-verify", 12, 600.0, 20.0, 3072),
 }
@@ -187,26 +163,32 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
     There are NO hardcoded python fallbacks; all settings must be explicitly defined.
     """
     from config import _read_config
+    # Read config.json
     cfg = _read_config()
-    stage_cfg = cfg.get("stage_concurrency", {}).get(stage, {}) if isinstance(cfg.get("stage_concurrency"), dict) else {}
+    stage_concurrency_cfg = cfg.get("stage_concurrency", {}) if isinstance(cfg.get("stage_concurrency"), dict) else {}
+    stage_cfg = stage_concurrency_cfg.get(stage, {}) if isinstance(stage_concurrency_cfg, dict) else {}
     if not isinstance(stage_cfg, dict):
         stage_cfg = {"concurrency_per_server": int(stage_cfg)}
 
-    def get_setting(cli_val: Any, key: str, err_name: str) -> Any:
+    default_profile = STAGE_PROFILES.get(stage)
+
+    def get_setting(cli_val: Any, key: str, default_val: Any = None) -> Any:
         if cli_val not in (None, 0, 0.0, ""):
             return cli_val
         if key in stage_cfg:
             return stage_cfg[key]
         if key in cfg:
             return cfg[key]
+        if default_val is not None:
+            return default_val
         raise ValueError(
-            f"Missing required parameter '{err_name}'! "
+            f"Missing required parameter for stage '{stage}': '{key}'! "
             f"Specify via CLI argument or set '{key}' in config.json."
         )
 
-    # 1. Servers
-    servers = getattr(args, "servers", None) or cfg.get("servers")
-    if not servers:
+    # 1. Servers (Accepts list of URLs, or dict of {url: concurrency})
+    raw_servers = getattr(args, "servers", None) or cfg.get("servers")
+    if not raw_servers:
         raise ValueError("Missing 'servers'! Specify via --servers or set 'servers' in config.json.")
 
     # 2. Model
@@ -214,40 +196,61 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
     if not model:
         raise ValueError("Missing 'model'! Specify via --model or set 'model_name' in config.json.")
 
-    # 3. Concurrency
+    # 3. Determine Concurrency
     cli_concurrency = getattr(args, "concurrency_per_server", None)
     if cli_concurrency not in (None, 0, 0.0, ""):
-        concurrency = int(cli_concurrency)
+        default_concurrency = int(cli_concurrency)
     elif "concurrency_per_server" in stage_cfg:
-        concurrency = int(stage_cfg["concurrency_per_server"])
+        default_concurrency = int(stage_cfg["concurrency_per_server"])
+    elif isinstance(stage_cfg, dict) and stage_cfg.get("concurrency"):
+        default_concurrency = int(stage_cfg["concurrency"])
     elif "concurrency_per_server" in cfg:
-        concurrency = int(cfg["concurrency_per_server"])
-    elif isinstance(servers, dict) and servers:
-        # Per-server concurrency is already defined in the servers dictionary
-        concurrency = max(int(c) for c in servers.values())
+        default_concurrency = int(cfg["concurrency_per_server"])
+    elif isinstance(raw_servers, dict) and raw_servers:
+        default_concurrency = max(int(c) for c in raw_servers.values())
+    elif default_profile:
+        default_concurrency = default_profile.concurrency_per_server
     else:
-        raise ValueError(
-            "Missing required parameter '--concurrency_per_server'! "
-            "Specify via CLI argument or set 'concurrency_per_server' or a servers dictionary in config.json."
-        )
+        default_concurrency = 16
 
-    # 4. Max Tokens
+    # Build per-server concurrency mapping for this specific stage:
+    # 1. stage_cfg has specific server URLs: {"http://cn-dgx...": 32, "http://cn-a40...": 16}
+    # 2. raw_servers is a list of URLs: ["http://cn-a40:8000/v1", "http://cn-dgx:8000/v1"]
+    # 3. raw_servers is a dict: {"http://cn-a40:8000/v1": 16, "http://cn-dgx:8000/v1": 32}
+    if isinstance(stage_cfg, dict) and any(isinstance(v, (int, float)) and k.startswith("http") for k, v in stage_cfg.items()):
+        server_list = list(raw_servers.keys()) if isinstance(raw_servers, dict) else list(raw_servers)
+        servers = {s: int(stage_cfg.get(s, default_concurrency)) for s in server_list}
+        concurrency = max(servers.values())
+    elif isinstance(raw_servers, dict):
+        if "concurrency_per_server" in stage_cfg or (isinstance(stage_cfg, dict) and stage_cfg.get("concurrency")):
+            servers = {s: default_concurrency for s in raw_servers}
+            concurrency = default_concurrency
+        else:
+            servers = raw_servers
+            concurrency = default_concurrency
+    else:
+        servers = raw_servers
+        concurrency = default_concurrency
+
+    # 4. Max Tokens (Checks CLI -> stage_cfg -> cfg -> default STAGE_PROFILES)
+    default_max_tokens = default_profile.max_tokens if default_profile else 4096
     max_tokens = int(get_setting(
         getattr(args, "max_tokens", None),
         "max_tokens",
-        "--max_tokens"
+        default_val=default_max_tokens
     ))
 
-    # 5. Request Timeout
+    # 5. Request Timeout (Checks CLI -> stage_cfg -> cfg -> default STAGE_PROFILES)
+    default_timeout = default_profile.request_timeout if default_profile else 600.0
     timeout = float(get_setting(
         getattr(args, "request_timeout", None),
         "request_timeout",
-        "--request_timeout"
+        default_val=default_timeout
     ))
 
     # Optional / Tuning parameters (attempts & budget)
-    attempts = getattr(args, "max_attempts", 0) or stage_cfg.get("attempts") or cfg.get("attempts") or 4
-    budget = getattr(args, "stage_budget_minutes", 0.0) or stage_cfg.get("budget_minutes") or cfg.get("budget_minutes") or 300.0
+    attempts = getattr(args, "max_attempts", 0) or stage_cfg.get("attempts") or cfg.get("attempts") or (default_profile.attempts if default_profile else 4)
+    budget = getattr(args, "stage_budget_minutes", 0.0) or stage_cfg.get("budget_minutes") or cfg.get("budget_minutes") or (default_profile.budget_minutes if default_profile else 300.0)
 
     profile = StageProfile(
         key=stage,

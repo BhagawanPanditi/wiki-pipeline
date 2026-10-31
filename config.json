@@ -1,14 +1,46 @@
 {
-  "servers": {
-    "http://cn28-a40:8000/v1": 32,
-    "http://cn35-a40:8001/v1": 32,
-    "http://cn45-l40:8006/v1": 32,
-    "http://cn45-l40:8007/v1": 32,
-    "http://cn41-l40:8008/v1": 32,
-    "http://cn44-l40:8000/v1": 32
-  },
+  "servers": [
+    "http://cn-a40:8000/v1",
+    "http://cn-l40:8001/v1",
+    "http://cn-dgx:8002/v1"
+  ],
   "model_name": "Qwen/Qwen3.8-27B",
-  "max_tokens": 16000,
-  "request_timeout": 2400.0,
-  "enable_thinking": false
+  "enable_thinking": false,
+  "stage_concurrency": {
+    "extract-concepts": {
+      "http://cn-a40:8000/v1": 8,
+      "http://cn-l40:8001/v1": 8,
+      "http://cn-dgx:8002/v1": 24,
+      "max_tokens": 16000,
+      "request_timeout": 2400.0
+    },
+    "refine-concepts": {
+      "http://cn-a40:8000/v1": 8,
+      "http://cn-l40:8001/v1": 8,
+      "http://cn-dgx:8002/v1": 24,
+      "max_tokens": 16000,
+      "request_timeout": 2400.0
+    },
+    "consolidate-documents": {
+      "http://cn-a40:8000/v1": 8,
+      "http://cn-l40:8001/v1": 8,
+      "http://cn-dgx:8002/v1": 20,
+      "max_tokens": 32000,
+      "request_timeout": 4500.0
+    },
+    "write-briefs": {
+      "http://cn-a40:8000/v1": 32,
+      "http://cn-l40:8001/v1": 32,
+      "http://cn-dgx:8002/v1": 64,
+      "max_tokens": 1536,
+      "request_timeout": 90.0
+    },
+    "link-entities": {
+      "http://cn-a40:8000/v1": 32,
+      "http://cn-l40:8001/v1": 32,
+      "http://cn-dgx:8002/v1": 64,
+      "max_tokens": 512,
+      "request_timeout": 60.0
+    }
+  }
 }

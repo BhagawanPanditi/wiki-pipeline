@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
+"""Stage 7: Concept Brief & Key Entity Generation.
+------------------------------------------------
+Generates a 2-3 sentence overview brief and extracts important, domain-salient
+entities for each consolidated concept in a single direct LLM call.
+
+Usage:
+    python3 write_briefs_and_entities.py --wiki_path /path/to/wiki
 """
-Combined Concept Brief & Important Entities Generator Pass
------------------------------------------------------------
-Reads `global_concepts.json` directly (no stub-resolving or thin concept folding needed).
-In a single fast LLM call per concept:
-1. Generates a condensed, 2-3 sentence (< 5 lines, ~40-60 words) factual `brief`.
-2. Extracts domain-vital `entities` (genes, enzymes, proteins, chemicals, algorithms, tools, diseases)
-   while strictly excluding generic nouns, common adjectives, and high-level proper names.
-Updates `global_concepts.json` and writes individual concept files to `concepts/<title>.json`.
-Uses pure XML tags, sandboxed <think> tags, non-thinking mode toggle, and no disk debug logs.
-"""
+
 
 import asyncio
 import json
@@ -30,43 +28,35 @@ STAGE = "write-briefs"
 # ── XML System Prompt ─────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT_BRIEF_ENTITIES = """\
-You are an expert technical knowledge graph agent.
+You are an expert knowledge agent.
 Your task is to analyze a comprehensive concept description and produce two vital outputs in ONE pass:
 1. A condensed BRIEF (< 5 lines, 2-3 dense factual sentences, ~40-60 words).
-2. A list of IMPORTANT, DOMAIN-VITAL ENTITIES mentioned in the text.
+2. A list of IMPORTANT ENTITIES mentioned in the text.
 
 RULES FOR BRIEF:
 - Length: Exactly 2 to 3 dense, well-formed complete sentences (< 5 lines, ~40-60 words).
-- Content: State the core definition, primary technical mechanism, key parameters, or biological function.
-- Exactness: Retain exact numbers, metrics, or technical codes where relevant.
-- No Citations: SILENTLY OMIT all paper citations, DOIs, and internal provenance IDs like [canon_...].
-- No Noise: Silently omit conversational filler (e.g. "This concept is...") and output a clean paragraph.
+- Content: State the core definition, primary role, key parameters, or functional purpose.
+- Exactness: Retain exact numbers, metrics, or specifications where relevant.
+- No Citations: SILENTLY OMIT all paper citations, DOIs, and internal provenance IDs like [doc_...].
+- No Noise: Silently omit conversational filler and output a clean paragraph.
 
 RULES FOR IMPORTANT ENTITIES:
-- Extract ONLY vital, specific technical/scientific entities: genes, enzymes, proteins, chemicals, pathogens, specific algorithms, protocols, formal software tools, cellular components, or specific medical conditions.
+- Extract salient, specific entities, terms, identifiers, tools, components, metrics, or methods mentioned in the text.
 - Strictly EXCLUDE:
-  * Generic common nouns or categories (e.g., "cell", "protein", "study", "process", "system", "research", "method", "data").
-  * General geographic places, general dates/years, or author names.
-  * Trivial qualifiers or non-technical proper nouns.
+  * Overly generic empty words (e.g. "thing", "stuff", "data", "info", "system", "process", "result", "aspect").
+  * Trivial conversational filler or generic single common nouns without domain specificity.
 - Keep each entity to 1-4 words in Title Case.
 
-THINKING PROCESS (SANDBOXED):
-- If you need to reason or select entities, put all thinking strictly inside `<think>...</think>` at the very start of your response.
-- Once `</think>` is closed, output ONLY the `<brief>...</brief>` and `<entities>...</entities>` XML blocks.
-- Absolutely NO commentary or notes outside `<think>...</think>`.
-
 OUTPUT FORMAT:
-<think>
-[Key mechanism summary and vital domain entity selection]
-</think>
+Output ONLY the <brief>...</brief> and <entities>...</entities> XML blocks with no introductory or concluding text:
 <brief>
-First dense sentence defining the core concept and its primary role. Second sentence explaining the primary technical mechanism or key parameter.
+First dense sentence defining the core concept and its primary role. Second sentence explaining the primary mechanism, rule, or parameter.
 </brief>
 <entities>
-- Specific Enzyme A
-- Gene B
-- Technical Tool C
-- Formal Pathway D
+- Primary Entity A
+- Method or Rule B
+- Tool or System C
+- Component or Metric D
 </entities>
 """
 
@@ -77,23 +67,20 @@ class BriefAndEntities(BaseModel):
 # ── XML Parsing Helper ────────────────────────────────────────────────────────
 
 def parse_xml_brief_and_entities(text: str) -> BriefAndEntities:
-    """Parse <brief> and <entities> XML blocks, stripping any thinking tags."""
+    """Parse <brief> and <entities> XML blocks directly."""
     if not text:
         return BriefAndEntities()
 
-    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
-
     brief = ""
-    brief_m = re.search(r"<brief>(.*?)</brief>", clean_text, re.DOTALL | re.IGNORECASE)
+    brief_m = re.search(r"<brief>(.*?)</brief>", text, re.DOTALL | re.IGNORECASE)
     if brief_m:
         raw_brief = brief_m.group(1).strip()
-        # Strip citation brackets like [canon_...::chunk_...]
-        raw_brief = re.sub(r"\[canon_[^\]]+\]", "", raw_brief)
+        # Strip citation brackets like [doc_...::chunk_...] or [canon_...]
+        raw_brief = re.sub(r"\[(?:doc_|canon_)[^\]]+\]", "", raw_brief)
         brief = " ".join(raw_brief.split())
 
     entities = []
-    entities_m = re.search(r"<entities>(.*?)</entities>", clean_text, re.DOTALL | re.IGNORECASE)
+    entities_m = re.search(r"<entities>(.*?)</entities>", text, re.DOTALL | re.IGNORECASE)
     if entities_m:
         raw_entities = entities_m.group(1).strip().splitlines()
         for line in raw_entities:

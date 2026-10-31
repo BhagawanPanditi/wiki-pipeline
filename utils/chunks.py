@@ -1,7 +1,6 @@
-"""Shared access to the chunk cache produced by Pass 1.
-
-Pass 2 and the verifier carried byte-identical copies of this loader (they
-differed only in the wording of the FileNotFoundError), so both now import it.
+"""Chunk Cache Loader.
+-------------------
+Loads cached sliding-window text chunks from disk, keyed by `doc_id::chunk_id`.
 """
 
 import json

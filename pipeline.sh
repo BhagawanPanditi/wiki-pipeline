@@ -115,12 +115,24 @@ run_stage() {
     local start_time=$(date +%s)
     local retries=5
     local attempt=1
+
+    # Pre-flight server check before launching stage
+    if [ -f "check_servers.py" ]; then
+        python3 check_servers.py || {
+            echo ">>> [STAGE $stage_num ERROR] Pre-flight server check failed! Aborting." >&2
+            exit 1
+        }
+    fi
+
     while [ $attempt -le $retries ]; do
         if "${cmd[@]}"; then
             break
         else
             if [ $attempt -lt $retries ]; then
                 echo ">>> [STAGE $stage_num WARNING] Command failed on attempt $attempt/$retries. Retrying with --resume in 5s..." >&2
+                if [ -f "check_servers.py" ]; then
+                    python3 check_servers.py || true
+                fi
                 sleep 5
             else
                 echo ">>> [STAGE $stage_num ERROR] Command failed after $retries attempts!" >&2

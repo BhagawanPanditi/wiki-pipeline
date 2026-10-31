@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
+"""Stage 8: Semantic Jaccard Overlap Linker & Relation Characterization.
+---------------------------------------------------------------------
+Establishes bidirectional links between concepts sharing salient named entities:
+1. Calculates Jaccard similarity across shared entities between concept pairs.
+2. Characterizes direct relationships with concise LLM relation tags (<= 10 words).
+3. Orders outbound relations by Jaccard similarity.
+
+Usage:
+    python3 link_entities_jaccard.py --wiki_path /path/to/wiki
 """
-Entity Jaccard-Based Semantic Overlap Linker
---------------------------------------------
-Solves graph fragmentation by establishing reciprocal, bidirectional relations
-between concepts that share vital named entities:
-- Uses Jaccard similarity: |E_A ∩ E_B| / |E_A ∪ E_B|.
-- Links all concept pairs meeting min_shared (default >= 2 entities) or min_jaccard (default >= 0.15).
-- Guaranteed 100% reciprocal bidirectionality: if A links to B, B links to A.
-- Sorts outbound relations strictly by Jaccard similarity descending.
-- Computes and prints exact link distribution statistics across all concepts:
-  * 0 links, 1-5 links, 6-10 links, 11-15 links, 16-20 links, 21-25 links, 26-30 links, 31+ links (bin width = 5).
-- Fast, 100% deterministic, zero LLM calls, zero debug logging.
-"""
+
 
 import asyncio
 import json
@@ -31,33 +29,29 @@ from utils.llm_pool import pool_for_stage
 STAGE = "link-entities"
 
 SYSTEM_PROMPT_RELATION_SYNTHESIS = """\
-You are an expert technical knowledge graph specialist.
-Given two domain concepts with their titles, briefs, and key shared entities, explain their precise domain relationship in 1-2 dense, informative sentences.
+You are an expert knowledge specialist.
+Given two concepts with their titles, briefs, and key shared entities, characterize their precise direct relationship in a concise, 1-line tag or short phrase (at most 4 to 10 words).
 
 GUIDELINES:
-- Clearly explain how Concept 1 and Concept 2 functionally, structurally, or causally interact or relate in the domain.
-- Draw directly upon both concept briefs and their shared context.
-- Keep the description to 1-2 concise, high-density sentences.
-- Absolutely NO generic meta-phrases like "Concept 1 and Concept 2 are related because...". State the direct technical relationship.
+- Output a concise relationship tag or short phrase (e.g., "primary implementation of", "sub-system component", "counterpart framework in", "underlying dependency for").
+- State the exact relationship directly and compactly.
+- Keep it to a single brief phrase (max 10 words).
+- Absolutely NO conversational filler, meta-phrasing (e.g. "Concept 1 is related to Concept 2 because..."), or multi-sentence paragraphs.
 
 OUTPUT FORMAT:
-<think>
-[Brief reasoning]
-</think>
+Output ONLY the <relation>...</relation> block with no introductory or concluding text:
 <relation>
-Exact concise relationship description.
+Concise relationship phrase (max 10 words)
 </relation>
 """
 
 def parse_xml_relation(text: str) -> str:
     if not text:
         return ""
-    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
-    rel_m = re.search(r"<relation>(.*?)</relation>", clean_text, re.DOTALL | re.IGNORECASE)
+    rel_m = re.search(r"<relation>(.*?)</relation>", text, re.DOTALL | re.IGNORECASE)
     if rel_m:
         return rel_m.group(1).strip()
-    return clean_text.strip().strip('"').strip("'")
+    return text.strip().strip('"').strip("'")
 
 def normalize_entity(ent: str) -> str:
     """Normalize entity text with robust lemmatization for matching."""

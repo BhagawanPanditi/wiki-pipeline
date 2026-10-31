@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
+"""Stage 3: Concept Refinement & Second-Pass Extraction.
+-----------------------------------------------------
+Performs a targeted second pass over raw chunks guided by Phase 1 verification
+feedback. Injects omitted factual details into existing concept descriptions
+via <update_concept> and extracts substantive missed topics via <new_concept>.
+
+Usage:
+    python3 refine_concepts.py --wiki_path /path/to/wiki
 """
-Refinement Pass 2: Second-Pass Knowledge Graph Concept Extraction & Patching
-- Resolves omissions, adds missing concepts, appends missing facts into descriptions.
-- Supports adding/removing outbound relations, adding aliases, and adding brand new concepts.
-"""
+
 
 import asyncio
 import json
@@ -54,11 +59,11 @@ class Pass2ExtractionSchema(BaseModel):
 # ── Second-Pass System Prompt ────────────────────────────────────────────────
 
 SYSTEM_PROMPT_PASS2 = """\
-You are an expert technical knowledge auditor performing a SECOND-PASS EXTRACTION & REFINEMENT on an LLM Knowledge Graph.
+You are an expert knowledge auditor performing a SECOND-PASS EXTRACTION & REFINEMENT on a Knowledge Wiki.
 
 YOUR MISSION:
-Perform an exhaustive comparison between the RAW CHUNK text and the EXISTING EXTRACTED CONCEPTS (from Pass 1).
-Identify any missing concepts, omitted technical metrics, parameters, or factual details, and generate XML patch updates.
+Perform an exhaustive comparison between the RAW CHUNK text and the EXISTING EXTRACTED CONCEPTS.
+Identify any missing concepts or omitted factual details, and generate XML patch updates.
 
 INPUT & NOISE CLEANING:
 - Silently ignore HTML tags, scraping artifacts, navigation menus, headers/footers, cookie notices, and boilerplate.
@@ -70,45 +75,36 @@ CONTEXT BOUNDARIES:
 - Never invent facts or add outside knowledge.
 
 TITLES AND ALIASES:
-- Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the name any other chunk would use for the same thing, so concepts merge cleanly across chunks.
-- Aliases: Semicolon-separated list of acronyms or alternate names that explicitly appear in the text. If none, leave empty.
+- Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the canonical name any other document would use for the same subject, ensuring concepts merge cleanly across sources.
+- Aliases: Semicolon-separated list of acronyms, alternate designations, or specific minor sub-topics/parameters absorbed into this concept. If none, leave empty.
 
-SOLID CONCEPTS ONLY (NO FRAGMENTATION / NO THIN CONCEPTS):
-- Extract only major, solid, well-developed subjects: a core idea, system, entity, method, mechanism, theory, phenomenon, or process.
-- Strictly avoid creating thin, 1-2 sentence stub concepts for minor parameters, properties, sub-steps, or variants. Every minor detail, metric, and property MUST be absorbed directly into the comprehensive description of its primary parent concept (prefer <update_concept> over creating thin new concepts).
-- Do not extract meta-labels ("Introduction", "Chapter 1", "Summary") or whole-chunk overviews.
+WHAT IS A CONCEPT (UNIVERSAL DEFINITION):
+A concept is a canonical, self-contained, semantically coherent unit of knowledge that captures a meaningful subject or body of information, along with its relevant facts, properties, and relationships. It is independent of document boundaries, can be consolidated and enriched across multiple sources, and is not merely a keyword or arbitrary text chunk.
+- Scope: Concepts may represent any meaningful subject across domains (e.g., architectures, software libraries, algorithms, financial entities, scientific phenomena, operational procedures, policies, historical events, or core definitions).
+- Granularity & Standalone Subtopics: Any distinct subtopic or specialized theme that contains substantial information (typically 300 to 600+ words/tokens with its own details, properties, or comparisons) SHOULD be extracted as an independent <new_concept>.
+- Avoid Trivial Fragmentation: Do not create thin 1-2 sentence stub concepts for trivial sub-steps or isolated numbers; absorb those facts directly into the description of their primary subject (prefer <update_concept> over creating thin new concepts) and record specific names in <aliases>.
+- Do not extract meta-labels ("Introduction", "Chapter 1", "Overview") or whole-chunk summaries.
 
-ZERO INFORMATION LOSS (SQUEEZE THE CHUNK DRY):
-- Every substantive fact, number, parameter, metric, condition, finding, and mechanism in the chunk MUST be captured inside one of the concept descriptions. Leave zero informational content unabsorbed.
-- Squeeze every useful piece of information into a concept description (either updating an existing concept via <update_concept> or adding a missed major concept via <new_concept>).
-- Descriptions must be comprehensive, dense paragraphs that explicitly name the subject and stand entirely on their own.
-
-FACTUAL RETENTION MANDATE:
-Descriptions must preserve exact concrete details rather than high-level generalizations:
-1. QUANTITATIVE FACTS & BOUNDS: Exact numbers, statistics, ranges, thresholds, formulas, and measurements.
-2. FORMAL NAMES & TERMS: Specific named entities, tools, techniques, classifications, benchmarks, or formal designations.
-3. CONDITIONS & CONSTRAINTS: Specific operational boundaries, environmental constraints, procedural steps, and dates/years.
-4. ATTRIBUTIONS: Specific author, study, or expert attributions tied to explicit claims.
-5. COMPLETE SENTENCES: ALL technical facts, numbers, bounds, parameters, tool mentions, and findings MUST be complete sentences inside concept descriptions.
-
-THINKING PROCESS (SANDBOXED):
-- If you need to analyze the text, plan missing concepts, or deliberate on updates, you MUST do so strictly inside `<think>...</think>` tags at the very beginning of your response.
-- Once `</think>` is closed, output ONLY the final XML update blocks.
-- Absolutely NO commentary, reasoning, or notes outside `<think>...</think>`.
+COMPREHENSIVE INFORMATION RETENTION (ZERO FACT LOSS):
+- Capture all substantive information present in the chunk inside the appropriate concept descriptions (either updating an existing concept via <update_concept> or adding a missed concept via <new_concept>). Leave no meaningful informational content unabsorbed.
+- Descriptions must preserve exact concrete details rather than high-level generalizations: retain specific names, identifiers, terms, numbers, metrics, operational conditions, rules, relationships, chronology, and attributions.
+- All substantive information must be expressed in complete, grammatically sound sentences. Descriptions must be dense, self-contained paragraphs that explicitly name the subject and stand entirely on their own.
 
 OUTPUT FORMAT:
+Output ONLY completed XML blocks with no introductory or concluding text.
+
 Output brand-new concepts using <new_concept>...</new_concept> blocks:
 <new_concept>
 <title>Exact Canonical Title</title>
 <aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
-<description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all raw quantitative metrics and findings from this chunk.</description>
+<description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all substantive facts, properties, and specific details from this chunk.</description>
 </new_concept>
 
 Output factual updates to existing Pass 1 concepts using <update_concept>...</update_concept> blocks:
 <update_concept>
 <title>Exact Canonical Title of Existing Concept</title>
 <additional_aliases>New Alt Name 1; New Alt Name 2</additional_aliases>
-<additional_description>Dense factual sentences containing newly extracted facts/metrics to append to the existing description.</additional_description>
+<additional_description>Dense factual sentences containing newly extracted facts or details to append to the existing description.</additional_description>
 </update_concept>
 
 If the existing extraction is already complete and no updates or new concepts are needed, output nothing.
@@ -120,15 +116,11 @@ def parse_xml_refinement(text: str) -> Pass2ExtractionSchema:
     if not text:
         return Pass2ExtractionSchema()
 
-    # 1. Strip thinking tags
-    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
-
     new_concepts: List[Concept] = []
-    # Match <new_concept> or <concept>
+    # Match <new_concept> blocks
     new_blocks = re.findall(
-        r"<(?:new_concept|concept)>((?:(?!<(?:new_concept|concept)>).)*?)</(?:new_concept|concept)>",
-        clean_text, re.DOTALL | re.IGNORECASE
+        r"<new_concept>((?:(?!<new_concept>).)*?)</new_concept>",
+        text, re.DOTALL | re.IGNORECASE
     )
     for block in new_blocks:
         title_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
@@ -148,10 +140,10 @@ def parse_xml_refinement(text: str) -> Pass2ExtractionSchema:
         new_concepts.append(Concept(title=title, aliases=aliases, description=description))
 
     concept_updates: List[ConceptUpdate] = []
-    # Match <update_concept>
+    # Match <update_concept> blocks
     update_blocks = re.findall(
         r"<update_concept>((?:(?!<update_concept>).)*?)</update_concept>",
-        clean_text, re.DOTALL | re.IGNORECASE
+        text, re.DOTALL | re.IGNORECASE
     )
     for block in update_blocks:
         title_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
@@ -175,9 +167,9 @@ def parse_xml_refinement(text: str) -> Pass2ExtractionSchema:
         ))
 
     # Fallback to JSON repair if no XML tags found
-    if not new_concepts and not concept_updates and "{" in clean_text:
+    if not new_concepts and not concept_updates and "{" in text:
         try:
-            cleaned_json = clean_json_string(clean_text)
+            cleaned_json = clean_json_string(text)
             parsed = json.loads(cleaned_json)
             if isinstance(parsed, dict):
                 nc_list = []

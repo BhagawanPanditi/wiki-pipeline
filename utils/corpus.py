@@ -1,23 +1,7 @@
-"""Corpus loading, normalisation, deduplication and chunking.
-
-The pipeline is not tied to the BRIGHT benchmark files. A corpus is any file of
-documents in one of two shapes, auto-detected:
-
-* a single JSON array  -- ``[{"id": "a", "contents": "..."}, ...]``  (``.json``)
-* JSON Lines           -- ``{"id": "a", "contents": "..."}`` per line (``.jsonl``)
-
-Field names are normalised on the way in, so ``contents``/``content``/``text``
-and ``id``/``doc_id``/``document_id`` are all accepted.
-
-Documents with byte-identical content are collapsed into one *canonical*
-document named ``canon_<hash>``, and every original id is recorded in a mapping
-so a citation can be traced back to the source corpus. Deduplication happens
-whether or not chunking is enabled.
-
-Chunking is optional. With chunking off, each document becomes exactly one
-extraction unit, so every downstream stage sees the same shape and no tokenizer
-is needed at all -- which means a new corpus can be processed without
-``transformers`` or any offline HuggingFace model.
+"""Corpus Processing, Deduplication & Chunking.
+----------------------------------------------
+Loads raw corpus files (.json or .jsonl), normalizes document records to doc_XXXXX
+format, deduplicates identical documents, and builds token sliding-window units.
 """
 
 import hashlib
@@ -250,25 +234,29 @@ def load_corpus(path: Path) -> List[Dict[str, str]]:
 
 
 def deduplicate(docs: List[Dict[str, str]]) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Collapse byte-identical documents into canonical ones.
+    """Index documents by their clean document id (doc_XXXXX), deduplicating if needed.
 
     Args:
         docs: Normalised records from :func:`load_corpus`.
 
     Returns:
         A 2-tuple of:
-            * ``canon_docs`` -- ``{canonical_id: content}``, one entry per unique
+            * ``canon_docs`` -- ``{doc_id: content}``, one entry per unique
               document, in first-seen order.
-            * ``doc_mapping`` -- ``{original_id: canonical_id}`` for every record
-              in the corpus, including duplicates. This is the citation mapping
-              written to ``doc_mapping.json``.
+            * ``doc_mapping`` -- ``{original_id: doc_id}`` for every record
+              in the corpus. This is the citation mapping written to ``doc_mapping.json``.
     """
     canon_docs: Dict[str, str] = {}
     doc_mapping: Dict[str, str] = {}
-    for doc in docs:
-        cid = canonical_id(doc["content"])
-        canon_docs.setdefault(cid, doc["content"])
-        doc_mapping[doc["id"]] = cid
+    for idx, doc in enumerate(docs, start=1):
+        raw_id = doc.get("id") or ""
+        # If the input id is already a doc_XXXXX, keep it; otherwise assign doc_XXXXX format
+        if raw_id.startswith("doc_"):
+            doc_id = raw_id
+        else:
+            doc_id = f"doc_{idx:05d}"
+        canon_docs.setdefault(doc_id, doc["content"])
+        doc_mapping[raw_id if raw_id else doc_id] = doc_id
     return canon_docs, doc_mapping
 
 

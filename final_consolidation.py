@@ -1,31 +1,15 @@
 #!/usr/bin/env python3
-"""
-Final Knowledge Graph Consolidation, Hybrid Link Ranking, Reciprocal Rescue & Markdown Wiki Export
----------------------------------------------------------------------------------------------------
-1. Alphabetical Candidate Scan: Groups concepts with high character/token overlap.
-2. Parallel LLM Decision: Evaluates candidate pairs in parallel across cluster (MERGE, LINK, PRUNE, KEEP).
-3. Sequential Execution Phase:
-   - PRUNE executed first: Drops noise/boilerplate nodes (from BOTH Pass 1 macro prune_ids AND Pass 2 deep verify).
-   - MERGE executed second:
-       * Unified DisjointSet maps aliases/titles into single canonical root.
-       * Provenance sources concatenated & deduplicated.
-       * Descriptions merged with unique sentence preservation.
-       * Most comprehensive brief selected.
-       * Relations remapped to new canonical targets with SELF-LOOPS removed.
-   - LINK executed third: Adds bidirectional relations with Jaccard tracking.
-4. GPU Embedding & Hybrid Link Ranking + Reciprocal Rescue Backlinks:
-   - Computes & caches normalized concept embeddings (`leaf_embeddings.npy`) so downstream hierarchy compilation
-     gets an automatic cache hit!
-   - Scores every outbound relation with a domain-agnostic Hybrid Score:
-     `0.40 * Jaccard + 0.30 * Asymmetric_Containment + 0.30 * Cosine_Similarity`.
-   - Enforces the Top-15 (`--max_primary_links 15`) cap while reserving up to `--rescue_slots 2` slots to
-     inject reciprocal rescue backlinks into target hubs whenever a peripheral/specialized concept would
-     otherwise have `primary_in_degree == 0`.
-5. Island Health & Directed Reachability Audit:
-   - Uses O(1) set lookup for graph construction (fixing the O(N^2) list comprehension bottleneck).
-   - Reports both undirected island stats and directed Top-15 primary in-degree / rescue backlink stats.
-6. Markdown Wiki Export:
-   - Compiles into `concepts_md/<slug>.md` (with stale/pruned `.md` cleanup) + `islands_report.json`.
+"""Stage 9: Final Consolidation, Hybrid Link Ranking & Clean Markdown Wiki Export.
+-------------------------------------------------------------------------------
+Executes final quality consolidation, link ranking, and wiki generation:
+1. Macro Alphabetical & Deep LLM Verification: Catches remaining near-duplicates or junk.
+2. Hybrid Link Ranking: Ranks outbound relations using Jaccard, Containment, and Cosine.
+3. Reciprocal Rescue: Connects peripheral nodes with zero inbound links.
+4. Clean Markdown Wiki Export: Exports pure markdown concept pages (no YAML frontmatter),
+   single-line grep-friendly concept_index.md, and entity_index.md.
+
+Usage:
+    python3 final_consolidation.py --wiki_path /path/to/wiki
 """
 
 import asyncio
@@ -51,14 +35,6 @@ from utils.llm_pool import pool_for_stage
 STAGE = "final-macro-scan"
 DEEP_STAGE = "final-deep-verify"
 
-_DEFAULT_EMBED_SERVERS = [
-    "http://localhost:8015/v1",
-    "http://localhost:8016/v1",
-]
-_DEFAULT_EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
-_embed_cursor = 0
-
-
 def _get_next_embed_endpoint(servers: List[str]) -> str:
     global _embed_cursor
     s = servers[_embed_cursor % len(servers)].rstrip("/")
@@ -69,7 +45,7 @@ def _get_next_embed_endpoint(servers: List[str]) -> str:
 def embed_batch_remote(
     texts: List[str],
     servers: List[str],
-    model: str = _DEFAULT_EMBED_MODEL,
+    model: str,
     max_chars: int = 4000,
 ) -> np.ndarray:
     """Computes L2-normalized embeddings across GPU embedding servers."""
@@ -169,7 +145,7 @@ def format_yaml_frontmatter(title: str, brief: str, aliases: List[str], entities
 # ── XML System Prompt for Alphabet Macro Scan (Domain-Agnostic) ──────────────
 
 SYSTEM_PROMPT_MACRO_SCAN = """\
-You are an expert technical knowledge graph consolidator auditing concepts starting with a specific letter or group.
+You are an expert knowledge consolidator auditing concepts starting with a specific letter or group.
 You are provided with an indexed list of concept titles: "[ID] Title".
 
 TASK:
@@ -178,16 +154,14 @@ Examine the list and identify:
    - Alternative spellings or transliterations.
    - Formatting / hyphenation / spacing splits.
    - High phrasing overlap or minor singular/plural/word-order variations.
-   - Generic methodology or redundant sub-split duplicates.
+   - Redundant sub-split duplicates.
 2. "link_pairs": Pairs of IDs that are distinct topics or serialized parts, but MUST have direct reciprocal links:
    - Serialized volumes, versions, or numbered parts (e.g. Part 1 vs Part 2, Type I vs Type II).
-   - Direct parent vs sub-category topics (e.g. Core Process vs Core Process Indications/Variants).
+   - Direct parent vs sub-category topics.
 3. "prune_ids": List of single IDs that are confirmed web scraping junk, site disclaimers, cookie/privacy notices, navigation menus, publishing metadata stubs, or completely non-substantive fragments.
 
 OUTPUT FORMAT:
-<think>
-[Brief analysis]
-</think>
+Output ONLY the <macro_candidates>...</macro_candidates> XML block with no introductory or concluding text:
 <macro_candidates>
   <merge_pairs>
     <pair><id_a>1</id_a><id_b>5</id_b></pair>
@@ -212,29 +186,26 @@ def parse_macro_scan(text: str) -> MacroScanResult:
     if not text:
         return MacroScanResult()
 
-    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
-
     res = MacroScanResult()
 
-    mp_block = re.search(r"<merge_pairs>(.*?)</merge_pairs>", clean_text, re.DOTALL | re.IGNORECASE)
+    mp_block = re.search(r"<merge_pairs>(.*?)</merge_pairs>", text, re.DOTALL | re.IGNORECASE)
     if mp_block:
         for pair_m in re.finditer(r"<pair>\s*<id_a>(\d+)</id_a>\s*<id_b>(\d+)</id_b>\s*</pair>", mp_block.group(1), re.IGNORECASE):
             res.merge_pairs.append((int(pair_m.group(1)), int(pair_m.group(2))))
 
-    lp_block = re.search(r"<link_pairs>(.*?)</link_pairs>", clean_text, re.DOTALL | re.IGNORECASE)
+    lp_block = re.search(r"<link_pairs>(.*?)</link_pairs>", text, re.DOTALL | re.IGNORECASE)
     if lp_block:
         for pair_m in re.finditer(r"<pair>\s*<id_a>(\d+)</id_a>\s*<id_b>(\d+)</id_b>\s*</pair>", lp_block.group(1), re.IGNORECASE):
             res.link_pairs.append((int(pair_m.group(1)), int(pair_m.group(2))))
 
-    pr_block = re.search(r"<prune_ids>(.*?)</prune_ids>", clean_text, re.DOTALL | re.IGNORECASE)
+    pr_block = re.search(r"<prune_ids>(.*?)</prune_ids>", text, re.DOTALL | re.IGNORECASE)
     if pr_block:
         for id_m in re.finditer(r"<id>(\d+)</id>", pr_block.group(1), re.IGNORECASE):
             res.prune_ids.append(int(id_m.group(1)))
 
-    if not res.merge_pairs and not res.link_pairs and not res.prune_ids and "{" in clean_text:
+    if not res.merge_pairs and not res.link_pairs and not res.prune_ids and "{" in text:
         try:
-            m = re.search(r"\{.*\}", clean_text, re.DOTALL)
+            m = re.search(r"\{.*\}", text, re.DOTALL)
             if m:
                 payload = json.loads(m.group(0))
                 for p in payload.get("merge_pairs", []):
@@ -254,24 +225,17 @@ def parse_macro_scan(text: str) -> MacroScanResult:
 # ── XML System Prompt for Deep Verification (Domain-Agnostic) ────────────────
 
 SYSTEM_PROMPT_DEEP_VERIFY = """\
-You are an expert technical knowledge graph consolidator performing final quality verification.
+You are an expert knowledge consolidator performing final quality verification.
 You are given a candidate pair or cluster of concepts with their Canonical Titles, Briefs, and Top Entities.
 
 Determine the definitive action for this group:
-- MERGE: If both concepts represent the EXACT SAME real-world entity, tool, mechanism, process, or formal concept.
-- LINK: If concepts are functionally related or co-occur in the same mechanism/system but are distinct concepts.
+- MERGE: If both concepts represent the EXACT SAME real-world entity, tool, process, rule, or concept.
+- LINK: If concepts are functionally related or co-occur in the same system but are distinct concepts.
 - PRUNE: If one is uninformative web scraping boilerplate, navigational filler, or metadata junk.
 - KEEP_SEPARATE: If they are distinct concepts with no direct relationship.
 
-THINKING PROCESS (SANDBOXED):
-- Put all reasoning strictly inside `<think>...</think>` at the very start of your response.
-- Once `</think>` is closed, output ONLY the final `<verdict>...</verdict>` XML block.
-- Absolutely NO commentary or notes outside `<think>...</think>`.
-
 OUTPUT FORMAT:
-<think>
-[Analysis of candidate relationship]
-</think>
+Output ONLY the final <verdict>...</verdict> XML block with no introductory or concluding text:
 <verdict>
 <action>MERGE</action>
 <primary_title>Exact Canonical Title</primary_title>
@@ -290,21 +254,18 @@ def parse_xml_final_action(text: str) -> FinalActionVerdict:
     if not text:
         return FinalActionVerdict()
 
-    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
-
-    act_m = re.search(r"<action>(.*?)</action>", clean_text, re.IGNORECASE)
+    act_m = re.search(r"<action>(.*?)</action>", text, re.IGNORECASE)
     action = act_m.group(1).strip().upper() if act_m else "KEEP_SEPARATE"
 
-    canon_m = re.search(r"<primary_title>(.*?)</primary_title>", clean_text, re.DOTALL | re.IGNORECASE)
+    canon_m = re.search(r"<primary_title>(.*?)</primary_title>", text, re.DOTALL | re.IGNORECASE)
     primary = canon_m.group(1).strip() if canon_m else ""
 
-    reason_m = re.search(r"<reason>(.*?)</reason>", clean_text, re.DOTALL | re.IGNORECASE)
+    reason_m = re.search(r"<reason>(.*?)</reason>", text, re.DOTALL | re.IGNORECASE)
     reason = reason_m.group(1).strip() if reason_m else ""
 
-    if action == "KEEP_SEPARATE" and "{" in clean_text:
+    if action == "KEEP_SEPARATE" and "{" in text:
         try:
-            m = re.search(r"\{.*\}", clean_text, re.DOTALL)
+            m = re.search(r"\{.*\}", text, re.DOTALL)
             if m:
                 payload = json.loads(m.group(0))
                 action = payload.get("action", "KEEP_SEPARATE").upper()
@@ -370,8 +331,11 @@ class FinalConsolidationPipeline:
         if getattr(self.args, "skip_embeddings", False):
             return None
 
-        embed_servers = getattr(self.args, "embed_servers", _DEFAULT_EMBED_SERVERS)
-        embed_model = getattr(self.args, "embed_model", _DEFAULT_EMBED_MODEL)
+        embed_servers = getattr(self.args, "embed_servers", None)
+        embed_model = getattr(self.args, "embed_model", None)
+        if not embed_servers or not embed_model:
+            print("Notice: --embed_servers and --embed_model not fully specified; skipping embeddings.")
+            return None
 
         # Sort concepts by slug (`sanitize_filename(title)`) so order matches `sorted(concepts_md.glob("*.md"))`
         concepts.sort(key=lambda c: sanitize_filename(c["title"]) or "unnamed_concept")
@@ -1089,54 +1053,68 @@ class FinalConsolidationPipeline:
         }
         atomic_write_json(self.islands_file, islands_summary)
 
-        # 7. Compile and Export Markdown Wiki (with Stale File Cleanup)
+        # 7. Compile and Export Markdown Wiki, concept_index.md & entity_index.md (with Stale File Cleanup)
         print(f"Exporting Markdown Wiki to {self.md_dir}...")
         self.md_dir.mkdir(parents=True, exist_ok=True)
-        surviving_md_names: Set[str] = set()
+        surviving_md_names: Set[str] = {"concept_index.md", "entity_index.md"}
+
+        concept_index_entries: List[Tuple[str, str, str]] = []
+        entity_to_concepts: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
 
         for c in tqdm(final_concepts, desc="Exporting Markdown Pages"):
             title = c["title"]
-            brief = c.get("brief", "")
+            brief = c.get("brief", "").strip()
             desc = clean_chunk_citations(c.get("description", ""))
             relations = c.get("outbound_relations", [])
+            aliases = [a.strip() for a in c.get("aliases", []) if a.strip()]
+            entities = [e.strip() for e in c.get("entities", []) if e.strip()]
 
             safe_name = sanitize_filename(title) or "unnamed_concept"
             md_filename = f"{safe_name}.md"
             surviving_md_names.add(md_filename)
             md_path = self.md_dir / md_filename
 
-            frontmatter_str = format_yaml_frontmatter(
-                title=title,
-                brief=brief,
-                aliases=c.get("aliases", []),
-                entities=c.get("entities", [])[:15]
-            )
+            # Track for concept_index.md
+            concept_index_entries.append((safe_name, title, brief))
 
-            md_content = [frontmatter_str, f"# {title}\n"]
+            # Track for entity_index.md (both key entities and aliases)
+            for ent in entities:
+                entity_to_concepts[ent].add((safe_name, title))
+            for al in aliases:
+                entity_to_concepts[al].add((safe_name, title))
+
+            md_content = [f"# {title}\n"]
+            if aliases:
+                md_content.append(f"**Aliases**: {', '.join(aliases)}\n")
+            if entities:
+                md_content.append(f"**Key Entities**: {', '.join(entities[:15])}\n")
+
             if brief:
-                md_content.append(f"> **Overview**: {brief}\n")
+                md_content.append("## Overview\n")
+                md_content.append(f"{brief}\n")
 
             md_content.append("## Description\n")
             md_content.append(f"{desc}\n")
 
             if relations:
-                md_content.append("# Related\n")
+                md_content.append("## Related\n")
                 primary_cap = getattr(self.args, "max_primary_links", 15)
                 primary_relations = relations[:primary_cap]
                 extended_relations = relations[primary_cap:]
 
                 for rel in primary_relations:
                     tgt = rel.get("target_concept", "")
-                    r_text = rel.get("relation", "")
-                    h_score = rel.get("hybrid_score")
-                    jacc = rel.get("jaccard_similarity")
-                    score_val = h_score if h_score is not None else jacc
-                    score_str = f" *(overlap={score_val:.2f})*" if score_val is not None else ""
+                    r_text = rel.get("relation", "").strip()
                     tgt_slug = sanitize_filename(tgt) or "unnamed_concept"
-                    md_content.append(f"- [[{tgt_slug}|{tgt}]]: {r_text}{score_str}")
+                    if r_text:
+                        # Clean format: - [[slug|Title]] (relation tag)
+                        rel_desc = r_text.rstrip(".")
+                        md_content.append(f"- [[{tgt_slug}|{tgt}]] ({rel_desc})")
+                    else:
+                        md_content.append(f"- [[{tgt_slug}|{tgt}]]")
 
                 if extended_relations:
-                    md_content.append("\n### Extended Context & Mentions\n")
+                    md_content.append("\n## Mentions\n")
                     compact_links = [
                         f"[[{sanitize_filename(r.get('target_concept', ''))}|{r.get('target_concept', '')}]]"
                         for r in extended_relations if r.get("target_concept")
@@ -1145,6 +1123,32 @@ class FinalConsolidationPipeline:
                 md_content.append("")
 
             atomic_write_text(md_path, "\n".join(md_content))
+
+        # 8. Export Single-Line concept_index.md (optimized for grep)
+        print(f"Generating single-line grep-friendly concept_index.md...")
+        concept_index_entries.sort(key=lambda x: x[1].lower())
+        c_lines = ["# Concept Index\n"]
+        for slug, c_title, c_brief in concept_index_entries:
+            # Single-line format: - [[slug|Title]]: Brief description
+            if c_brief:
+                # Collapse any multiline brief to a single clean line
+                clean_brief_line = " ".join(c_brief.split())
+                c_lines.append(f"- [[{slug}|{c_title}]]: {clean_brief_line}")
+            else:
+                c_lines.append(f"- [[{slug}|{c_title}]]")
+        c_lines.append("")
+        atomic_write_text(self.md_dir / "concept_index.md", "\n".join(c_lines))
+
+        # 9. Export entity_index.md (mapping entities and aliases to concepts)
+        print(f"Generating entity_index.md...")
+        sorted_entities = sorted(entity_to_concepts.keys(), key=lambda x: x.lower())
+        e_lines = ["# Entity Index\n"]
+        for ent in sorted_entities:
+            target_links = sorted(entity_to_concepts[ent], key=lambda x: x[1].lower())
+            links_str = ", ".join([f"[[{slug}|{t}]]" for slug, t in target_links])
+            e_lines.append(f"- **{ent}**: {links_str}")
+        e_lines.append("")
+        atomic_write_text(self.md_dir / "entity_index.md", "\n".join(e_lines))
 
         # Remove any stale/pruned/merged Markdown files from `concepts_md/`
         removed_stale = 0
@@ -1181,10 +1185,10 @@ def main():
                         help="Maximum primary related links with full explanations on Markdown pages (remainder listed compactly).")
     parser.add_argument("--rescue_slots", type=int, default=2,
                         help="Number of slots within --max_primary_links reserved for reciprocal rescue backlinks to source-only nodes (default: 2).")
-    parser.add_argument("--embed_servers", nargs="+", default=_DEFAULT_EMBED_SERVERS,
+    parser.add_argument("--embed_servers", nargs="+", default=None,
                         help="vLLM embedding server endpoints for cosine similarity link scoring.")
-    parser.add_argument("--embed_model", type=str, default=_DEFAULT_EMBED_MODEL,
-                        help="Embedding model name (default: Qwen/Qwen3-Embedding-8B).")
+    parser.add_argument("--embed_model", type=str, default=None,
+                        help="Embedding model name (e.g. Qwen/Qwen3-Embedding-8B).")
     parser.add_argument("--skip_embeddings", action="store_true",
                         help="Skip GPU embedding computation and rank links by Jaccard + Containment only.")
     parser.add_argument("--recompute_embeddings", action="store_true",

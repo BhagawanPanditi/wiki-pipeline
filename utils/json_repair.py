@@ -1,14 +1,6 @@
-"""JSON extraction from raw model output.
-
-Nine stage scripts each carried their own copy of ``clean_json_string``. The
-copies were not identical, so this module parameterises the three real
-behaviours instead of collapsing them into one and silently changing output:
-
-* default                 fenced ```json {...}``` block only
-* ``allow_bare_object``   also accept an unfenced outermost ``{...}``
-                          (refine_concepts behaviour)
-* ``allow_array``         also accept a fenced ``[...]`` payload
-                          (final_consolidation behaviour)
+"""JSON Extraction & Fallback Repair.
+------------------------------------
+Extracts JSON payloads from model output blocks and repairs truncated JSON responses.
 """
 
 import re

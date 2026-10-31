@@ -1,16 +1,8 @@
-"""Bounded retry with error classification.
+"""Bounded retry loop with error classification and jittered backoff.
 
-Replaces the ``for attempt in range(10)`` + ad-hoc ``asyncio.sleep`` loops that
-were copy-pasted through eight stages. Three properties matter here:
-
-* permanent errors (400/401/404/422) fail on the first attempt instead of
-  burning ten rounds of backoff on a request that can never succeed;
-* backoff is short and capped (2s -> 20s transient, 0.5s -> 4s recoverable)
-  with jitter, so a stage degrades gracefully without idling for minutes;
-* every attempt consults the stage's wall-clock budget, so no stage can run
-  indefinitely on waiting alone.
-
-Each attempt is streamed to the debug sink untruncated before it is retried.
+Provides robust retry logic for asynchronous LLM calls and network operations.
+Distinguishes between transient network errors (which back off and retry) and
+permanent failures (e.g. 400/401/404/422 or exhausted budgets, which fail immediately).
 """
 
 import asyncio

@@ -20,17 +20,14 @@ def main():
         None. Exits 2 when ``config.json`` is invalid and 1 when any server is
         unreachable, so a caller can tell the two apart."""
     try:
-        servers, model = load_global_config()
+        raw_servers, model = load_global_config()
         overrides = load_stage_overrides()
     except ValueError as exc:
         print(f"ERROR: {exc}")
         sys.exit(2)
-    for name, value in overrides.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float, dict)):
-            print(f"ERROR: config.json stage_concurrency['{name}'] must be a number or an object.")
-            sys.exit(2)
+    servers = list(raw_servers.keys()) if isinstance(raw_servers, dict) else raw_servers
     if not isinstance(servers, list) or not servers or any(not isinstance(s, str) or not s.strip() for s in servers):
-        print("ERROR: config.json must contain a non-empty 'servers' list of URLs.")
+        print("ERROR: config.json must contain a non-empty 'servers' list or dictionary of URLs.")
         sys.exit(2)
 
     print("=" * 65)

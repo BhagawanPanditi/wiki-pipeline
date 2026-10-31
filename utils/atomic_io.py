@@ -1,10 +1,7 @@
-"""Atomic file writers for durable checkpoints, graphs and debug logs.
-
-A Slurm job can be preempted between ``open()`` and the final ``write()``, so
-every state file is written to a sibling temporary, fsynced, then renamed over
-the target. ``_fsync_dir`` also flushes the rename itself: without it a power
-loss can leave the directory pointing at the old inode even though the new
-file's data reached disk.
+"""Atomic I/O Utilities.
+-----------------------
+Provides crash-resilient file writers using sibling temporary files, fsync,
+and atomic file renames to prevent partial/torn writes during preemption or shutdown.
 """
 
 import json

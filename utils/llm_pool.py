@@ -1,19 +1,7 @@
-"""Evenly spread LLM work across a pool of vLLM servers.
-
-The old pattern built ``len(servers) * concurrency`` workers that all pulled
-from one shared queue. Workers were pinned to a server, but *dispatch* was a
-race, so the tail of a run could pile onto whichever server happened to have
-free workers - five remaining items could all land on server 1 while servers
-2-5 idled.
-
-This pool partitions the work up front: item ``i`` goes to server ``i % N``.
-The spread is exact and deterministic (each server receives within one item of
-the others), each server's in-flight count is capped by its own worker count,
-and progress plus per-item results stream out as they complete.
-
-If a server stops accepting connections its remaining queue is handed to the
-healthy servers instead of failing, and the run only aborts when every server
-is down.
+"""vLLM Distributed Server Pool & Worker Dispatch.
+--------------------------------------------------
+Evenly partitions LLM requests across a cluster of OpenAI-compatible vLLM servers
+with per-server concurrency limits, automatic failover, and request timeouts.
 """
 
 import asyncio

@@ -1,20 +1,7 @@
-"""Error classification and wall-clock budgeting for pipeline stages.
-
-The pipeline talks to vLLM over HTTP, and its failures fall into three classes
-that need very different responses. Conflating them is what made the old retry
-loops simultaneously slow and fragile: a 400 Bad Request was retried ten times
-with exponential backoff even though it can never succeed, while a genuine
-network timeout deserved more patience than it got.
-
-TRANSIENT    network / server faults      -> retry with capped backoff
-RECOVERABLE  malformed or truncated model
-             output                       -> retry quickly (resampling helps)
-PERMANENT    request / config errors      -> fail immediately, dump full debug
-
-Unknown exceptions are treated as RECOVERABLE rather than PERMANENT. That is
-deliberate: it preserves the previous behaviour where any parse or schema
-failure was retried, while still failing fast on the errors that provably
-cannot succeed.
+"""Pipeline Error Handling & Classification.
+--------------------------------------------
+Classifies errors into transient (server network faults), recoverable (malformed/truncated
+model outputs), and permanent (invalid requests/syntax) to manage intelligent retry loops.
 """
 
 import asyncio

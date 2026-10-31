@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
+"""Stage 2 & Stage 4: Extraction Verification & Audit.
+----------------------------------------------------
+Audits extracted concepts against raw document chunks for factual completeness,
+reporting missing concepts, omitted details, and hallucinations.
+- Phase 1 (Stage 2): Audits Pass 1 output and produces repair feedback for Pass 2.
+- Phase 2 (Stage 4): Audits Pass 2 output and computes measured delta improvements.
+
+Usage:
+    python3 verify_extraction.py --wiki_path /path/to/wiki --phase 1
+    python3 verify_extraction.py --wiki_path /path/to/wiki --phase 2
 """
-Extraction Verifier & Auditor - runs twice, once per extraction pass.
-----------------------------------------------------------------------
-Phase 1 audits the raw Pass 1 output and produces the ``missing_concepts`` /
-``missing_facts`` feedback that Pass 2 consumes as its repair instructions.
-Phase 2 re-audits the same chunks after Pass 2 has merged its repairs, so the
-two runs are directly comparable and their difference is the measured
-improvement.
 
-The phases write to separate files precisely because Pass 2 reads phase 1:
-
-    phase 1 -> staging/<doc>/<chunk>/verification.json         + verification_log.json
-    phase 2 -> staging/<doc>/<chunk>/verification_pass2.json   + verification_pass2_log.json
-
-Phase 2 additionally writes ``verification_summary.json`` in the domain
-directory holding both runs plus the deltas, and prints the improvement table.
-
-Requests are spread evenly across the configured vLLM servers (item i goes to
-server i % N), every failure is streamed to ``verification_debug.jsonl`` with
-the full untruncated prompt and raw response, and the stage stops on a
-wall-clock budget rather than idling on backoff.
-"""
 
 import asyncio
 import json
@@ -89,39 +79,32 @@ class VerificationResult(BaseModel):
 
 # ── System Prompt for Audit Verification ─────────────────────────────────────
 VERIFICATION_SYSTEM_PROMPT = """\
-You are an expert technical knowledge auditor evaluating an automated Knowledge Graph extraction.
+You are an expert knowledge auditor evaluating a Knowledge Wiki extraction.
 Your task is to compare a RAW TEXT CHUNK against the EXTRACTED CONCEPTS to verify factual completeness, accuracy, and core concept coverage.
 
 AUDIT DEFINITIONS & EXPECTATIONS:
 1. SOLID CONCEPTS ONLY (NO FRAGMENTATION):
-   - Concepts are expected to be major, solid, well-developed subjects (a core idea, system, entity, method, mechanism, theory, phenomenon, or process).
-   - Minor parameters, sub-steps, properties, and variants should NOT be standalone concepts; they are expected to be absorbed directly into the comprehensive description of their primary parent concept.
+   - A concept is a canonical, self-contained, semantically coherent unit of knowledge that captures a meaningful subject or body of information, along with its relevant facts, properties, and relationships. It is independent of document boundaries and is not merely a keyword or arbitrary text chunk.
+   - Minor parameters, sub-steps, properties, and narrow variants should NOT be standalone concepts; they are expected to be absorbed directly into the comprehensive description of their primary parent concept (with narrow sub-topic names preserved in aliases).
    - Do NOT penalize the extraction for omitting meta-labels ("Introduction", "Summary") or for not creating thin stub concepts for minor properties.
 
 2. SUBSTANTIVE FACTS TO AUDIT (ZERO FACT LOSS):
-   - Verify that all core technical metrics, parameters, benchmark scores, formulas, conditions, procedural steps, and quantitative bounds from the raw text are explicitly retained inside concept descriptions.
-   - Verify that specific named terms, tools, algorithms, or classifications are retained.
+   - Verify that all core facts, properties, identifiers, terms, numbers, operational conditions, rules, relationships, chronology, and attributions from the raw text are explicitly retained inside concept descriptions.
+   - Verify that specific names, definitions, or classifications are retained.
 
 3. NOISE & NON-FACTS (SILENTLY IGNORE):
    - Silently ignore HTML tags, web scraping artifacts, navigation menus, headers/footers, cookie notices, citations, and boilerplate. Do NOT penalize the extraction for omitting them, and do NOT flag them as missing facts or missing concepts.
 
 4. SCORING CRITERIA:
 - `coverage_score` (0.0 to 1.0):
-  - 1.0: Perfect retention. All main themes and key quantitative/technical facts captured.
-  - 0.8 - 0.9: Main themes captured; missed minor secondary metrics.
-  - 0.5 - 0.7: Omitted a primary thematic concept or several key findings.
+  - 1.0: Perfect retention. All main themes and key facts captured.
+  - 0.8 - 0.9: Main themes captured; missed minor secondary details.
+  - 0.5 - 0.7: Omitted a primary thematic concept or several key details.
   - < 0.5: Severe omissions of main body content.
 - `is_sufficient`: `true` if coverage_score >= 0.85 and NO major primary concept was dropped. Otherwise `false`.
 
-THINKING PROCESS (SANDBOXED):
-- If you need to reason or analyze omissions, you MUST do so strictly inside `<think>...</think>` tags at the very start of your response.
-- Once `</think>` is closed, output ONLY the final `<verification>...</verification>` XML block.
-- Absolutely NO commentary or notes outside `<think>...</think>` or outside `<verification>` tags.
-
 OUTPUT FORMAT:
-<think>
-[Auditor analysis and comparison notes]
-</think>
+Output ONLY the final <verification>...</verification> XML block with no introductory or concluding text:
 <verification>
 <coverage_score>0.95</coverage_score>
 <is_sufficient>true</is_sufficient>
@@ -129,7 +112,7 @@ OUTPUT FORMAT:
 - Name of missing PRIMARY theme (if any, max 8)
 </missing_concepts>
 <missing_facts>
-- Specific missing technical metric or finding (if any, max 20)
+- Specific missing fact or detail (if any, max 20)
 </missing_facts>
 <hallucinations>
 - Fact in extraction that contradicts or is absent from raw text (if any, max 8)
@@ -309,9 +292,9 @@ CURRENT EXTRACTED CONCEPTS TO AUDIT:
 
 AUDITOR INSTRUCTION:
 Compare the RAW SOURCE CHUNK against the EXTRACTED CONCEPTS above.
-Evaluate whether the extraction accurately captured the core concepts and substantive technical facts from the text.
-Identify any genuinely missing primary concepts (max {MAX_MISSING_CONCEPTS}), missing quantitative facts (max {MAX_MISSING_FACTS}), or hallucinations (max {MAX_HALLUCINATIONS}).
-If you need to think, put all thinking strictly inside <think>...</think>, followed immediately by the <verification>...</verification> block.
+Evaluate whether the extraction accurately captured the core concepts and substantive facts from the text.
+Identify any genuinely missing primary concepts (max {MAX_MISSING_CONCEPTS}), missing facts (max {MAX_MISSING_FACTS}), or hallucinations (max {MAX_HALLUCINATIONS}).
+Output ONLY the <verification>...</verification> block.
 """
 
     def parse_verification(self, raw_text: Optional[str], key: str) -> VerificationResult:
@@ -319,14 +302,10 @@ If you need to think, put all thinking strictly inside <think>...</think>, follo
         if not raw_text:
             raise ValueError("Empty verification response")
 
-        # 1. Strip thinking tags
-        clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
-        clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
-
-        # 2. Check for XML <verification> block
-        if "<verification>" in clean_text:
-            block_m = re.search(r"<verification>((?:(?!<verification>).)*?)</verification>", clean_text, re.DOTALL | re.IGNORECASE)
-            block = block_m.group(1) if block_m else clean_text
+        # 1. Check for XML <verification> block
+        if "<verification>" in raw_text:
+            block_m = re.search(r"<verification>((?:(?!<verification>).)*?)</verification>", raw_text, re.DOTALL | re.IGNORECASE)
+            block = block_m.group(1) if block_m else raw_text
 
             score_m = re.search(r"<coverage_score>(.*?)</coverage_score>", block, re.DOTALL | re.IGNORECASE)
             coverage_score = 0.90

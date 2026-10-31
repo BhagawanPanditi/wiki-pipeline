@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
+"""Stage 5: Document-Level Concept Consolidation.
+----------------------------------------------
+Deduplicates and merges concept mentions within each document across its multiple
+chunks, consolidating descriptions and tracking chunk citations.
+
+Usage:
+    python3 consolidate_documents.py --wiki_path /path/to/wiki
 """
-Document-Level Knowledge Graph Consolidation Pass
--------------------------------------------------
-Merges duplicate concepts within each document across its multiple chunks.
-Uses XML prompts, sandboxed <think> tags, non-thinking mode support,
-and outputs thin concept statistics (word-count distribution).
-"""
+
 
 import asyncio
 import json
@@ -45,13 +47,13 @@ class DocumentConsolidationSchema(BaseModel):
 SYSTEM_PROMPT_CONSOLIDATE = """\
 You are an expert technical knowledge graph consolidator.
 You are given a list of candidate concepts extracted across multiple chunks of the SAME document.
-Because these concepts were extracted independently per chunk, many represent the EXACT SAME real-world entity, process, software tool, gene, condition, or technical subject under slightly different titles or acronyms.
+Because these concepts were extracted independently per chunk, many represent the EXACT SAME subject, entity, software tool, process, condition, or topic under slightly different titles or acronyms.
 
 YOUR MISSION:
-Identify groups of concepts that refer to the exact same core concept/entity within this document and should be merged together.
+Identify groups of concepts that refer to the exact same core concept/subject within this document and should be merged together.
 
 CRITICAL RULES:
-1. MERGE CRITERIA: Merge concepts ONLY if they refer to the exact same canonical entity, tool, process, acronym, or subject.
+1. MERGE CRITERIA: Merge concepts ONLY if they refer to the exact same canonical subject, entity, tool, process, acronym, or topic.
 2. DO NOT MERGE DISTINCT CONCEPTS: Do NOT merge distinct sub-components, related but separate concepts, or parent/child hierarchy terms.
 3. PRIMARY TITLE SELECTION: Pick the most standard, canonical, explicit title as `primary_title`.
 4. SCOPE: ONLY include titles that exist in the provided candidate concepts list.
@@ -83,17 +85,13 @@ If no concepts need to be merged, output:
 # ── XML Parsing Helper ────────────────────────────────────────────────────────
 
 def parse_xml_merge_clusters(text: str) -> List[MergeCluster]:
-    """Parse <merge_clusters> blocks into MergeCluster objects, stripping thinking tags."""
+    """Parse <merge_clusters> blocks into MergeCluster objects directly."""
     if not text:
         return []
 
-    # 1. Strip thinking tags
-    clean_text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    clean_text = re.sub(r"<thought>.*?(?:</thought>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE)
-
     clusters: List[MergeCluster] = []
     # Match each <cluster> block
-    cluster_blocks = re.findall(r"<cluster>(.*?)</cluster>", clean_text, re.DOTALL | re.IGNORECASE)
+    cluster_blocks = re.findall(r"<cluster>(.*?)</cluster>", text, re.DOTALL | re.IGNORECASE)
     for block in cluster_blocks:
         title_m = re.search(r"<primary_title>(.*?)</primary_title>", block, re.DOTALL | re.IGNORECASE)
         if not title_m or not title_m.group(1).strip():
@@ -112,9 +110,9 @@ def parse_xml_merge_clusters(text: str) -> List[MergeCluster]:
         clusters.append(MergeCluster(primary_title=primary_title, merged_titles=merged_titles))
 
     # JSON fallback in case model emitted JSON
-    if not clusters and "{" in clean_text:
+    if not clusters and "{" in text:
         try:
-            m = re.search(r"\{.*\}", clean_text, re.DOTALL)
+            m = re.search(r"\{.*\}", text, re.DOTALL)
             if m:
                 payload = json.loads(m.group(0))
                 if "merge_clusters" in payload:
@@ -223,7 +221,7 @@ class WikiDocumentConsolidatorPipeline:
     def prepare_document_items(self) -> List[Dict[str, Any]]:
         """Collect all canonical documents and their raw chunk concepts."""
         print(f"Scanning staging directory: {self.staging_dir}...")
-        doc_dirs = sorted([d for d in self.staging_dir.iterdir() if d.is_dir() and d.name.startswith("canon_")])
+        doc_dirs = sorted([d for d in self.staging_dir.iterdir() if d.is_dir() and not d.name.startswith(".")])
         doc_items = []
 
         for doc_dir in doc_dirs:
