@@ -726,7 +726,7 @@ class FinalConsolidationPipeline:
                 # Reject merge if combined size > 1200 tokens (~900 words) unless one is a stub (<45 words)
                 if combined_words > 900 and min(len1, len2) > 45:
                     print(f"[MERGE GUARD] Skipped merging large concepts '{t1}' ({len1}w) and '{t2}' ({len2}w). Converting to LINK.")
-                    additional_links.append((t1, t2, "Closely related counterpart in domain."))
+                    additional_links.append((t1, t2, "closely related domain counterpart"))
                     continue
                 merge_uf.union(t1, t2)
                 verified_merges += 1
@@ -889,8 +889,10 @@ class FinalConsolidationPipeline:
                 union_len = len(ents1 | ents2)
                 calc_jacc = round(len(shared_ents) / union_len, 3) if union_len > 0 else 0.0
 
-                # Use verified predicate if provided, otherwise leave empty so exporter renders bare wikilink
-                rel_text = rel_phrase.rstrip(".") if (rel_phrase and len(rel_phrase.split()) <= 6) else ""
+                # Deep verification pairs must always have a valid predicate phrase
+                rel_text = rel_phrase.rstrip(".,;:").strip()
+                if not rel_text or len(rel_text.split()) > 7 or any(kw in rel_text.lower() for kw in ["distinct", "aspects", "two concepts", "focuses"]):
+                    rel_text = "directly related topic"
 
                 if root2.lower() not in targets1:
                     c1_obj["outbound_relations"].append({
@@ -1061,8 +1063,7 @@ class FinalConsolidationPipeline:
                     tgt_obj = concept_by_name.get(tgt.lower())
                     tgt_slug = tgt_obj.get("slug") if tgt_obj else generate_stable_slug(tgt)
 
-                    # Only show parenthesis if there is a concise predicate (2 to 6 words)
-                    # and it does not contain meta-reasoning words or parentheses
+                    # Ensure every related link has a clean, concise descriptive phrase
                     words = r_text.split() if r_text else []
                     is_valid_predicate = (
                         2 <= len(words) <= 7
@@ -1073,10 +1074,10 @@ class FinalConsolidationPipeline:
 
                     if is_valid_predicate:
                         clean_phrase = " ".join(words).rstrip(".,;:")
-                        md_content.append(f"- [[{tgt_slug}|{tgt}]] ({clean_phrase})")
                     else:
-                        # Clean bare wikilink with no parentheses
-                        md_content.append(f"- [[{tgt_slug}|{tgt}]]")
+                        clean_phrase = "directly related topic"
+
+                    md_content.append(f"- [[{tgt_slug}|{tgt}]] ({clean_phrase})")
 
                 # Section 4.3: Compact "Referenced by" list guaranteeing reachability from spoke to hub
                 refs = referenced_by_map.get(title.lower(), [])
