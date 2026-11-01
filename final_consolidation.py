@@ -130,13 +130,17 @@ Determine the definitive action for this group:
 - PRUNE: If one is confirmed boilerplate, navigational junk, or scraping residue.
 - KEEP_SEPARATE: If they are distinct concepts with no direct relationship.
 
+GUIDELINES FOR LINK:
+If action is LINK, output a concise directional relationship phrase (2 to 6 words, no parentheses, no meta-reasoning, no trailing punctuation) in <relation_phrase>.
+Example good phrases: "is a specialized subsystem of", "is a common pathology affecting", "serves as an input to".
+
 OUTPUT FORMAT:
 Output ONLY the final <verdict>...</verdict> XML block:
 <verdict>
 <action>MERGE | LINK | PRUNE | KEEP_SEPARATE</action>
 <primary_title>Exact Canonical Title to keep for MERGE</primary_title>
 <prune_title>Exact Canonical Title of the junk concept for PRUNE</prune_title>
-<reason>One clear sentence explaining the verdict.</reason>
+<relation_phrase>Concise 2-6 word predicate if LINK, otherwise leave empty</relation_phrase>
 </verdict>
 """
 
@@ -145,7 +149,7 @@ class FinalActionVerdict(BaseModel):
     action: str = "KEEP_SEPARATE"
     primary_title: str = ""
     prune_title: str = ""
-    reason: str = ""
+    relation_phrase: str = ""
 
 
 def parse_xml_final_action(text: str) -> FinalActionVerdict:
@@ -161,8 +165,16 @@ def parse_xml_final_action(text: str) -> FinalActionVerdict:
     prune_m = re.search(r"<prune_title>(.*?)</prune_title>", text, re.DOTALL | re.IGNORECASE)
     prune = prune_m.group(1).strip() if prune_m else ""
 
-    reason_m = re.search(r"<reason>(.*?)</reason>", text, re.DOTALL | re.IGNORECASE)
-    reason = reason_m.group(1).strip() if reason_m else ""
+    rel_m = re.search(r"<relation_phrase>(.*?)</relation_phrase>", text, re.DOTALL | re.IGNORECASE)
+    rel_phrase = rel_m.group(1).strip() if rel_m else ""
+
+    # Backwards compatibility check for <reason> if present and short
+    if not rel_phrase:
+        reason_m = re.search(r"<reason>(.*?)</reason>", text, re.DOTALL | re.IGNORECASE)
+        if reason_m:
+            r_raw = reason_m.group(1).strip()
+            if len(r_raw.split()) <= 6 and not any(kw in r_raw.lower() for kw in ["distinct", "aspects", "two concepts", "focuses"]):
+                rel_phrase = r_raw
 
     if action == "KEEP_SEPARATE" and "{" in text:
         try:
@@ -172,11 +184,11 @@ def parse_xml_final_action(text: str) -> FinalActionVerdict:
                 action = payload.get("action", "KEEP_SEPARATE").upper()
                 primary = payload.get("primary_title", "")
                 prune = payload.get("prune_title", "")
-                reason = payload.get("reason", "")
+                rel_phrase = payload.get("relation_phrase", "") or payload.get("relation", "")
         except Exception:
             pass
 
-    return FinalActionVerdict(action=action, primary_title=primary, prune_title=prune, reason=reason)
+    return FinalActionVerdict(action=action, primary_title=primary, prune_title=prune, relation_phrase=rel_phrase)
 
 
 # ── DisjointSet ───────────────────────────────────────────────────────────────
@@ -722,8 +734,8 @@ class FinalConsolidationPipeline:
         # (C) Collect LINK
         for (c1, c2), verdict in decisions:
             if verdict.action == "LINK" and c1["title"] not in pruned_titles and c2["title"] not in pruned_titles:
-                reason = verdict.reason.strip() if verdict.reason else ""
-                additional_links.append((c1["title"], c2["title"], reason))
+                rel_phrase = verdict.relation_phrase.strip() if verdict.relation_phrase else ""
+                additional_links.append((c1["title"], c2["title"], rel_phrase))
 
         print(f"Decisions collected: {len(pruned_titles)} pruned, {verified_merges} merged, {len(additional_links)} linked.")
 
@@ -862,7 +874,7 @@ class FinalConsolidationPipeline:
             del c["_raw_relations"]
 
         # Apply Additional Verified Links
-        for t1, t2, reason in additional_links:
+        for t1, t2, rel_phrase in additional_links:
             root1 = canonical_title_map.get(merge_uf.find(t1), t1)
             root2 = canonical_title_map.get(merge_uf.find(t2), t2)
             if root1.lower() != root2.lower() and root1.lower() in concept_by_name and root2.lower() in concept_by_name:
@@ -877,10 +889,8 @@ class FinalConsolidationPipeline:
                 union_len = len(ents1 | ents2)
                 calc_jacc = round(len(shared_ents) / union_len, 3) if union_len > 0 else 0.0
 
-                # When linking verified pairs, use a concise relationship label rather than dumping long justifications
-                rel_text = "directly related topic"
-                if reason and len(reason.split()) <= 8 and not any(kw in reason.lower() for kw in ["distinct", "aspects of", "two concepts", "focuses on"]):
-                    rel_text = reason.rstrip(".")
+                # Use verified predicate if provided, otherwise leave empty so exporter renders bare wikilink
+                rel_text = rel_phrase.rstrip(".") if (rel_phrase and len(rel_phrase.split()) <= 6) else ""
 
                 if root2.lower() not in targets1:
                     c1_obj["outbound_relations"].append({
@@ -898,6 +908,8 @@ class FinalConsolidationPipeline:
                         if r["target_concept"].lower() == root2.lower():
                             r["verified_by_llm"] = True
                             r["link_type"] = "llm_verified"
+                            if rel_text and not r.get("relation"):
+                                r["relation"] = rel_text
 
                 if root1.lower() not in targets2:
                     c2_obj["outbound_relations"].append({
@@ -915,6 +927,8 @@ class FinalConsolidationPipeline:
                         if r["target_concept"].lower() == root1.lower():
                             r["verified_by_llm"] = True
                             r["link_type"] = "llm_verified"
+                            if rel_text and not r.get("relation"):
+                                r["relation"] = rel_text
 
         # 5b. Score Ranking + Reciprocal Rescue Backlinks
         primary_cap = getattr(self.args, "max_primary_links", 15)
@@ -1047,25 +1061,21 @@ class FinalConsolidationPipeline:
                     tgt_obj = concept_by_name.get(tgt.lower())
                     tgt_slug = tgt_obj.get("slug") if tgt_obj else generate_stable_slug(tgt)
 
-                    # Clean relation explanation: strip nested parenthetical justifications and dangling prepositions
-                    if r_text:
-                        # Strip concatenated justification like: "phrase (The two concepts represent distinct...)"
-                        r_text = re.sub(r"\s*\([^)]*(?:The two concepts|aspects of|closely related|distinct)[^)]*\)", "", r_text, flags=re.IGNORECASE).strip()
-                        if r_text.lower().startswith("verified:"):
-                            inner = r_text[9:].strip()
-                            r_text = "directly related topic" if any(w in inner.lower() for w in ["distinct", "aspects", "focuses"]) or len(inner) > 60 else inner
+                    # Only show parenthesis if there is a concise predicate (2 to 6 words)
+                    # and it does not contain meta-reasoning words or parentheses
+                    words = r_text.split() if r_text else []
+                    is_valid_predicate = (
+                        2 <= len(words) <= 7
+                        and "(" not in r_text
+                        and ")" not in r_text
+                        and not any(w in r_text.lower() for w in ["distinct", "aspects of", "two concepts", "focuses", "verified:"])
+                    )
 
-                        # Clean trailing prepositions/articles like: "is a refractive error affecting the" -> "is a refractive error affecting this system"
-                        words = r_text.split()
-                        dangling = {"the", "a", "an", "of", "to", "in", "with", "by", "for", "from", "on", "into", "at"}
-                        while words and words[-1].lower() in dangling:
-                            words.pop()
-                        rel_desc = " ".join(words).rstrip(".")
-                        if rel_desc:
-                            md_content.append(f"- [[{tgt_slug}|{tgt}]] ({rel_desc})")
-                        else:
-                            md_content.append(f"- [[{tgt_slug}|{tgt}]]")
+                    if is_valid_predicate:
+                        clean_phrase = " ".join(words).rstrip(".,;:")
+                        md_content.append(f"- [[{tgt_slug}|{tgt}]] ({clean_phrase})")
                     else:
+                        # Clean bare wikilink with no parentheses
                         md_content.append(f"- [[{tgt_slug}|{tgt}]]")
 
                 # Section 4.3: Compact "Referenced by" list guaranteeing reachability from spoke to hub
