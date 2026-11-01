@@ -234,7 +234,11 @@ def load_corpus(path: Path) -> List[Dict[str, str]]:
 
 
 def deduplicate(docs: List[Dict[str, str]]) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Index documents by their clean document id (doc_XXXXX), deduplicating if needed.
+    """Index documents by their clean document id (doc_XXXXX), deduplicating identical content.
+
+    Matches the exact mapping behavior of prepare_bright.py:
+    - Identical content across different original IDs maps to the same doc_XXXXX.
+    - Each unique piece of content gets a sequentially assigned doc_XXXXX.
 
     Args:
         docs: Normalised records from :func:`load_corpus`.
@@ -244,19 +248,36 @@ def deduplicate(docs: List[Dict[str, str]]) -> Tuple[Dict[str, str], Dict[str, s
             * ``canon_docs`` -- ``{doc_id: content}``, one entry per unique
               document, in first-seen order.
             * ``doc_mapping`` -- ``{original_id: doc_id}`` for every record
-              in the corpus. This is the citation mapping written to ``doc_mapping.json``.
+              in the corpus. This matches orig_to_new.json in prepare_bright.py.
     """
+    seen_content_hashes: Dict[str, str] = {}
     canon_docs: Dict[str, str] = {}
     doc_mapping: Dict[str, str] = {}
+    doc_count = 0
+
     for idx, doc in enumerate(docs, start=1):
-        raw_id = doc.get("id") or ""
+        raw_id = str(doc.get("id") or f"doc_{idx}")
+        content = doc.get("content", "")
+
+        # Hash text for content-based deduplication
+        chash = hashlib.md5(content.encode("utf-8")).hexdigest()
+
+        if chash in seen_content_hashes:
+            existing_doc_id = seen_content_hashes[chash]
+            doc_mapping[raw_id] = existing_doc_id
+            continue
+
+        doc_count += 1
         # If the input id is already a doc_XXXXX, keep it; otherwise assign doc_XXXXX format
         if raw_id.startswith("doc_"):
             doc_id = raw_id
         else:
-            doc_id = f"doc_{idx:05d}"
-        canon_docs.setdefault(doc_id, doc["content"])
-        doc_mapping[raw_id if raw_id else doc_id] = doc_id
+            doc_id = f"doc_{doc_count:05d}"
+
+        seen_content_hashes[chash] = doc_id
+        canon_docs[doc_id] = content
+        doc_mapping[raw_id] = doc_id
+
     return canon_docs, doc_mapping
 
 
