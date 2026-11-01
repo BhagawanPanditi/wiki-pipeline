@@ -48,9 +48,10 @@ Decompose this broad topic into more digestible, focused concepts:
 2. <child>: 2 to 4 discrete CHILD concepts (each 150 to 350 words) covering distinct subtopics, components, or operational phases.
 
 CRITICAL RULES:
-- FACT PRESERVATION: Do NOT lose any specific numbers, metrics, experimental findings, or parameters. Every fact in the original text must live in either the pillar or one of the child concepts.
-- NO INLINE CITATIONS IN PROSE: Do NOT write bracketed citations like [doc_00251] in the prose. Instead, wrap each paragraph in <paragraph doc_id="...">prose...</paragraph> using the provided doc_id.
-- TITLES: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Canine Retinal Photoreception", NOT just "Photoreceptors").
+- 100% FACT & PROVENANCE PRESERVATION: Do NOT lose any specific numbers, metrics, or factual statements. Every single source document (e.g. doc_00020, doc_00023, doc_00024) must retain its factual contributions across either the pillar or one of the child concepts.
+- PRESERVE SOURCE DOC IDs: You MUST attribute each paragraph to its originating doc_id using <paragraph doc_id="doc_XXXXX">...</paragraph>. Never attribute facts from doc_00023 to doc_00020 or vice versa. If a child concept covers information discussed in doc_00023, include a <paragraph doc_id="doc_00023"> block inside that child.
+- NO INLINE CITATIONS IN PROSE: Do NOT write bracketed citations like [doc_00251] in the prose. The provenance is captured strictly by the doc_id attribute on <paragraph>.
+- TITLES: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Workstation Ergonomics and Lighting", NOT just "Ergonomics").
 - NO NOISE: Output no introductory text, commentary, or markdown formatting outside the XML tags.
 - IF NOT DECOMPOSABLE: If the concept cannot be cleanly divided without severe redundancy, output exactly: <cannot_decompose/>
 
@@ -283,9 +284,24 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
                 decomposed_count += 1
                 pillar_slug = c.get("slug") or generate_stable_slug(t, used_slugs)
                 c["slug"] = pillar_slug
-                # Update pillar paragraphs
-                if decomp_data.get("pillar_paragraphs"):
-                    c["paragraphs"] = decomp_data["pillar_paragraphs"]
+
+                # Safety: Ensure no source documents from parent are dropped across pillar + children
+                orig_paras = c.get("paragraphs", [])
+                pillar_paras = list(decomp_data.get("pillar_paragraphs", []))
+                all_child_paras = []
+                for ch in decomp_data.get("children", []):
+                    all_child_paras.extend(ch.get("paragraphs", []))
+
+                surviving_docs = {p.get("doc_id") for p in pillar_paras + all_child_paras if p.get("doc_id")}
+                # If any original doc_id was omitted by LLM in decomposition, retain it in the pillar
+                for orig_p in orig_paras:
+                    did = orig_p.get("doc_id")
+                    if did and did != "unknown" and did not in surviving_docs:
+                        print(f"[PROVENANCE RESCUE] Rescued omitted doc '{did}' back into pillar '{t}'.")
+                        pillar_paras.append(orig_p)
+                        surviving_docs.add(did)
+
+                c["paragraphs"] = pillar_paras
                 c.pop("description", None)
                 c.pop("source_chunks", None)
 
