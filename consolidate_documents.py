@@ -410,12 +410,7 @@ class WikiDocumentConsolidatorPipeline:
                 if src_chunk:
                     source_chunks_set.add(src_chunk)
 
-            fused_desc = fuse_descriptions([c.get("description", "") for c in concept_group]).strip()
-            # Enforce document-level citation at the end of the document's consolidated description
-            if fused_desc and f"[{doc_id}]" not in fused_desc:
-                if not fused_desc.endswith((".", "!", "?")):
-                    fused_desc += "."
-                fused_desc = f"{fused_desc} [{doc_id}]"
+            fused_desc = fuse_descriptions([c.get("description", "") for c in concept_group])
 
             consolidated_concepts.append({
                 "title": chosen_title,
