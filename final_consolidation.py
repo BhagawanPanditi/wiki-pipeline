@@ -27,7 +27,11 @@ from utils.atomic_io import atomic_write_json, atomic_write_text, sanitize_filen
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.citation_utils import clean_chunk_citations
 from utils.cli import build_parser, resolve_settings
-from utils.concept_ops import fuse_descriptions_by_document, generate_stable_slug
+from utils.concept_ops import (
+    format_description_into_per_doc_paragraphs,
+    fuse_descriptions_by_document,
+    generate_stable_slug,
+)
 from utils.llm_pool import pool_for_stage
 from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.stats import print_link_distribution
@@ -1027,57 +1031,7 @@ class FinalConsolidationPipeline:
                 md_content.append(f"{brief}\n")
 
             # Format description into clean distinct paragraphs per source document with citations at the end of each paragraph
-            doc_citations = []
-            for sc in c.get("source_chunks", []):
-                doc_id = sc.split("::")[0] if "::" in sc else sc
-                if doc_id and doc_id not in doc_citations:
-                    doc_citations.append(doc_id)
-
-            # If description came from multiple documents but lacks paragraph breaks, reconstruct distinct per-document paragraphs from consolidated/
-            consolidated_dir = self.wiki_path / "consolidated"
-            reconstructed_paras = []
-            if len(doc_citations) > 1 and "\n\n" not in desc and consolidated_dir.exists():
-                title_norm = title.strip().casefold()
-                for did in doc_citations:
-                    cf = consolidated_dir / did / "concepts.json"
-                    if cf.exists():
-                        try:
-                            with open(cf, "r", encoding="utf-8") as f:
-                                c_list = json.load(f).get("concepts", [])
-                                matched = None
-                                for cand in c_list:
-                                    if cand.get("title", "").strip().casefold() == title_norm:
-                                        matched = cand
-                                        break
-                                    if any(a.strip().casefold() == title_norm for a in cand.get("aliases", [])):
-                                        matched = cand
-                                        break
-                                if matched and matched.get("description"):
-                                    p_txt = matched["description"].strip()
-                                    p_txt = re.sub(r"\[(?:doc_|canon_)[A-Za-z0-9_-]+::[A-Za-z0-9_-]+\]", "", p_txt).strip()
-                                    if f"[{did}]" not in p_txt:
-                                        p_txt = f"{p_txt} [{did}]"
-                                    reconstructed_paras.append(p_txt)
-                        except Exception:
-                            pass
-
-            if reconstructed_paras:
-                raw_paras = reconstructed_paras
-            else:
-                raw_paras = [p.strip() for p in re.split(r"\n\s*\n", desc) if p.strip()]
-
-            formatted_paras = []
-            for i, p in enumerate(raw_paras):
-                p_clean = p.rstrip()
-                has_cite = bool(re.search(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+\s*\]", p_clean))
-                if not has_cite and i < len(doc_citations):
-                    p_clean = f"{p_clean} [{doc_citations[i]}]"
-                formatted_paras.append(p_clean)
-
-            if not formatted_paras and desc:
-                formatted_paras = [desc]
-
-            desc_text = "\n\n".join(formatted_paras)
+            desc_text = format_description_into_per_doc_paragraphs(desc, c.get("source_chunks", []))
             md_content.append("## Description\n")
             md_content.append(f"{desc_text}\n")
 

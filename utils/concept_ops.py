@@ -105,9 +105,10 @@ def fuse_descriptions_by_document(concept_list: List[Dict[str, Any]]) -> str:
                 s_clean = s.strip()
                 if not s_clean:
                     continue
-                # Strip raw chunk citations like [doc_...::chunk_...]
-                s_clean = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+::[A-Za-z0-9_-]+\s*\]", "", s_clean).strip()
-                norm = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+\s*\]", "", s_clean).casefold().strip()
+                # Strip raw chunk citations like [doc_...::chunk_...] and doc citations [doc_...]
+                s_clean = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[-A-Za-z0-9_]+)?\s*\]", "", s_clean).strip()
+                s_clean = re.sub(r"\.\s*\.", ".", s_clean)
+                norm = s_clean.casefold().strip()
                 norm = " ".join(norm.split())
                 if norm and norm not in seen_sents:
                     seen_sents.add(norm)
@@ -118,14 +119,77 @@ def fuse_descriptions_by_document(concept_list: List[Dict[str, Any]]) -> str:
 
         para = " ".join(sents).strip()
         para = re.sub(r"\s+([.,;:!?])", r"\1", para)
+        if not para.endswith((".", "!", "?")):
+            para += "."
 
         # Place the document citation cleanly at the end of this document's paragraph
-        if doc_id != "unknown" and f"[{doc_id}]" not in para:
+        if doc_id != "unknown":
             para = f"{para} [{doc_id}]"
 
         paragraphs.append(para)
 
     return "\n\n".join(paragraphs)
+
+
+def format_description_into_per_doc_paragraphs(text: str, source_chunks: Optional[List[str]] = None) -> str:
+    """Format any description text (including merged blobs with repeated inline citations)
+    into clean, distinct paragraphs per source document with a single citation at the end
+    of each respective paragraph.
+    """
+    if not text:
+        return ""
+
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    doc_paragraphs: Dict[str, List[str]] = defaultdict(list)
+    doc_order: List[str] = []
+    current_doc = None
+
+    expected_doc_ids: List[str] = []
+    if source_chunks:
+        for sc in source_chunks:
+            did = sc.split("::")[0] if "::" in sc else sc
+            if did and did not in expected_doc_ids:
+                expected_doc_ids.append(did)
+
+    for s in sentences:
+        s_clean = s.strip()
+        if not s_clean:
+            continue
+
+        # Extract cited document from sentence if present
+        found_docs = re.findall(r'\[\s*((?:doc_|canon_)[A-Za-z0-9_-]+)(?:::[^\]]+)?\s*\]', s_clean)
+        if found_docs:
+            current_doc = found_docs[0]
+        elif not current_doc and expected_doc_ids:
+            current_doc = expected_doc_ids[0]
+
+        key = current_doc or "general"
+        if key not in doc_paragraphs:
+            doc_order.append(key)
+
+        # Strip all inline bracket citations from within the sentence
+        clean_sentence = re.sub(r'\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]', '', s_clean).strip()
+        clean_sentence = re.sub(r'\.\s*\.', '.', clean_sentence)
+        clean_sentence = re.sub(r'\s+([.,;:!?])', r'\1', clean_sentence)
+        clean_sentence = " ".join(clean_sentence.split())
+
+        if clean_sentence and len(clean_sentence) > 3:
+            doc_paragraphs[key].append(clean_sentence)
+
+    formatted = []
+    for doc_key in doc_order:
+        sents = doc_paragraphs[doc_key]
+        if not sents:
+            continue
+        para = " ".join(sents).strip()
+        if not para.endswith((".", "!", "?")):
+            para += "."
+
+        if doc_key != "general":
+            para = f"{para} [{doc_key}]"
+        formatted.append(para)
+
+    return "\n\n".join(formatted) if formatted else text.strip()
 
 
 def union_aliases(alias_lists: Iterable[List[str]]) -> List[str]:
