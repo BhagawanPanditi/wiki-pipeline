@@ -351,7 +351,7 @@ class WikiDocumentConsolidatorPipeline:
             merge_clusters=[cluster for clusters in batch_results for cluster in clusters]
         )
 
-    def execute_programmatic_merge(self, raw_concepts: List[Dict[str, Any]], delta: DocumentConsolidationSchema) -> List[Dict[str, Any]]:
+    def execute_programmatic_merge(self, raw_concepts: List[Dict[str, Any]], delta: DocumentConsolidationSchema, doc_id: str = "unknown") -> List[Dict[str, Any]]:
         """Group identical concepts and fuse their aliases, descriptions, and chunks using UnionFind."""
         # F-13: Resolve conflicting or overlapping clusters via UnionFind instead of dict overwrites
         uf = UnionFind()
@@ -428,7 +428,7 @@ class WikiDocumentConsolidatorPipeline:
         output_dir: Path = item["output_dir"]
         await asyncio.to_thread(output_dir.mkdir, parents=True, exist_ok=True)
 
-        consolidated = self.execute_programmatic_merge(item["raw_concepts"], delta)
+        consolidated = self.execute_programmatic_merge(item["raw_concepts"], delta, doc_id=doc_id)
         out_payload = json.dumps({"doc_id": doc_id, "concepts": consolidated}, indent=2)
         await asyncio.to_thread(atomic_write_text, output_dir / "concepts.json", out_payload)
 
