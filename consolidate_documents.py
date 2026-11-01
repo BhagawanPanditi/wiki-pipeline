@@ -417,6 +417,7 @@ class WikiDocumentConsolidatorPipeline:
                 "aliases": union_aliases(aliases_list),
                 "subtopics": union_aliases(subtopics_list),
                 "description": fused_desc,
+                "paragraphs": [{"doc_id": doc_id, "text": fused_desc}],
                 "source_chunks": sorted(list(source_chunks_set)),
             })
 

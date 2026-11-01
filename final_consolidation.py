@@ -30,7 +30,9 @@ from utils.cli import build_parser, resolve_settings
 from utils.concept_ops import (
     format_description_into_per_doc_paragraphs,
     fuse_descriptions_by_document,
+    fuse_paragraphs_by_document,
     generate_stable_slug,
+    render_paragraphs_to_markdown,
 )
 from utils.llm_pool import pool_for_stage
 from utils.manifest import verify_stage_manifest, write_stage_manifest
@@ -723,9 +725,9 @@ class FinalConsolidationPipeline:
                 len1 = len(c1.get("description", "").split())
                 len2 = len(c2.get("description", "").split())
                 combined_words = len1 + len2
-                # Reject merge if combined size > 1200 tokens (~900 words) unless one is a stub (<45 words)
-                if combined_words > 900 and min(len1, len2) > 45:
-                    print(f"[MERGE GUARD] Skipped merging large concepts '{t1}' ({len1}w) and '{t2}' ({len2}w). Converting to LINK.")
+                # Reject merge if combined size > 600 words unless one is a stub (<45 words)
+                if combined_words > 600 and min(len1, len2) > 45:
+                    print(f"[MERGE GUARD] Skipped merging large concepts '{t1}' ({len1}w) and '{t2}' ({len2}w) (>600 words). Converting to LINK.")
                     additional_links.append((t1, t2, "closely related domain counterpart"))
                     continue
                 merge_uf.union(t1, t2)
@@ -807,7 +809,8 @@ class FinalConsolidationPipeline:
             merged_aliases.discard(chosen_title)
             merged_subtopics.discard(chosen_title)
             chosen_brief = max(briefs, key=len) if briefs else ""
-            fused_desc = fuse_descriptions_by_document(group)
+            fused_paragraphs = fuse_paragraphs_by_document(group)
+            fused_desc = "\n\n".join(p["text"] for p in fused_paragraphs)
 
             raw_relations = []
             for c in group:
@@ -821,6 +824,7 @@ class FinalConsolidationPipeline:
                 "subtopics": sorted(list(merged_subtopics)),
                 "entities": sorted(list(merged_entities)),
                 "description": fused_desc,
+                "paragraphs": fused_paragraphs,
                 "source_chunks": sorted(list(merged_chunks)),
                 "_raw_relations": raw_relations,
             })
@@ -1047,7 +1051,10 @@ class FinalConsolidationPipeline:
                 md_content.append(f"{brief}\n")
 
             # Format description into clean distinct paragraphs per source document with citations at the end of each paragraph
-            desc_text = format_description_into_per_doc_paragraphs(desc, c.get("source_chunks", []))
+            if "paragraphs" in c and c["paragraphs"]:
+                desc_text = render_paragraphs_to_markdown(c["paragraphs"])
+            else:
+                desc_text = format_description_into_per_doc_paragraphs(desc, c.get("source_chunks", []))
             md_content.append("## Description\n")
             md_content.append(f"{desc_text}\n")
 
