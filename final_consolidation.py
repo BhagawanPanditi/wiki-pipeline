@@ -1081,13 +1081,13 @@ class FinalConsolidationPipeline:
                     else:
                         clean_phrase = "directly related topic"
 
-                    md_content.append(f"- [[{tgt_slug}|{tgt}]] ({clean_phrase})")
+                    md_content.append(f"- [[{tgt_slug}]] ({clean_phrase})")
 
                 # Section 4.3: Compact "Referenced by" list guaranteeing reachability from spoke to hub
                 refs = referenced_by_map.get(title.lower(), [])
                 if refs:
                     md_content.append("\n## Referenced by\n")
-                    ref_links = [f"[[{r_slug}|{r_t}]]" for r_slug, r_t in refs]
+                    ref_links = [f"[[{r_slug}]]" for r_slug, _ in refs]
                     md_content.append(", ".join(ref_links))
 
                 if extended_relations:
@@ -1098,7 +1098,7 @@ class FinalConsolidationPipeline:
                         if tgt:
                             tgt_obj = concept_by_name.get(tgt.lower())
                             tgt_slug = tgt_obj.get("slug") if tgt_obj else generate_stable_slug(tgt)
-                            compact_links.append(f"[[{tgt_slug}|{tgt}]]")
+                            compact_links.append(f"[[{tgt_slug}]]")
                     md_content.append(", ".join(compact_links))
                 md_content.append("")
 
@@ -1109,13 +1109,13 @@ class FinalConsolidationPipeline:
         concept_index_entries.sort(key=lambda x: x[1].lower())
         c_lines = ["# Concept Index\n"]
         for slug, c_title, c_brief in concept_index_entries:
-            # Single-line format: - [[slug|Title]]: Brief description
+            # Single-line format: - [[slug]]: Brief description
             if c_brief:
                 # Collapse any multiline brief to a single clean line
                 clean_brief_line = " ".join(c_brief.split())
-                c_lines.append(f"- [[{slug}|{c_title}]]: {clean_brief_line}")
+                c_lines.append(f"- [[{slug}]]: {clean_brief_line}")
             else:
-                c_lines.append(f"- [[{slug}|{c_title}]]")
+                c_lines.append(f"- [[{slug}]]")
         c_lines.append("")
         atomic_write_text(self.md_dir / "concept_index.md", "\n".join(c_lines))
 
@@ -1125,7 +1125,7 @@ class FinalConsolidationPipeline:
         e_lines = ["# Entity Index\n"]
         for ent in sorted_entities:
             target_links = sorted(entity_to_concepts[ent], key=lambda x: x[1].lower())
-            links_str = ", ".join([f"[[{slug}|{t}]]" for slug, t in target_links])
+            links_str = ", ".join([f"[[{slug}]]" for slug, _ in target_links])
             e_lines.append(f"- **{ent}**: {links_str}")
         e_lines.append("")
         atomic_write_text(self.md_dir / "entity_index.md", "\n".join(e_lines))
