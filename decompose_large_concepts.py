@@ -48,8 +48,8 @@ Decompose this broad topic into more digestible, focused concepts:
 2. <child>: 2 to 4 discrete CHILD concepts (each 150 to 350 words) covering distinct subtopics, components, or operational phases.
 
 CRITICAL RULES:
-- 100% FACT & PROVENANCE PRESERVATION: Do NOT lose any specific numbers, metrics, or factual statements. Every single source document (e.g. doc_00020, doc_00023, doc_00024) must retain its factual contributions across either the pillar or one of the child concepts.
-- PRESERVE SOURCE DOC IDs: You MUST attribute each paragraph to its originating doc_id using <paragraph doc_id="doc_XXXXX">...</paragraph>. Never attribute facts from doc_00023 to doc_00020 or vice versa. If a child concept covers information discussed in doc_00023, include a <paragraph doc_id="doc_00023"> block inside that child.
+- 100% FACT & PROVENANCE PRESERVATION: Do NOT lose any specific numbers, metrics, or factual statements. Every source document present in the input must retain its factual contributions across either the pillar or one of the child concepts.
+- PRESERVE SOURCE DOC IDs: You MUST attribute each paragraph to its originating doc_id using <paragraph doc_id="doc_XXXXX">...</paragraph>. Never attribute facts from one document to another. If a child concept covers information discussed in a specific document, wrap that text inside a <paragraph doc_id="..."> block matching that document's ID.
 - NO INLINE CITATIONS IN PROSE: Do NOT write bracketed citations like [doc_00251] in the prose. The provenance is captured strictly by the doc_id attribute on <paragraph>.
 - TITLES: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Workstation Ergonomics and Lighting", NOT just "Ergonomics").
 - NO NOISE: Output no introductory text, commentary, or markdown formatting outside the XML tags.
