@@ -357,7 +357,6 @@ def global_consolidate(domain_dir: Path, args: Any):
                     global_source_chunks.add(sc.strip())
 
         fused_paragraphs = fuse_paragraphs_by_document(concepts)
-        fused_desc = "\n\n".join(p["text"] for p in fused_paragraphs)
         final_aliases = sorted([a for a in merged_aliases_set if a.casefold() != chosen_title.casefold()])
         final_subtopics = sorted([s for s in merged_subtopics_set if s.casefold() != chosen_title.casefold()])
 
@@ -366,9 +365,7 @@ def global_consolidate(domain_dir: Path, args: Any):
             "slug": slug,
             "aliases": final_aliases,
             "subtopics": final_subtopics,
-            "description": fused_desc,
             "paragraphs": fused_paragraphs,
-            "source_chunks": sorted(list(global_source_chunks)),
         })
 
     # Save summary and global concepts

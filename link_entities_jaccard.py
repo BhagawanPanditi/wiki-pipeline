@@ -25,6 +25,7 @@ from tqdm import tqdm
 from utils.atomic_io import atomic_write_json, sanitize_filename
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
+from utils.concept_ops import get_concept_full_text
 from utils.lemma import normalize_entity
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
@@ -275,7 +276,7 @@ async def enrich_graph_via_jaccard(
     pairs_to_synthesize: Dict[str, Dict[str, Any]] = {}
     for c in concepts:
         t1 = c["title"]
-        b1 = c.get("brief", "") or c.get("description", "")[:250]
+        b1 = c.get("brief", "") or get_concept_full_text(c)[:250]
         for rel in c.get("outbound_relations", []):
             t2 = rel.get("target_concept", "")
             if not t2 or t2.lower() == t1.lower() or t2 not in concept_by_title:
@@ -291,7 +292,7 @@ async def enrich_graph_via_jaccard(
             if is_generic:
                 pk = ":::".join(sorted([t1, t2]))
                 if pk not in pairs_to_synthesize:
-                    b2 = concept_by_title[t2].get("brief", "") or concept_by_title[t2].get("description", "")[:250]
+                    b2 = concept_by_title[t2].get("brief", "") or get_concept_full_text(concept_by_title[t2])[:250]
                     pairs_to_synthesize[pk] = {
                         "concept_1": t1,
                         "brief_1": b1,

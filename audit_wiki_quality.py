@@ -405,7 +405,14 @@ Analyze factual retention, completeness, and extraction quality according to the
                     # Multi-Source Provenance Stats
                     source_doc_counts = []
                     for c in concepts:
-                        docs = {sc.split("::")[0] for sc in c.get("source_chunks", []) if sc}
+                        docs = set()
+                        if "paragraphs" in c and c["paragraphs"]:
+                            for p in c["paragraphs"]:
+                                did = p.get("doc_id", "").strip()
+                                if did and did != "unknown":
+                                    docs.add(did)
+                        if not docs:
+                            docs = {sc.split("::")[0] for sc in c.get("source_chunks", []) if sc}
                         if not docs:
                             # fallback: find document citations in description
                             desc_docs = set(re.findall(r"\[\s*([A-Za-z0-9_-]+)(?:::[^\]]+)?\s*\]", c.get("description", "")))

@@ -201,6 +201,37 @@ def render_paragraphs_to_markdown(paragraphs: List[Dict[str, str]]) -> str:
     return "\n\n".join(lines)
 
 
+def get_concept_full_text(concept: Dict[str, Any]) -> str:
+    """Get clean plain prose text of a concept without inline doc citations.
+    Prefers concept['paragraphs'], falls back to concept['description'].
+    """
+    if "paragraphs" in concept and concept["paragraphs"]:
+        return " ".join(p.get("text", "").strip() for p in concept["paragraphs"] if p.get("text", "").strip())
+    desc = concept.get("description", "")
+    # Clean any accidental inline citations
+    clean = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", desc)
+    clean = re.sub(r"\.\s*\.", ".", clean)
+    clean = re.sub(r"\s+([.,;:!?])", r"\1", clean)
+    return " ".join(clean.split())
+
+
+def get_concept_source_docs(concept: Dict[str, Any]) -> List[str]:
+    """Extract list of unique doc_ids from concept paragraphs or source_chunks."""
+    docs = []
+    if "paragraphs" in concept and concept["paragraphs"]:
+        for p in concept["paragraphs"]:
+            did = p.get("doc_id", "").strip()
+            if did and did != "unknown" and did not in docs:
+                docs.append(did)
+    if not docs:
+        for sc in concept.get("source_chunks", []):
+            if sc:
+                did = sc.split("::")[0].strip()
+                if did and did not in docs:
+                    docs.append(did)
+    return docs
+
+
 def fuse_descriptions_by_document(concept_list: List[Dict[str, Any]]) -> str:
     """Backwards-compatible helper returning a plain multi-paragraph string with citations."""
     paras = fuse_paragraphs_by_document(concept_list)

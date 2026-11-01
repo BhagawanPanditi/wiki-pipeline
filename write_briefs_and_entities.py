@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from utils.atomic_io import atomic_write_json, sanitize_filename
 from utils.checkpoint import load_bool_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
+from utils.concept_ops import get_concept_full_text
 from utils.errors import StageBudget
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
@@ -150,7 +151,7 @@ class BriefAndEntitiesPipeline:
     async def generate_brief_and_entities(self, client: Any, item: Dict[str, Any], server_index: int) -> BriefAndEntities:
         title = item.get("title", "")
         aliases = ", ".join(item.get("aliases", []))
-        description = item.get("description", "")
+        description = get_concept_full_text(item)
 
         user_prompt = f"CONCEPT TITLE: \"{title}\"\n"
         if aliases:

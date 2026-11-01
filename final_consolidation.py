@@ -28,10 +28,12 @@ from utils.checkpoint import load_json_log, save_log_sync
 from utils.citation_utils import clean_chunk_citations
 from utils.cli import build_parser, resolve_settings
 from utils.concept_ops import (
+    extract_concept_paragraphs,
     format_description_into_per_doc_paragraphs,
     fuse_descriptions_by_document,
     fuse_paragraphs_by_document,
     generate_stable_slug,
+    get_concept_full_text,
     render_paragraphs_to_markdown,
 )
 from utils.llm_pool import pool_for_stage
@@ -699,13 +701,13 @@ class FinalConsolidationPipeline:
             if verdict.action == "PRUNE":
                 victim = verdict.prune_title.strip()
                 if not victim:
-                    # Fallback to shorter description if not named
-                    victim = c2["title"] if len(c2.get("description", "")) <= len(c1.get("description", "")) else c1["title"]
+                    # Fallback to shorter text if not named
+                    victim = c2["title"] if len(get_concept_full_text(c2)) <= len(get_concept_full_text(c1)) else c1["title"]
                 
                 # Check description length: do not prune substantive concepts (>150 words) without confirmation
                 victim_c = concept_by_name.get(victim.lower())
                 if victim_c:
-                    victim_words = len(victim_c.get("description", "").split())
+                    victim_words = len(get_concept_full_text(victim_c).split())
                     if victim_words > 150:
                         print(f"[PRUNE GUARD] Skipped pruning '{victim}': contains {victim_words} words of description.")
                         continue
@@ -722,8 +724,8 @@ class FinalConsolidationPipeline:
         for (c1, c2), verdict in decisions:
             if verdict.action == "MERGE" and c1["title"] not in pruned_titles and c2["title"] not in pruned_titles:
                 t1, t2 = c1["title"], c2["title"]
-                len1 = len(c1.get("description", "").split())
-                len2 = len(c2.get("description", "").split())
+                len1 = len(get_concept_full_text(c1).split())
+                len2 = len(get_concept_full_text(c2).split())
                 combined_words = len1 + len2
                 # Reject merge if combined size > 600 words unless one is a stub (<45 words)
                 if combined_words > 600 and min(len1, len2) > 45:
@@ -810,7 +812,6 @@ class FinalConsolidationPipeline:
             merged_subtopics.discard(chosen_title)
             chosen_brief = max(briefs, key=len) if briefs else ""
             fused_paragraphs = fuse_paragraphs_by_document(group)
-            fused_desc = "\n\n".join(p["text"] for p in fused_paragraphs)
 
             raw_relations = []
             for c in group:
@@ -823,9 +824,7 @@ class FinalConsolidationPipeline:
                 "aliases": sorted(list(merged_aliases)),
                 "subtopics": sorted(list(merged_subtopics)),
                 "entities": sorted(list(merged_entities)),
-                "description": fused_desc,
                 "paragraphs": fused_paragraphs,
-                "source_chunks": sorted(list(merged_chunks)),
                 "_raw_relations": raw_relations,
             })
 
@@ -1051,10 +1050,8 @@ class FinalConsolidationPipeline:
                 md_content.append(f"{brief}\n")
 
             # Format description into clean distinct paragraphs per source document with citations at the end of each paragraph
-            if "paragraphs" in c and c["paragraphs"]:
-                desc_text = render_paragraphs_to_markdown(c["paragraphs"])
-            else:
-                desc_text = format_description_into_per_doc_paragraphs(desc, c.get("source_chunks", []))
+            paras = c.get("paragraphs") or extract_concept_paragraphs(c)
+            desc_text = render_paragraphs_to_markdown(paras)
             md_content.append("## Description\n")
             md_content.append(f"{desc_text}\n")
 

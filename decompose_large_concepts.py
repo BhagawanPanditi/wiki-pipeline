@@ -22,7 +22,12 @@ from pydantic import BaseModel, Field
 from utils.atomic_io import atomic_write_json, sanitize_filename
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
-from utils.concept_ops import generate_stable_slug
+from utils.concept_ops import (
+    extract_concept_paragraphs,
+    fuse_paragraphs_by_document,
+    generate_stable_slug,
+    get_concept_full_text,
+)
 from utils.errors import StageBudget
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
@@ -35,7 +40,7 @@ STAGE = "decompose-concepts"
 
 SYSTEM_PROMPT_DECOMPOSE = """\
 You are an expert scientific encyclopedist and knowledge graph architect.
-You are given a LARGE, COMPOSITE CONCEPT (>600 words) from a technical knowledge wiki, along with its absorbed subtopics and full description.
+You are given a LARGE, COMPOSITE CONCEPT (>600 words) from a technical knowledge wiki, along with its absorbed subtopics and its source text broken down by document ID.
 
 YOUR TASK:
 Decompose this broad topic into more digestible, focused concepts:
@@ -44,7 +49,7 @@ Decompose this broad topic into more digestible, focused concepts:
 
 CRITICAL RULES:
 - FACT PRESERVATION: Do NOT lose any specific numbers, metrics, experimental findings, or parameters. Every fact in the original text must live in either the pillar or one of the child concepts.
-- CITATIONS: Every paragraph must keep its original document citations (e.g. [doc_00251]) matching where the facts came from.
+- NO INLINE CITATIONS IN PROSE: Do NOT write bracketed citations like [doc_00251] in the prose. Instead, wrap each paragraph in <paragraph doc_id="...">prose...</paragraph> using the provided doc_id.
 - TITLES: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Canine Retinal Photoreception", NOT just "Photoreceptors").
 - NO NOISE: Output no introductory text, commentary, or markdown formatting outside the XML tags.
 - IF NOT DECOMPOSABLE: If the concept cannot be cleanly divided without severe redundancy, output exactly: <cannot_decompose/>
@@ -52,60 +57,85 @@ CRITICAL RULES:
 OUTPUT FORMAT:
 <decomposition>
 <pillar>
-<description>
-Overview description paragraph(s) with citations...
-</description>
+<paragraph doc_id="doc_XXXXX">
+Overview description paragraph...
+</paragraph>
 </pillar>
 <child>
 <title>Specific Child Concept Title A</title>
-<description>
-Detailed factual description focusing strictly on this subtopic with citations...
-</description>
+<paragraph doc_id="doc_XXXXX">
+Detailed factual paragraph focusing strictly on this subtopic...
+</paragraph>
 </child>
 <child>
 <title>Specific Child Concept Title B</title>
-<description>
-Detailed factual description focusing strictly on this subtopic with citations...
-</description>
+<paragraph doc_id="doc_XXXXX">
+Detailed factual paragraph focusing strictly on this subtopic...
+</paragraph>
 </child>
 </decomposition>
 """
 
 class DecomposedChild(BaseModel):
     title: str
-    description: str
+    paragraphs: List[Dict[str, str]] = Field(default_factory=list)
 
 class DecompositionResult(BaseModel):
     decomposed: bool = False
-    pillar_description: str = ""
+    pillar_paragraphs: List[Dict[str, str]] = Field(default_factory=list)
     children: List[DecomposedChild] = Field(default_factory=list)
 
-def parse_xml_decomposition(text: str) -> DecompositionResult:
+
+def parse_xml_decomposition(text: str, default_doc_id: str = "unknown") -> DecompositionResult:
     if not text or "<cannot_decompose" in text.lower():
         return DecompositionResult(decomposed=False)
 
-    pillar_m = re.search(r"<pillar>.*?<description>(.*?)</description>.*?</pillar>", text, re.DOTALL | re.IGNORECASE)
-    if not pillar_m or not pillar_m.group(1).strip():
+    def extract_paragraphs(xml_block: str) -> List[Dict[str, str]]:
+        paras: List[Dict[str, str]] = []
+        p_matches = re.findall(r'<paragraph(?:\s+doc_id="([^"]+)")?>(.*?)</paragraph>', xml_block, re.DOTALL | re.IGNORECASE)
+        for doc_attr, p_text in p_matches:
+            did = doc_attr.strip() if doc_attr else default_doc_id
+            clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", p_text).strip()
+            clean_t = re.sub(r"\.\s*\.", ".", clean_t)
+            clean_t = re.sub(r"\s+([.,;:!?])", r"\1", clean_t)
+            clean_t = " ".join(clean_t.split())
+            if clean_t:
+                paras.append({"doc_id": did, "text": clean_t})
+        if not paras:
+            # Fallback if model used <description>...</description>
+            desc_m = re.search(r"<description>(.*?)</description>", xml_block, re.DOTALL | re.IGNORECASE)
+            fallback_text = desc_m.group(1).strip() if desc_m else xml_block.strip()
+            clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", fallback_text).strip()
+            clean_t = re.sub(r"\.\s*\.", ".", clean_t)
+            clean_t = re.sub(r"\s+([.,;:!?])", r"\1", clean_t)
+            clean_t = " ".join(clean_t.split())
+            if clean_t:
+                paras.append({"doc_id": default_doc_id, "text": clean_t})
+        return paras
+
+    pillar_m = re.search(r"<pillar>(.*?)</pillar>", text, re.DOTALL | re.IGNORECASE)
+    if not pillar_m:
         return DecompositionResult(decomposed=False)
 
-    pillar_desc = pillar_m.group(1).strip()
-    children = []
+    pillar_paras = extract_paragraphs(pillar_m.group(1))
+    if not pillar_paras:
+        return DecompositionResult(decomposed=False)
 
+    children: List[DecomposedChild] = []
     child_blocks = re.findall(r"<child>(.*?)</child>", text, re.DOTALL | re.IGNORECASE)
     for block in child_blocks:
         t_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
-        d_m = re.search(r"<description>(.*?)</description>", block, re.DOTALL | re.IGNORECASE)
-        if t_m and d_m and t_m.group(1).strip() and d_m.group(1).strip():
-            c_title = t_m.group(1).strip()
-            c_desc = d_m.group(1).strip()
-            # Clean citations
-            c_desc = re.sub(r"\[(?:doc_|canon_)[A-Za-z0-9_-]+::[A-Za-z0-9_-]+\]", "", c_desc)
-            children.append(DecomposedChild(title=c_title, description=c_desc))
+        if not t_m:
+            continue
+        c_title = t_m.group(1).strip()
+        c_paras = extract_paragraphs(block)
+        if c_title and c_paras:
+            children.append(DecomposedChild(title=c_title, paragraphs=c_paras))
 
     if not children:
         return DecompositionResult(decomposed=False)
 
-    return DecompositionResult(decomposed=True, pillar_description=pillar_desc, children=children)
+    return DecompositionResult(decomposed=True, pillar_paragraphs=pillar_paras, children=children)
 
 # ── Pipeline Implementation ──────────────────────────────────────────────────
 
@@ -133,27 +163,41 @@ class ConceptDecompositionPipeline:
             self.checkpoint = load_json_log(self.log_file, corrupt_message="Decomposition log corrupted. Initializing fresh.")
 
     def select_large_concepts(self, concepts: List[Dict[str, Any]], word_threshold: int = 600) -> List[Dict[str, Any]]:
-        """Identify concepts exceeding word_threshold that have subtopics or substantive breadth."""
+        """Identify concepts exceeding word_threshold that have subtopics or multiple source documents."""
         large = []
         for c in concepts:
-            words = len(re.findall(r"\b\w+\b", c.get("description", "")))
-            if words > word_threshold and (len(c.get("subtopics", [])) >= 2 or len(c.get("source_chunks", [])) >= 2):
+            text = get_concept_full_text(c)
+            words = len(re.findall(r"\b\w+\b", text))
+            paras = c.get("paragraphs", [])
+            subtopics = c.get("subtopics", [])
+            if words > word_threshold and (len(subtopics) >= 2 or len(paras) >= 2):
                 large.append(c)
         return large
 
     async def decompose_concept(self, client: Any, item: Dict[str, Any], server_index: int) -> Dict[str, Any]:
         title = item.get("title", "")
         subtopics = ", ".join(item.get("subtopics", [])) or "None listed"
-        desc = item.get("description", "")
-        words = len(re.findall(r"\b\w+\b", desc))
+        paras = item.get("paragraphs", [])
+        if not paras:
+            paras = extract_concept_paragraphs(item)
+        
+        full_text = get_concept_full_text(item)
+        words = len(re.findall(r"\b\w+\b", full_text))
+
+        doc_blocks = []
+        for p in paras:
+            did = p.get("doc_id", "unknown")
+            ptxt = p.get("text", "").strip()
+            doc_blocks.append(f"DOCUMENT ID: {did}\nTEXT:\n{ptxt}\n")
+        source_presentation = "\n".join(doc_blocks)
 
         prompt = f"""\
 COMPOSITE CONCEPT TITLE: "{title}"
 CURRENT LENGTH: {words} words
 ABSORBED SUBTOPICS: {subtopics}
 
-FULL TEXT:
-{desc}
+SOURCE PARAGRAPHS BY DOCUMENT ID:
+{source_presentation}
 """
         raw_text = await call_llm(
             client=client,
@@ -168,12 +212,13 @@ FULL TEXT:
             max_growth=1,
         )
 
-        res = parse_xml_decomposition(raw_text)
+        default_doc = paras[0].get("doc_id", "unknown") if paras else "unknown"
+        res = parse_xml_decomposition(raw_text, default_doc_id=default_doc)
         return {
             "title": title,
             "decomposed": res.decomposed,
-            "pillar_description": res.pillar_description,
-            "children": [{"title": ch.title, "description": ch.description} for ch in res.children]
+            "pillar_paragraphs": res.pillar_paragraphs,
+            "children": [{"title": ch.title, "paragraphs": ch.paragraphs} for ch in res.children]
         }
 
     async def run(self):
@@ -238,9 +283,11 @@ FULL TEXT:
                 decomposed_count += 1
                 pillar_slug = c.get("slug") or generate_stable_slug(t, used_slugs)
                 c["slug"] = pillar_slug
-                # Update pillar description
-                if decomp_data.get("pillar_description"):
-                    c["description"] = decomp_data["pillar_description"]
+                # Update pillar paragraphs
+                if decomp_data.get("pillar_paragraphs"):
+                    c["paragraphs"] = decomp_data["pillar_paragraphs"]
+                c.pop("description", None)
+                c.pop("source_chunks", None)
 
                 # Ensure outbound_relations exists
                 relations = c.get("outbound_relations", [])
@@ -254,15 +301,13 @@ FULL TEXT:
                     ch_slug = generate_stable_slug(ch_title, used_slugs)
                     new_children_count += 1
 
-                    # Child inherits source chunks of parent
                     child_concept = {
                         "title": ch_title,
                         "slug": ch_slug,
                         "aliases": [],
                         "subtopics": [],
                         "entities": [],
-                        "description": ch["description"],
-                        "source_chunks": list(c.get("source_chunks", [])),
+                        "paragraphs": ch.get("paragraphs", []),
                         "outbound_relations": [
                             {
                                 "target_concept": t,
@@ -289,6 +334,8 @@ FULL TEXT:
                         existing_targets.add(ch_title.lower())
                 c["outbound_relations"] = relations
             else:
+                c.pop("description", None)
+                c.pop("source_chunks", None)
                 final_concepts.append(c)
 
         print(f"\nDecomposed {decomposed_count} broad concepts into {new_children_count} focused subtopic concepts.")
