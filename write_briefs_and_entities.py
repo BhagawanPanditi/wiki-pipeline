@@ -155,6 +155,13 @@ class BriefAndEntitiesPipeline:
         aliases = ", ".join(item.get("aliases", []))
         description = get_concept_full_text(item)
 
+        # Truncate description to fit comfortably within model context limit (~20,000 words / ~28,000 tokens)
+        # A brief (1-3 sentences) and 5-12 key entities do not require 90,000 tokens of raw text.
+        desc_words = description.split()
+        max_desc_words = 15000
+        if len(desc_words) > max_desc_words:
+            description = " ".join(desc_words[:max_desc_words]) + " …"
+
         user_prompt = f"CONCEPT TITLE: \"{title}\"\n"
         if aliases:
             user_prompt += f"ALIASES: {aliases}\n"
