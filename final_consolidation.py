@@ -1092,8 +1092,9 @@ class FinalConsolidationPipeline:
 
                 if extended_relations:
                     md_content.append("\n## Mentions\n")
+                    max_mentions = getattr(self.args, "max_mentions", 50)
                     compact_links = []
-                    for r in extended_relations:
+                    for r in extended_relations[:max_mentions]:
                         tgt = r.get("target_concept", "")
                         if tgt:
                             tgt_obj = concept_by_name.get(tgt.lower())

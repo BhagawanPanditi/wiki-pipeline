@@ -129,7 +129,8 @@ class WikiQualityAuditor:
             except Exception:
                 pass
 
-        # Estimate tokens as approx chars / 4 (20k tokens ~ 80,000 chars)
+        # Filter out empty stubs / redirects (< 500 chars) and documents above max_chars (default 80k chars)
+        min_chars = getattr(self.args, "min_doc_chars", 500)
         max_chars = getattr(self.args, "max_doc_chars", 80000)
         eligible = []
         for doc in corpus:
@@ -137,7 +138,7 @@ class WikiQualityAuditor:
             canon_id = doc_mapping.get(raw_id, raw_id)
             text = doc.get("content") or doc.get("text") or doc.get("contents") or doc.get("body") or ""
             doc_len = len(text)
-            if doc_len > 0 and doc_len <= max_chars:
+            if doc_len >= min_chars and doc_len <= max_chars:
                 eligible.append({
                     "doc_id": canon_id,
                     "orig_id": raw_id,
@@ -145,6 +146,22 @@ class WikiQualityAuditor:
                     "chars": doc_len,
                     "est_tokens": doc_len // 4,
                 })
+
+        # If strict min_chars filter yielded nothing, fallback to non-empty
+        if not eligible and min_chars > 0:
+            for doc in corpus:
+                raw_id = doc.get("id") or doc.get("doc_id", "")
+                canon_id = doc_mapping.get(raw_id, raw_id)
+                text = doc.get("content") or doc.get("text") or doc.get("contents") or doc.get("body") or ""
+                doc_len = len(text)
+                if doc_len > 0 and doc_len <= max_chars:
+                    eligible.append({
+                        "doc_id": canon_id,
+                        "orig_id": raw_id,
+                        "text": text,
+                        "chars": doc_len,
+                        "est_tokens": doc_len // 4,
+                    })
 
         # Sort ascending by length (smallest first)
         eligible.sort(key=lambda d: d["chars"])
