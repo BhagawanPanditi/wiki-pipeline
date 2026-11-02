@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
+from openai import BadRequestError
 from pydantic import BaseModel, Field
 
 from utils.atomic_io import atomic_write_json, sanitize_filename
@@ -35,6 +36,13 @@ from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.stats import print_concept_word_distribution
 
 STAGE = "decompose-concepts"
+MAX_MODEL_LEN = 98304
+PROMPT_OVERHEAD_TOKENS = 1500
+SAFETY_MARGIN = 2000
+
+def est_tokens(text: str) -> int:
+    """Estimate token count conservatively (~3.2 chars/token for technical text)."""
+    return int(len(text) / 3.2) + 1
 
 # ── XML System Prompt ─────────────────────────────────────────────────────────
 
@@ -185,11 +193,32 @@ class ConceptDecompositionPipeline:
         full_text = get_concept_full_text(item)
         words = len(re.findall(r"\b\w+\b", full_text))
 
+        max_model_len = getattr(self.args, "max_model_len", None) or MAX_MODEL_LEN
+        max_out = min(self.settings.max_tokens or 3072, 3072)
+        input_budget = max_model_len - max_out - PROMPT_OVERHEAD_TOKENS - SAFETY_MARGIN
+
+        # Budget check: if all paragraphs exceed model context, prune to budget
         doc_blocks = []
+        accumulated_tokens = 0
+        retained_paras = []
         for p in paras:
             did = p.get("doc_id", "unknown")
             ptxt = p.get("text", "").strip()
-            doc_blocks.append(f"DOCUMENT ID: {did}\nTEXT:\n{ptxt}\n")
+            block = f"DOCUMENT ID: {did}\nTEXT:\n{ptxt}\n"
+            block_tokens = est_tokens(block)
+            if accumulated_tokens + block_tokens > input_budget:
+                if not doc_blocks:
+                    # Truncate single oversized paragraph if necessary
+                    char_limit = int(input_budget * 3.2)
+                    ptxt = ptxt[:char_limit]
+                    block = f"DOCUMENT ID: {did}\nTEXT:\n{ptxt}\n"
+                    doc_blocks.append(block)
+                    retained_paras.append(p)
+                break
+            doc_blocks.append(block)
+            retained_paras.append(p)
+            accumulated_tokens += block_tokens
+
         source_presentation = "\n".join(doc_blocks)
 
         prompt = f"""\
@@ -200,18 +229,32 @@ ABSORBED SUBTOPICS: {subtopics}
 SOURCE PARAGRAPHS BY DOCUMENT ID:
 {source_presentation}
 """
-        raw_text = await call_llm(
-            client=client,
-            model=self.settings.model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_DECOMPOSE},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=self.settings.max_tokens or 4096,
-            args=self.args,
-            task="generate",
-            max_growth=1,
-        )
+        try:
+            raw_text = await call_llm(
+                client=client,
+                model=self.settings.model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_DECOMPOSE},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=max_out,
+                args=self.args,
+                task="generate",
+                max_growth=1,
+                max_model_len=max_model_len,
+            )
+        except (BadRequestError, Exception) as exc:
+            msg = str(exc).lower()
+            if "maximum context length" in msg or "input_tokens" in msg or "too large" in msg:
+                print(f"\n[SKIP OVERFLOW] '{title}' exceeded context window ({words} words); retaining intact composite concept.")
+                return {
+                    "title": title,
+                    "decomposed": False,
+                    "pillar_paragraphs": paras,
+                    "children": [],
+                    "skipped": "context_overflow",
+                }
+            raise
 
         default_doc = paras[0].get("doc_id", "unknown") if paras else "unknown"
         res = parse_xml_decomposition(raw_text, default_doc_id=default_doc)
