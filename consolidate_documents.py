@@ -10,6 +10,7 @@ Usage:
 
 
 import asyncio
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -32,8 +33,10 @@ from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.unionfind import UnionFind
 
 STAGE = "consolidate-documents"
-MAX_MERGE_BATCH_CHARS = 30000
-MAX_MERGE_BATCH_CONCEPTS = 80
+MAX_MERGE_BATCH_CHARS = 12000
+MAX_MERGE_BATCH_CONCEPTS = 40
+CALL_TIMEOUT_S = 120.0
+CALL_RETRIES = 2
 
 # ── Pydantic Schemas ──────────────────────────────────────────────────────────
 
@@ -270,15 +273,23 @@ class WikiDocumentConsolidatorPipeline:
         doc_id = item["doc_id"]
         raw_concepts = item["raw_concepts"]
 
-        lightweight_concepts = []
+        # Deduplicate exact case-insensitive titles before constructing LLM prompts
+        by_key: Dict[str, Dict[str, Any]] = {}
         for c in raw_concepts:
-            desc = c.get("description", "")
-            words = desc.split()[:30]
-            lightweight_concepts.append({
-                "title": c.get("title"),
-                "aliases": c.get("aliases", [])[:8],
-                "description_hint": " ".join(words)[:400],
+            title = (c.get("title") or "").strip()
+            if not title:
+                continue
+            k = title.casefold()
+            entry = by_key.setdefault(k, {
+                "title": title,
+                "aliases": [],
+                "description_hint": " ".join((c.get("description") or "").split()[:12])[:200],
             })
+            for a in c.get("aliases", []):
+                if a and a not in entry["aliases"] and len(entry["aliases"]) < 6:
+                    entry["aliases"].append(a)
+
+        lightweight_concepts = list(by_key.values())
 
         batches = make_merge_batches(lightweight_concepts)
         # Allow concurrent processing of batches within a document to saturate server capacity
@@ -287,6 +298,10 @@ class WikiDocumentConsolidatorPipeline:
         batch_pbar = None
         if len(batches) > 1:
             batch_pbar = tqdm(total=len(batches), desc=f"  [doc {doc_id[:12]}] {len(raw_concepts)} concepts", leave=False)
+
+        def _batch_cache_path(batch: List[Dict[str, Any]]) -> Path:
+            h = hashlib.sha1("\n".join(str(c.get("title", "")) for c in batch).encode("utf-8")).hexdigest()[:16]
+            return self.consolidated_dir / ".cache" / f"{doc_id}_{h}.json"
 
         def format_batch_for_prompt(batch_concepts: List[Dict[str, Any]]) -> str:
             lines = []
@@ -303,50 +318,86 @@ class WikiDocumentConsolidatorPipeline:
             return "\n\n".join(lines)
 
         async def merge_batch(batch: List[Dict[str, Any]]) -> List[MergeCluster]:
-            async with semaphore:
-                batch_text = format_batch_for_prompt(batch)
-                user_prompt = (
-                    f"DOCUMENT ID: {doc_id}\nTOTAL EXTRACTED CONCEPTS ACROSS CHUNKS: "
-                    f"{len(lightweight_concepts)}\nCONCEPTS IN THIS BATCH: {len(batch)}\n\n"
-                    "CANDIDATE CONCEPTS LIST (only merge titles present in this list):\n\n"
-                    f"{batch_text}\n"
-                )
-
+            cache_path = _batch_cache_path(batch)
+            if cache_path.exists():
                 try:
-                    raw_text = await call_llm(
-                        client=client,
-                        model=self.settings.model_name,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT_CONSOLIDATE},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        max_tokens=self.settings.max_tokens or 4096,
-                        args=self.args,
-                        cfg=getattr(self, "cfg", None),
-                        task="judge",
-                        max_growth=1,
-                    )
-                    clusters = parse_xml_merge_clusters(raw_text)
+                    data = json.loads(cache_path.read_text(encoding="utf-8"))
+                    clusters = [MergeCluster(**c) for c in data]
                     if batch_pbar is not None:
                         batch_pbar.update(1)
                     return clusters
-                except Exception as exc:
-                    too_long = ("hit max_tokens" in str(exc).lower() or
-                                isinstance(exc, BadRequestError) and
-                                ("maximum context length" in str(exc).lower() or "input_tokens" in str(exc).lower()))
-                    if not too_long or len(batch) <= 1:
-                        raise
-                    if batch_pbar is not None:
-                        batch_pbar.total += 1
-                        batch_pbar.refresh()
+                except Exception:
+                    pass
+
+            last_exc: Exception | None = None
+            for attempt in range(CALL_RETRIES):
+                async with semaphore:
+                    batch_text = format_batch_for_prompt(batch)
+                    user_prompt = (
+                        f"DOCUMENT ID: {doc_id}\nTOTAL UNIQUE EXTRACTED CONCEPTS: "
+                        f"{len(lightweight_concepts)}\nCONCEPTS IN THIS BATCH: {len(batch)}\n\n"
+                        "CANDIDATE CONCEPTS LIST (only merge titles present in this list):\n\n"
+                        f"{batch_text}\n"
+                    )
+
+                    try:
+                        raw_text = await asyncio.wait_for(
+                            call_llm(
+                                client=client,
+                                model=self.settings.model_name,
+                                messages=[
+                                    {"role": "system", "content": SYSTEM_PROMPT_CONSOLIDATE},
+                                    {"role": "user", "content": user_prompt}
+                                ],
+                                max_tokens=min(self.settings.max_tokens or 2048, 2048),
+                                args=self.args,
+                                cfg=getattr(self, "cfg", None),
+                                task="judge",
+                                max_growth=1,
+                            ),
+                            timeout=CALL_TIMEOUT_S,
+                        )
+                        clusters = parse_xml_merge_clusters(raw_text)
+                        try:
+                            cache_path.parent.mkdir(parents=True, exist_ok=True)
+                            atomic_write_text(cache_path, json.dumps([c.model_dump() for c in clusters]))
+                        except Exception:
+                            pass
+                        if batch_pbar is not None:
+                            batch_pbar.update(1)
+                        return clusters
+                    except Exception as exc:
+                        msg = str(exc).lower()
+                        is_timeout = isinstance(exc, asyncio.TimeoutError)
+                        too_long = (
+                            "hit max_tokens" in msg
+                            or (isinstance(exc, BadRequestError) and
+                                ("maximum context length" in msg or "input_tokens" in msg))
+                        )
+                        if not (is_timeout or too_long):
+                            raise
+                        last_exc = exc
+                        if too_long:
+                            break  # retrying same input won't help; split immediately
+
+            if len(batch) <= 1:
+                if last_exc:
+                    raise last_exc
+                return []
+
+            if batch_pbar is not None:
+                batch_pbar.total += 1
+                batch_pbar.refresh()
 
             mid = len(batch) // 2
             left, right = await asyncio.gather(merge_batch(batch[:mid]), merge_batch(batch[mid:]))
             return left + right
 
-        batch_results = await asyncio.gather(*(merge_batch(batch) for batch in batches))
-        if batch_pbar is not None:
-            batch_pbar.close()
+        try:
+            batch_results = await asyncio.gather(*(merge_batch(batch) for batch in batches))
+        finally:
+            if batch_pbar is not None:
+                batch_pbar.close()
 
         return DocumentConsolidationSchema(
             merge_clusters=[cluster for clusters in batch_results for cluster in clusters]
@@ -384,9 +435,10 @@ class WikiDocumentConsolidatorPipeline:
             grouped_concepts.setdefault(root, []).append(c)
 
         consolidated_concepts = []
+        groups = uf.get_groups()  # Compute groups once before the loop to avoid O(N^2) blocking
         for root, concept_group in grouped_concepts.items():
             # Pick canonical display title: LLM primary title > most frequent title
-            candidate_primaries = [primary_titles[item] for item in uf.get_groups().get(root, []) if item in primary_titles]
+            candidate_primaries = [primary_titles[item] for item in groups.get(root, []) if item in primary_titles]
             if candidate_primaries:
                 chosen_title = candidate_primaries[0]
             else:
