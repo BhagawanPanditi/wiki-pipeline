@@ -281,8 +281,9 @@ class WikiDocumentConsolidatorPipeline:
             })
 
         batches = make_merge_batches(lightweight_concepts)
-        # F-13: Limit concurrency to 1 within a document so pool concurrency limits are respected
-        semaphore = asyncio.Semaphore(1)
+        # Allow concurrent processing of batches within a document to saturate server capacity
+        batch_concurrency = max(1, getattr(self.args, "batch_concurrency", 4))
+        semaphore = asyncio.Semaphore(batch_concurrency)
         batch_pbar = None
         if len(batches) > 1:
             batch_pbar = tqdm(total=len(batches), desc=f"  [doc {doc_id[:12]}] {len(raw_concepts)} concepts", leave=False)
@@ -434,10 +435,7 @@ class WikiDocumentConsolidatorPipeline:
 
         async with self.log_lock:
             self.log_data[doc_id] = True
-            self.flush_count += 1
-            if self.flush_count >= 10:
-                await save_log_async(self.log_file, self.log_data)
-                self.flush_count = 0
+            await save_log_async(self.log_file, self.log_data)
 
     async def pass_through(self, pending: List[Dict[str, Any]]) -> None:
         no_merges = DocumentConsolidationSchema()
