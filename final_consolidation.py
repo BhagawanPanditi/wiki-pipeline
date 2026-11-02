@@ -936,7 +936,7 @@ class FinalConsolidationPipeline:
                                 r["relation"] = rel_text
 
         # 5b. Score Ranking + Reciprocal Rescue Backlinks
-        primary_cap = getattr(self.args, "max_primary_links", 15)
+        primary_cap = getattr(self.args, "max_primary_links", 60)
         rescue_slots = getattr(self.args, "rescue_slots", 2)
         directed_link_stats = self._rank_links_and_inject_rescue_backlinks(
             final_concepts,
@@ -1002,16 +1002,6 @@ class FinalConsolidationPipeline:
         concept_index_entries: List[Tuple[str, str, str]] = []
         entity_to_concepts: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
 
-        # Build reverse index for compact "Referenced by" section (Section 4.3)
-        referenced_by_map: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-        for c in final_concepts:
-            src_t = c["title"]
-            src_s = c.get("slug") or generate_stable_slug(src_t)
-            for rel in c.get("outbound_relations", [])[:getattr(self.args, "max_primary_links", 15)]:
-                tgt_t = rel.get("target_concept", "")
-                if tgt_t:
-                    referenced_by_map[tgt_t.lower()].append((src_s, src_t))
-
         for c in tqdm(final_concepts, desc="Exporting Markdown Pages"):
             title = c["title"]
             brief = c.get("brief", "").strip()
@@ -1057,9 +1047,8 @@ class FinalConsolidationPipeline:
 
             if relations:
                 md_content.append("## Related\n")
-                primary_cap = getattr(self.args, "max_primary_links", 15)
+                primary_cap = getattr(self.args, "max_primary_links", 60)
                 primary_relations = relations[:primary_cap]
-                extended_relations = relations[primary_cap:]
 
                 for rel in primary_relations:
                     tgt = rel.get("target_concept", "")
@@ -1083,24 +1072,6 @@ class FinalConsolidationPipeline:
 
                     md_content.append(f"- [[{tgt_slug}]] ({clean_phrase})")
 
-                # Section 4.3: Compact "Referenced by" list guaranteeing reachability from spoke to hub
-                refs = referenced_by_map.get(title.lower(), [])
-                if refs:
-                    md_content.append("\n## Referenced by\n")
-                    ref_links = [f"[[{r_slug}]]" for r_slug, _ in refs]
-                    md_content.append(", ".join(ref_links))
-
-                if extended_relations:
-                    md_content.append("\n## Mentions\n")
-                    max_mentions = getattr(self.args, "max_mentions", 50)
-                    compact_links = []
-                    for r in extended_relations[:max_mentions]:
-                        tgt = r.get("target_concept", "")
-                        if tgt:
-                            tgt_obj = concept_by_name.get(tgt.lower())
-                            tgt_slug = tgt_obj.get("slug") if tgt_obj else generate_stable_slug(tgt)
-                            compact_links.append(f"[[{tgt_slug}]]")
-                    md_content.append(", ".join(compact_links))
                 md_content.append("")
 
             atomic_write_text(md_path, "\n".join(md_content))
@@ -1171,8 +1142,8 @@ def main():
                         help="Skip LLM alphabetical macro scan and use fast in-memory candidate scan.")
     parser.add_argument("--skip_deep_verify", action="store_true",
                         help="Skip LLM deep verification and export current graph.")
-    parser.add_argument("--max_primary_links", type=int, default=15,
-                        help="Maximum primary related links with full explanations on Markdown pages (remainder listed compactly).")
+    parser.add_argument("--max_primary_links", type=int, default=60,
+                        help="Maximum primary related links with full explanations on Markdown pages (default: 60).")
     parser.add_argument("--rescue_slots", type=int, default=2,
                         help="Number of slots within --max_primary_links reserved for reciprocal rescue backlinks to source-only nodes (default: 2).")
     args = parser.parse_args()
