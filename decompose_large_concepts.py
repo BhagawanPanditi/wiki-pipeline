@@ -145,7 +145,31 @@ def parse_xml_decomposition(text: str, default_doc_id: str = "unknown") -> Decom
 
     return DecompositionResult(decomposed=True, pillar_paragraphs=pillar_paras, children=children)
 
-# ── Pipeline Implementation ──────────────────────────────────────────────────
+def clamp_concept_paragraphs(paragraphs: List[Dict[str, Any]], max_tokens: int = 600) -> List[Dict[str, Any]]:
+    """Strictly enforce that a concept's combined text does not exceed max_tokens (progressive disclosure)."""
+    if not paragraphs:
+        return []
+    total = sum(count_tokens(p.get("text", "")) for p in paragraphs)
+    if total <= max_tokens:
+        return paragraphs
+
+    clamped = []
+    budget_left = max_tokens
+    for p in paragraphs:
+        ptxt = (p.get("text") or "").strip()
+        t_count = count_tokens(ptxt)
+        if t_count <= budget_left:
+            clamped.append(p)
+            budget_left -= t_count
+        else:
+            # Word-level truncation to fit remaining budget
+            words = ptxt.split()
+            allowed_words = max(20, int(budget_left / 1.3))
+            if allowed_words > 0 and words:
+                truncated_text = " ".join(words[:allowed_words]) + " …"
+                clamped.append({"doc_id": p.get("doc_id", "unknown"), "text": truncated_text})
+            break
+    return clamped
 
 class ConceptDecompositionPipeline(OversizedDecomposerMixin):
     def __init__(self, args):
@@ -311,15 +335,21 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
                     all_child_paras.extend(ch.get("paragraphs", []))
 
                 surviving_docs = {p.get("doc_id") for p in pillar_paras + all_child_paras if p.get("doc_id")}
-                # If any original doc_id was omitted by LLM in decomposition, retain it in the pillar
+                # If any original doc_id was omitted by LLM in decomposition, retain concise evidence in the pillar
                 for orig_p in orig_paras:
                     did = orig_p.get("doc_id")
                     if did and did != "unknown" and did not in surviving_docs:
                         print(f"[PROVENANCE RESCUE] Rescued omitted doc '{did}' back into pillar '{t}'.")
-                        pillar_paras.append(orig_p)
+                        rescue_text = (orig_p.get("text") or "").strip()
+                        # Keep concise summary snippet (up to 40 words) to avoid blowing pillar context
+                        words = rescue_text.split()
+                        if len(words) > 40:
+                            rescue_text = " ".join(words[:40]) + " …"
+                        pillar_paras.append({"doc_id": did, "text": rescue_text})
                         surviving_docs.add(did)
 
-                c["paragraphs"] = pillar_paras
+                # Strict Progressive Disclosure Cap: Pillar concepts must not exceed 600 tokens
+                c["paragraphs"] = clamp_concept_paragraphs(pillar_paras, max_tokens=600)
                 c.pop("description", None)
                 c.pop("source_chunks", None)
 
@@ -329,7 +359,7 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
 
                 final_concepts.append(c)
 
-                # Add children
+                # Add children (strictly clamped to <= 600 tokens)
                 for ch in decomp_data.get("children", []):
                     ch_title = ch["title"].strip()
                     ch_slug = generate_stable_slug(ch_title, used_slugs)
@@ -341,7 +371,7 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
                         "aliases": [],
                         "subtopics": [],
                         "entities": [],
-                        "paragraphs": ch.get("paragraphs", []),
+                        "paragraphs": clamp_concept_paragraphs(ch.get("paragraphs", []), max_tokens=600),
                         "outbound_relations": [
                             {
                                 "target_concept": t,
@@ -370,6 +400,9 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
             else:
                 c.pop("description", None)
                 c.pop("source_chunks", None)
+                # Enforce max 600 tokens for undecomposed / standard concepts
+                if "paragraphs" in c and c["paragraphs"]:
+                    c["paragraphs"] = clamp_concept_paragraphs(c["paragraphs"], max_tokens=600)
                 final_concepts.append(c)
 
         print(f"\nDecomposed {decomposed_count} broad concepts into {new_children_count} focused subtopic concepts.")
