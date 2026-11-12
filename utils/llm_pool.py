@@ -404,9 +404,17 @@ class ServerPool:
                 await run_item(server_index, index, item)
                 shared_queue.task_done()
 
-        workers = [asyncio.create_task(worker(s))
-                   for s in range(server_count)
-                   for _ in range(self.server_concurrencies[s])]
+        # Interleave worker creation across all servers (round-robin) so that tasks
+        # are evenly scheduled across all servers from slot 0 onward. If there are fewer
+        # pending items than total cluster concurrency, items are distributed across
+        # all available servers instead of being monopolized by the first server in the list.
+        max_concurrency = max(self.server_concurrencies) if self.server_concurrencies else 0
+        workers = [
+            asyncio.create_task(worker(s))
+            for slot in range(max_concurrency)
+            for s in range(server_count)
+            if slot < self.server_concurrencies[s]
+        ]
         try:
             await asyncio.gather(*workers)
         finally:
