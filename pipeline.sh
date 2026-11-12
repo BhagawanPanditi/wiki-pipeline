@@ -42,13 +42,7 @@ DATA_DIR="${DATA_DIR:-/home/compiling-ganesh/24m0829/long_document/wiki_pipeline
 WIKI_BASE_DIR="${WIKI_BASE_DIR:-/home/compiling-ganesh/24m0829/long_document/wiki}"
 
 ALL_DOMAINS=(
-    "sustainable_living"
-    "biology"
-    "earth_science"
-    "economics"
-    "psychology"
-    "robotics"
-    "stackoverflow"
+    "browsecomp_plus"
 )
 
 TARGET_DOMAIN="${1:-sustainable_living}"
@@ -246,6 +240,7 @@ run_domain_pipeline() {
         python3 final_consolidation.py \
             --wiki_path "$wiki_path" \
             $THINKING_FLAG \
+            --max_primary_links 60 \
             --resume "${EXTRA_ARGS[@]}"
 
     # Stage 11: Benchmark Quality & Fact Retention Audit (Top 40 docs < 20k tokens)
