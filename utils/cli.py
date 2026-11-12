@@ -22,6 +22,12 @@ class StageProfile:
     connect_timeout: float = 30.0
     max_tokens: Optional[int] = None
     attempts: int = 4
+    budget_minutes: float = 300.0
+
+    @property
+    def attempt_timeout(self) -> float:
+        """Backstop above the request timeout for calls that never return."""
+        return self.request_timeout + 30.0
 
 
 @dataclass
@@ -33,6 +39,7 @@ class StageSettings:
     model_name: str
     max_tokens: Optional[int]
     attempts: int
+    budget_minutes: float = 300.0
 
 
 class StageArgumentParser(argparse.ArgumentParser):
@@ -94,6 +101,7 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
     max_tokens = int(stage_cfg.get("max_tokens", 4096))
     request_timeout = float(stage_cfg.get("request_timeout", 600.0))
     attempts = int(stage_cfg.get("attempts", cfg.get("attempts", 4)))
+    budget_minutes = float(stage_cfg.get("budget_minutes", cfg.get("budget_minutes", 300.0)))
 
     profile = StageProfile(
         key=stage,
@@ -102,6 +110,7 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
         connect_timeout=30.0,
         max_tokens=max_tokens,
         attempts=attempts,
+        budget_minutes=budget_minutes,
     )
 
     return StageSettings(
@@ -111,6 +120,7 @@ def resolve_settings(args: argparse.Namespace, stage: str) -> StageSettings:
         model_name=model,
         max_tokens=max_tokens,
         attempts=attempts,
+        budget_minutes=budget_minutes,
     )
 
 
