@@ -59,6 +59,10 @@ VERBATIM FIDELITY & ZERO FACT LOSS:
 - Whenever the source provides specific names, direct quotes, attributions, technical parameters, arguments, or code/robotics details (e.g. identifiers, terminal commands, file paths, launch files, configs, mathematical formulas, and units), preserve them exactly as stated in the text.
 - Do not replace concrete specifics with high-level generalizations.
 
+AVOID THIN STUBS (ABSORB, DO NOT DISCARD):
+- Do not create thin 1-2 sentence stub concepts for minor sub-steps, isolated parameters, or topics with limited text in this chunk.
+- NEVER discard these facts: absorb their verbatim descriptions, metrics, and parameters directly into the primary parent concept, and record their specific names under <subtopics>.
+
 CONTEXT BOUNDARIES:
 - CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g. "this system", "they") or acronyms to standard canonical titles.
 - Never invent facts or add outside knowledge.
