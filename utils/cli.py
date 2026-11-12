@@ -131,6 +131,7 @@ def add_common_args(
     description: str,
     include_resume: bool = False,
     include_input_path: bool = False,
+    **ignored_kwargs: Any,
 ) -> argparse.ArgumentParser:
     """Attach the minimal shared argument block for pipeline stages."""
     parser.add_argument("--wiki_path", "--wiki_dir", dest="wiki_path", type=str, required=True,
