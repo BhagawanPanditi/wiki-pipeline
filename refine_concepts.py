@@ -82,6 +82,7 @@ TITLES, ALIASES & SUBTOPICS:
 - Subtopics: Semicolon-separated list of absorbed specific sub-steps, mechanisms, or parameters.
 
 VERBATIM FIDELITY & ZERO FACT LOSS:
+- NO substantive information from the source chunk should be discarded. Every fact, parameter, explanation, and mechanism must be captured in the extracted concepts.
 - As much as possible, descriptions must be taken VERBATIM from the source text. Do not summarize away or paraphrase specific information.
 - Whenever the source provides specific names, direct quotes, attributions, technical parameters, arguments, or code/robotics details (identifiers, terminal commands, file paths, launch files, configs, formulas, and units), preserve them exactly as stated in the text.
 - Do not replace concrete specifics with high-level generalizations.
