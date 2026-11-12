@@ -69,32 +69,33 @@ def fuse_descriptions(descriptions: List[str], max_tokens: int = 1500) -> str:
 
 
 def extract_concept_paragraphs(concept: Dict[str, Any], default_doc_id: Optional[str] = None) -> List[Dict[str, str]]:
-    """Extract clean per-document paragraphs from a concept dict.
+    """Extract clean per-chunk paragraphs from a concept dict.
     
-    Returns a list of dicts: [{"doc_id": "doc_XXXXX", "text": "..."}] with ZERO inline citations.
+    Returns a list of dicts: [{"source_chunk": "doc_XXXXX_chunk_YYY", "text": "..."}] with ZERO inline citations.
     """
     # 1. If concept already has a structured 'paragraphs' field, return it cleanly
     if "paragraphs" in concept and isinstance(concept["paragraphs"], list) and concept["paragraphs"]:
         valid = []
         for p in concept["paragraphs"]:
             if isinstance(p, dict) and p.get("text"):
-                did = p.get("doc_id") or default_doc_id or "unknown"
+                src = p.get("source_chunk") or p.get("doc_id") or default_doc_id or "unknown"
+                src = src.replace("::", "_")
                 clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[-A-Za-z0-9_]+)?\s*\]", "", p["text"]).strip()
                 if "```" not in clean_t and "\n" not in clean_t:
                     clean_t = " ".join(clean_t.split())
                 if clean_t:
-                    valid.append({"doc_id": did, "text": clean_t})
+                    valid.append({"source_chunk": src, "doc_id": src.split("_chunk_")[0] if "_chunk_" in src else src, "text": clean_t})
         if valid:
             return valid
 
-    # 2. Extract doc_id from source_chunks
-    expected_doc_ids: List[str] = []
+    # 2. Extract chunk/doc IDs from source_chunks
+    expected_chunks: List[str] = []
     if default_doc_id:
-        expected_doc_ids.append(default_doc_id)
+        expected_chunks.append(default_doc_id.replace("::", "_"))
     for sc in concept.get("source_chunks", []):
-        did = sc.split("::")[0] if "::" in sc else sc
-        if did and did not in expected_doc_ids:
-            expected_doc_ids.append(did)
+        norm_sc = sc.replace("::", "_").strip()
+        if norm_sc and norm_sc not in expected_chunks:
+            expected_chunks.append(norm_sc)
 
     desc = concept.get("description", "").strip()
     if not desc:
@@ -102,69 +103,70 @@ def extract_concept_paragraphs(concept: Dict[str, Any], default_doc_id: Optional
 
     # If description contains distinct double newlines, inspect each block
     raw_blocks = [b.strip() for b in re.split(r"\n\s*\n", desc) if b.strip()]
-    if len(raw_blocks) > 1 and len(expected_doc_ids) >= len(raw_blocks):
+    if len(raw_blocks) > 1 and len(expected_chunks) >= len(raw_blocks):
         paras = []
         for i, b in enumerate(raw_blocks):
-            did = expected_doc_ids[i] if i < len(expected_doc_ids) else expected_doc_ids[0]
+            src = expected_chunks[i] if i < len(expected_chunks) else expected_chunks[0]
             clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[-A-Za-z0-9_]+)?\s*\]", "", b).strip()
             if "```" not in clean_t and "\n" not in clean_t:
                 clean_t = " ".join(clean_t.split())
             if clean_t:
-                paras.append({"doc_id": did, "text": clean_t})
+                paras.append({"source_chunk": src, "doc_id": src.split("_chunk_")[0] if "_chunk_" in src else src, "text": clean_t})
         return paras
 
     # Otherwise parse sentences and bracket tags
     sentences = re.split(r'(?<=[.!?])\s+', desc)
-    doc_paragraphs: Dict[str, List[str]] = defaultdict(list)
-    doc_order: List[str] = []
-    current_doc = expected_doc_ids[0] if len(expected_doc_ids) == 1 else None
+    chunk_paragraphs: Dict[str, List[str]] = defaultdict(list)
+    chunk_order: List[str] = []
+    current_chunk = expected_chunks[0] if len(expected_chunks) == 1 else None
 
     for s in sentences:
         s_clean = s.strip()
         if not s_clean:
             continue
-        found_docs = re.findall(r'\[\s*((?:doc_|canon_)[A-Za-z0-9_-]+)(?:::[^\]]+)?\s*\]', s_clean)
-        if found_docs:
-            current_doc = found_docs[0]
-        elif not current_doc and expected_doc_ids:
-            current_doc = expected_doc_ids[0]
+        found_chunks = re.findall(r'\[\s*((?:doc_|canon_)[A-Za-z0-9_-]+(?:::[-A-Za-z0-9_]+)?)\s*\]', s_clean)
+        if found_chunks:
+            current_chunk = found_chunks[0].replace("::", "_")
+        elif not current_chunk and expected_chunks:
+            current_chunk = expected_chunks[0]
 
-        key = current_doc or (expected_doc_ids[0] if expected_doc_ids else "unknown")
-        if key not in doc_paragraphs:
-            doc_order.append(key)
+        key = current_chunk or (expected_chunks[0] if expected_chunks else "unknown")
+        if key not in chunk_paragraphs:
+            chunk_order.append(key)
 
         clean_sentence = re.sub(r'\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]', '', s_clean).strip()
         clean_sentence = re.sub(r'\.\s*\.', '.', clean_sentence)
         clean_sentence = re.sub(r'\s+([.,;:!?])', r'\1', clean_sentence)
         clean_sentence = " ".join(clean_sentence.split())
         if clean_sentence and len(clean_sentence) > 3:
-            doc_paragraphs[key].append(clean_sentence)
+            chunk_paragraphs[key].append(clean_sentence)
 
     result = []
-    for did in doc_order:
-        sents = doc_paragraphs[did]
+    for sc in chunk_order:
+        sents = chunk_paragraphs[sc]
         if sents:
             txt = " ".join(sents).strip()
             if not txt.endswith((".", "!", "?")):
                 txt += "."
-            result.append({"doc_id": did, "text": txt})
+            result.append({"source_chunk": sc, "doc_id": sc.split("_chunk_")[0] if "_chunk_" in sc else sc, "text": txt})
     return result
 
 
 def fuse_paragraphs_by_document(concept_list: List[Dict[str, Any]], default_doc_id: Optional[str] = None) -> List[Dict[str, str]]:
-    """Merge paragraphs from multiple concepts, combining text belonging to the same doc_id
-    and keeping distinct doc_ids separate. Returns list of {"doc_id": ..., "text": ...}.
+    """Merge paragraphs from multiple concepts, combining text belonging to the same chunk
+    and keeping distinct chunks separate. Returns list of {"source_chunk": ..., "doc_id": ..., "text": ...}.
     """
-    doc_to_sents: Dict[str, List[str]] = defaultdict(list)
-    doc_order: List[str] = []
+    chunk_to_sents: Dict[str, List[str]] = defaultdict(list)
+    chunk_order: List[str] = []
     seen_sents: Set[str] = set()
 
     for c in concept_list:
         paras = extract_concept_paragraphs(c, default_doc_id=default_doc_id)
         for p in paras:
-            did = p["doc_id"]
-            if did not in doc_to_sents:
-                doc_order.append(did)
+            src = p.get("source_chunk") or p.get("doc_id", "unknown")
+            src = src.replace("::", "_")
+            if src not in chunk_to_sents:
+                chunk_order.append(src)
             for s in re.split(r'(?<=[.!?])\s+', p["text"].strip()):
                 s_clean = s.strip()
                 if not s_clean:
@@ -173,31 +175,36 @@ def fuse_paragraphs_by_document(concept_list: List[Dict[str, Any]], default_doc_
                 norm = " ".join(norm.split())
                 if norm and norm not in seen_sents:
                     seen_sents.add(norm)
-                    doc_to_sents[did].append(s_clean)
+                    chunk_to_sents[src].append(s_clean)
 
     merged = []
-    for did in doc_order:
-        sents = doc_to_sents[did]
+    for src in chunk_order:
+        sents = chunk_to_sents[src]
         if sents:
             txt = " ".join(sents).strip()
             if not txt.endswith((".", "!", "?")):
                 txt += "."
-            merged.append({"doc_id": did, "text": txt})
+            merged.append({
+                "source_chunk": src,
+                "doc_id": src.split("_chunk_")[0] if "_chunk_" in src else src,
+                "text": txt,
+            })
     return merged
 
 
 def render_paragraphs_to_markdown(paragraphs: List[Dict[str, str]]) -> str:
-    """Render a structured paragraphs list into Markdown with [doc_XXXXX] citations at the end."""
+    """Render a structured paragraphs list into Markdown with [doc_XXXXX_chunk_YYY] citations at the end."""
     if not paragraphs:
         return ""
     lines = []
     for p in paragraphs:
         t = p.get("text", "").strip()
-        did = p.get("doc_id", "").strip()
+        src = (p.get("source_chunk") or p.get("doc_id") or "").strip()
+        src = src.replace("::", "_")
         if not t:
             continue
-        if did and did != "unknown":
-            lines.append(f"{t} [{did}]")
+        if src and src != "unknown":
+            lines.append(f"{t} [{src}]")
         else:
             lines.append(t)
     return "\n\n".join(lines)

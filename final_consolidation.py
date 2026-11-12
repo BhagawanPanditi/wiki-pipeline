@@ -39,20 +39,21 @@ from utils.stats import print_link_distribution
 
 
 def clean_chunk_citations(text: str) -> str:
-    """Convert chunk-level bracket citations to document-level citations and deduplicate adjacent ones."""
+    """Normalize and deduplicate bracket citations (e.g. [doc_XXXXX_chunk_YYY] or [doc_XXXXX])."""
     if not text:
         return ""
 
     def replace_citation_groups(match):
         group = match.group(0)
-        canon_ids = re.findall(r"\[\s*([A-Za-z0-9_-]+)(?:::[A-Za-z0-9_-]+)?\s*\]", group)
+        canon_ids = re.findall(r"\[\s*([A-Za-z0-9_-]+(?:(?:_|::)chunk_[A-Za-z0-9_-]+)?)\s*\]", group)
         unique = []
         for cid in canon_ids:
-            if cid not in unique:
-                unique.append(cid)
+            norm_cid = cid.replace("::", "_")
+            if norm_cid not in unique:
+                unique.append(norm_cid)
         return " " + " ".join(f"[{cid}]" for cid in unique) + " "
 
-    pattern = r"(?:\[\s*[A-Za-z0-9_-]+(?:::[A-Za-z0-9_-]+)?\s*\]\s*)+"
+    pattern = r"(?:\[\s*[A-Za-z0-9_-]+(?:(?:_|::)chunk_[A-Za-z0-9_-]+)?\s*\]\s*)+"
     cleaned = re.sub(pattern, replace_citation_groups, text)
     cleaned = re.sub(r" +", " ", cleaned)
     cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
@@ -1078,6 +1079,24 @@ class FinalConsolidationPipeline:
         print(f"Exporting Markdown Wiki to {self.md_dir}...")
         self.md_dir.mkdir(parents=True, exist_ok=True)
         surviving_md_names: Set[str] = {"concept_index.md", "entity_index.md", "subtopic_index.md"}
+
+        # Export individual chunk texts into chunks/ for direct agent/model access if cache exists
+        cache_chunks_file = self.wiki_path / "cache" / "chunks_cache.json"
+        if cache_chunks_file.is_file():
+            chunks_export_dir = self.wiki_path / "chunks"
+            chunks_export_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(cache_chunks_file, "r", encoding="utf-8") as f:
+                    chunks_data = json.load(f)
+                for ch in chunks_data:
+                    doc_id = ch.get("doc_id", "")
+                    chunk_id = ch.get("chunk_id", "")
+                    txt = ch.get("current_chunk", "")
+                    if doc_id and chunk_id and txt:
+                        fname = f"{doc_id}_{chunk_id}.txt"
+                        (chunks_export_dir / fname).write_text(txt, encoding="utf-8")
+            except Exception as e:
+                print(f"Note: Could not export chunks folder: {e}")
 
         concept_index_entries: List[Tuple[str, str, str]] = []
         entity_to_concepts: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)

@@ -476,14 +476,35 @@ class WikiDocumentConsolidatorPipeline:
                 if src_chunk:
                     source_chunks_set.add(src_chunk)
 
-            fused_desc = fuse_descriptions([c.get("description", "") for c in concept_group])
+            # Preserve per-chunk paragraphs with chunk-level provenance (e.g. doc_XXXXX_chunk_YYY)
+            chunk_to_descs: Dict[str, List[str]] = defaultdict(list)
+            chunk_order: List[str] = []
+            for c in concept_group:
+                src = (c.get("source_chunk") or doc_id).replace("::", "_")
+                if src not in chunk_to_descs:
+                    chunk_order.append(src)
+                desc_text = (c.get("description") or "").strip()
+                if desc_text:
+                    chunk_to_descs[src].append(desc_text)
+
+            chunk_paragraphs = []
+            for src in chunk_order:
+                fused_chunk_desc = fuse_descriptions(chunk_to_descs[src])
+                if fused_chunk_desc:
+                    chunk_paragraphs.append({
+                        "source_chunk": src,
+                        "doc_id": doc_id,
+                        "text": fused_chunk_desc,
+                    })
+
+            fused_desc = "\n\n".join(p["text"] for p in chunk_paragraphs) if chunk_paragraphs else fuse_descriptions([c.get("description", "") for c in concept_group])
 
             consolidated_concepts.append({
                 "title": chosen_title,
                 "aliases": union_aliases(aliases_list),
                 "subtopics": union_aliases(subtopics_list),
                 "description": fused_desc,
-                "paragraphs": [{"doc_id": doc_id, "text": fused_desc}],
+                "paragraphs": chunk_paragraphs or [{"source_chunk": doc_id, "doc_id": doc_id, "text": fused_desc}],
                 "source_chunks": sorted(list(source_chunks_set)),
             })
 
