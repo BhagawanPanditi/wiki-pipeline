@@ -338,7 +338,8 @@ AUDIT DEFINITIONS & EXPECTATIONS:
    - For prose explanations, verify that core assertions, mechanisms, and attributions are preserved.
 
 3. NOISE & NON-FACTS (SILENTLY IGNORE):
-   - Silently ignore HTML tags, web scraping artifacts, navigation menus, headers/footers, cookie notices, pure bibliography/references metadata, and boilerplate. Do NOT penalize the extraction for omitting them.
+   - Silently ignore HTML tags, web scraping artifacts, navigation menus, headers/footers, cookie notices, pure bibliography/references metadata, and boilerplate.
+   - Silently ignore raw telemetry logs, packet sequence numbers (e.g. `seq: 1593`), raw timestamp numbers, and raw numeric matrix / covariance array dumps (`[5001.06..., 1405.96...]`). Do NOT enumerate individual matrix numbers or raw dump values as missing facts. Do NOT penalize the extraction for omitting them.
 
 4. SCORING CRITERIA:
 - `coverage_score` (0.0 to 1.0):
