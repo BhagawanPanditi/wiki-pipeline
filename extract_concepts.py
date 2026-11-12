@@ -31,8 +31,7 @@ from utils.llm_pool import pool_for_stage
 from utils.manifest import write_stage_manifest
 
 STAGE = "extract-concepts"
-DEFAULT_CHUNK_SIZE = 5000
-DEFAULT_CHUNK_OVERLAP = 500
+
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
 
@@ -49,29 +48,24 @@ class ChunkExtractionSchema(BaseModel):
 
 SYSTEM_PROMPT = """\
 You are an expert knowledge extractor building a Knowledge Wiki from raw documents.
-Your goal is to transform the CURRENT CHUNK into solid, fact-dense concepts that serve as a complete, superior replacement for the raw text. Once extracted, a reader should never need to look at the original chunk.
+Your goal is to extract solid, fact-dense concepts that serve as a complete, superior replacement for the raw text.
 
 INPUT & NOISE CLEANING:
-- Silently ignore HTML tags, scraping artifacts, navigation menus, headers/footers, cookie notices, and boilerplate.
-- If the chunk contains no substantive informational content, output nothing.
+- Ignore page chrome, navigation menus, headers/footers, cookie notices, and boilerplate.
+- Content inside code blocks, configuration blocks, commands, and tables is ALWAYS substantive content and must never be ignored or discarded.
+
+FACTUAL RETENTION & VERBATIM DETAIL:
+- Retain exact identifiers, command lines, code snippets, file paths, configurations, metrics, and parameters verbatim.
+- Do NOT aggressively summarize or paraphrase away specific technical details.
 
 CONTEXT BOUNDARIES:
 - CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g. "this system", "they") or acronyms to standard canonical titles.
 - Never invent facts or add outside knowledge.
 
 TITLES AND ALIASES:
-- Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the canonical name any other document would use for the same subject, ensuring concepts merge cleanly across sources.
-- Aliases: Semicolon-separated list of acronyms, alternate designations, or specific minor sub-topics/parameters absorbed into this concept. If none, leave empty.
-
-SIZE GUIDELINES (words):
-- A well-formed concept description is typically 150-450 words.
-- If a topic has fewer than ~45 words of substance in this chunk, do not create a concept; absorb its facts into the parent concept's description and record its name in <subtopics>.
-- If one topic spans well over 700 words in this chunk, split at natural thematic boundaries into separate concepts.
-- Never pad. Do not restate the title in every sentence or add commentary ("This concept covers...").
-
-ALIASES vs SUBTOPICS:
-- <aliases>: only true synonyms, acronyms, and alternate names for THIS concept.
-- <subtopics>: names of narrower parameters, variants, or sub-steps whose facts you absorbed into this description.
+- Title: 1-6 words, Title Case, the full standard name, singular unless the standard name is plural.
+- Aliases: Semicolon-separated list of acronyms or alternate designations. If none, leave empty.
+- Subtopics: Semicolon-separated list of absorbed specific sub-steps, variants, or parameters.
 
 EMPTY CASE:
 If the CURRENT CHUNK has no substantive informational content, output exactly: <no_concepts/>
@@ -82,7 +76,7 @@ Output ONLY completed <concept>...</concept> XML blocks with no introductory or 
 <title>Exact Canonical Title</title>
 <aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
 <subtopics>Absorbed Subtopic 1; Absorbed Subtopic 2</subtopics>
-<description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all substantive facts, properties, and specific details from this chunk.</description>
+<description>Comprehensive factual details, properties, code blocks, parameters, or prose describing this concept from this chunk.</description>
 </concept>
 
 If no substantive concepts exist in the chunk, output exactly: <no_concepts/>
@@ -119,13 +113,13 @@ def parse_xml_concepts(text: str) -> List[Concept]:
         aliases_m = re.search(r"<aliases>(.*?)</aliases>", block, re.DOTALL | re.IGNORECASE)
         if aliases_m:
             raw_aliases = aliases_m.group(1).strip()
-            aliases = [a.strip() for a in re.split(r"[;,]", raw_aliases) if a.strip()]
+            aliases = [a.strip() for a in raw_aliases.split(";") if a.strip()]
 
         subtopics = []
         subtopics_m = re.search(r"<subtopics>(.*?)</subtopics>", block, re.DOTALL | re.IGNORECASE)
         if subtopics_m:
             raw_subs = subtopics_m.group(1).strip()
-            subtopics = [s.strip() for s in re.split(r"[;,]", raw_subs) if s.strip()]
+            subtopics = [s.strip() for s in raw_subs.split(";") if s.strip()]
 
         concepts.append(Concept(
             title=title,

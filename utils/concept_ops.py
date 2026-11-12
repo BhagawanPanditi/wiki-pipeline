@@ -80,7 +80,8 @@ def extract_concept_paragraphs(concept: Dict[str, Any], default_doc_id: Optional
             if isinstance(p, dict) and p.get("text"):
                 did = p.get("doc_id") or default_doc_id or "unknown"
                 clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[-A-Za-z0-9_]+)?\s*\]", "", p["text"]).strip()
-                clean_t = " ".join(clean_t.split())
+                if "```" not in clean_t and "\n" not in clean_t:
+                    clean_t = " ".join(clean_t.split())
                 if clean_t:
                     valid.append({"doc_id": did, "text": clean_t})
         if valid:
@@ -106,7 +107,8 @@ def extract_concept_paragraphs(concept: Dict[str, Any], default_doc_id: Optional
         for i, b in enumerate(raw_blocks):
             did = expected_doc_ids[i] if i < len(expected_doc_ids) else expected_doc_ids[0]
             clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[-A-Za-z0-9_]+)?\s*\]", "", b).strip()
-            clean_t = " ".join(clean_t.split())
+            if "```" not in clean_t and "\n" not in clean_t:
+                clean_t = " ".join(clean_t.split())
             if clean_t:
                 paras.append({"doc_id": did, "text": clean_t})
         return paras

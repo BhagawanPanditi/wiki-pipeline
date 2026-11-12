@@ -59,15 +59,15 @@ def get_llm_kwargs(args: Any, cfg: Optional[Dict[str, Any]] = None, task: str = 
     base = {"chat_template_kwargs": {"enable_thinking": False}, "top_k": 20}
     if task == "judge":
         return {
-            "temperature": 0.1,
+            "temperature": 0.0,
             "top_p": 0.8,
             "presence_penalty": 0.0,
             "extra_body": {**base, "repetition_penalty": 1.0},
         }
     return {
-        "temperature": 0.3,
-        "top_p": 0.8,
-        "presence_penalty": 0.5,
+        "temperature": 0.1,
+        "top_p": 0.9,
+        "presence_penalty": 0.0,
         "extra_body": {**base, "repetition_penalty": 1.0},
     }
 

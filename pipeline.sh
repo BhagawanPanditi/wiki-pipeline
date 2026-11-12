@@ -42,7 +42,13 @@ DATA_DIR="${DATA_DIR:-/home/compiling-ganesh/24m0829/long_document/wiki_pipeline
 WIKI_BASE_DIR="${WIKI_BASE_DIR:-/home/compiling-ganesh/24m0829/long_document/wiki}"
 
 ALL_DOMAINS=(
-    "browsecomp_plus"
+    "sustainable_living"
+    "biology"
+    "earth_science"
+    "economics"
+    "psychology"
+    "robotics"
+    "stackoverflow"
 )
 
 TARGET_DOMAIN="${1:-sustainable_living}"

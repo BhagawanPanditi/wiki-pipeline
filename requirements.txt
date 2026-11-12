@@ -4,8 +4,8 @@ openai>=1.40
 pydantic>=2.6
 tqdm>=4.66
 networkx>=3.2
-# Needed for the default chunked mode. Not needed with --no-chunking.
+tiktoken>=0.7.0
+# Needed for tokenization/chunking when transformers tokenizer is used
 transformers>=4.40
-# Optional: a better stopword list for fuzzy matching. The stage falls back to a
-# built-in list when nltk is absent.
-# nltk>=3.8
+spacy>=3.7
+
