@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 from openai import BadRequestError
 from pydantic import BaseModel, Field
@@ -23,7 +23,7 @@ from tqdm import tqdm
 from utils.atomic_io import atomic_write_text
 from utils.checkpoint import load_bool_log, save_log_async
 from utils.cli import build_parser, resolve_settings
-from utils.concept_ops import fuse_descriptions, union_aliases
+from utils.concept_ops import fuse_descriptions
 from utils.corpus import chunking_enabled
 from utils.errors import StageBudget
 from utils.lemma import canonical_title_key
@@ -31,6 +31,19 @@ from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
 from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.unionfind import UnionFind
+
+
+def union_aliases(alias_lists: Iterable[List[str]]) -> List[str]:
+    """Union lists of aliases, deduplicating case-insensitively while preserving clean display."""
+    seen = set()
+    result = []
+    for alist in alias_lists:
+        for a in alist:
+            norm = a.strip().casefold()
+            if norm and norm not in seen:
+                seen.add(norm)
+                result.append(a.strip())
+    return result
 
 STAGE = "consolidate-documents"
 MAX_MERGE_BATCH_CHARS = 12000

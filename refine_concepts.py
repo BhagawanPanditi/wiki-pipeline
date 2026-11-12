@@ -21,8 +21,8 @@ from pydantic import BaseModel, Field
 
 from config import _read_config
 from utils.checkpoint import load_bool_log, save_log_async, save_log_sync
-from utils.chunks import load_cached_chunks
 from utils.cli import build_parser, resolve_settings
+from utils.corpus import load_cached_chunks
 from utils.errors import StageBudget
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage

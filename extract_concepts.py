@@ -27,10 +27,12 @@ from utils.corpus import (DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
                           save_run_config)
 from utils.errors import StageBudget
 from utils.llm_params import call_llm
-from utils.llm_pool import ServerPool
+from utils.llm_pool import pool_for_stage
 from utils.manifest import write_stage_manifest
 
 STAGE = "extract-concepts"
+DEFAULT_CHUNK_SIZE = 5000
+DEFAULT_CHUNK_OVERLAP = 500
 
 # ── Data Schemas ─────────────────────────────────────────────────────────────
 
@@ -344,15 +346,7 @@ Extract the substantive concepts from CURRENT CHUNK now according to the system 
         pending_chunks = [c for c in all_chunks if not self.chunk_is_complete(c)]
 
         settings = self.settings
-        pool = ServerPool(
-            settings.servers,
-            concurrency_per_server=settings.concurrency_per_server,
-            request_timeout=settings.profile.request_timeout,
-            connect_timeout=settings.profile.connect_timeout,
-            label=STAGE,
-            llm_log=None,
-            failover=not getattr(self.args, "no_failover", False),
-        )
+        pool = pool_for_stage(self.args, settings, STAGE)
 
         total_in_flight = sum(pool.server_concurrencies)
         print(f"Total chunks: {len(all_chunks)} | Pending chunks: {len(pending_chunks)}")
@@ -408,7 +402,7 @@ def main() -> None:
     parser = build_parser(
         stage=STAGE,
         description="High-throughput concept extractor: corpus -> per-chunk concepts",
-        include_corpus=True,
+        include_input_path=True,
         include_resume=True)
     args = parser.parse_args()
     pipeline = WikiExtractorPipeline(args)

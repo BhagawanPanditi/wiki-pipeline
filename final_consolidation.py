@@ -17,7 +17,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 from pydantic import BaseModel
@@ -25,12 +25,9 @@ from tqdm import tqdm
 
 from utils.atomic_io import atomic_write_json, atomic_write_text, sanitize_filename
 from utils.checkpoint import load_json_log, save_log_sync
-from utils.citation_utils import clean_chunk_citations
 from utils.cli import build_parser, resolve_settings
 from utils.concept_ops import (
     extract_concept_paragraphs,
-    format_description_into_per_doc_paragraphs,
-    fuse_descriptions_by_document,
     fuse_paragraphs_by_document,
     generate_stable_slug,
     get_concept_full_text,
@@ -39,6 +36,89 @@ from utils.concept_ops import (
 from utils.llm_pool import pool_for_stage
 from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.stats import print_link_distribution
+
+
+def clean_chunk_citations(text: str) -> str:
+    """Convert chunk-level bracket citations to document-level citations and deduplicate adjacent ones."""
+    if not text:
+        return ""
+
+    def replace_citation_groups(match):
+        group = match.group(0)
+        canon_ids = re.findall(r"\[\s*([A-Za-z0-9_-]+)(?:::[A-Za-z0-9_-]+)?\s*\]", group)
+        unique = []
+        for cid in canon_ids:
+            if cid not in unique:
+                unique.append(cid)
+        return " " + " ".join(f"[{cid}]" for cid in unique) + " "
+
+    pattern = r"(?:\[\s*[A-Za-z0-9_-]+(?:::[A-Za-z0-9_-]+)?\s*\]\s*)+"
+    cleaned = re.sub(pattern, replace_citation_groups, text)
+    cleaned = re.sub(r" +", " ", cleaned)
+    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+    return cleaned.strip()
+
+
+def fuse_descriptions_by_document(concept_list: List[Dict[str, Any]]) -> str:
+    """Backwards-compatible helper returning a plain multi-paragraph string with citations."""
+    paras = fuse_paragraphs_by_document(concept_list)
+    return render_paragraphs_to_markdown(paras)
+
+
+def format_description_into_per_doc_paragraphs(text: str, source_chunks: Optional[List[str]] = None) -> str:
+    """Format any description text into clean, distinct paragraphs per source document."""
+    if not text:
+        return ""
+
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    doc_paragraphs: Dict[str, List[str]] = defaultdict(list)
+    doc_order: List[str] = []
+    current_doc = None
+
+    expected_doc_ids: List[str] = []
+    if source_chunks:
+        for sc in source_chunks:
+            did = sc.split("::")[0] if "::" in sc else sc
+            if did and did not in expected_doc_ids:
+                expected_doc_ids.append(did)
+
+    for s in sentences:
+        s_clean = s.strip()
+        if not s_clean:
+            continue
+
+        found_docs = re.findall(r'\[\s*((?:doc_|canon_)[A-Za-z0-9_-]+)(?:::[^\]]+)?\s*\]', s_clean)
+        if found_docs:
+            current_doc = found_docs[0]
+        elif not current_doc and expected_doc_ids:
+            current_doc = expected_doc_ids[0]
+
+        key = current_doc or "general"
+        if key not in doc_paragraphs:
+            doc_order.append(key)
+
+        clean_sentence = re.sub(r'\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]', '', s_clean).strip()
+        clean_sentence = re.sub(r'\.\s*\.', '.', clean_sentence)
+        clean_sentence = re.sub(r'\s+([.,;:!?])', r'\1', clean_sentence)
+        clean_sentence = " ".join(clean_sentence.split())
+
+        if clean_sentence and len(clean_sentence) > 3:
+            doc_paragraphs[key].append(clean_sentence)
+
+    formatted = []
+    for doc_key in doc_order:
+        sents = doc_paragraphs[doc_key]
+        if not sents:
+            continue
+        para = " ".join(sents).strip()
+        if not para.endswith((".", "!", "?")):
+            para += "."
+
+        if doc_key != "general":
+            para = f"{para} [{doc_key}]"
+        formatted.append(para)
+
+    return "\n\n".join(formatted) if formatted else text.strip()
 
 STAGE = "final-macro-scan"
 DEEP_STAGE = "final-deep-verify"

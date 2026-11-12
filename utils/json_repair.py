@@ -64,25 +64,3 @@ def repair_truncated_json(text: str) -> str:
 
     return snippet
 
-
-def clean_json_string(raw_response: str, *, allow_bare_object: bool = False,
-                      allow_array: bool = False) -> str:
-    """Extract a clean JSON string from a raw model response.
-
-    Falls back to the stripped raw response when no JSON block is found; then
-    attempts repair if truncated.
-    """
-    if not raw_response:
-        return ""
-
-    pattern = _FENCED_OBJECT_OR_ARRAY if allow_array else _FENCED_OBJECT
-    match = pattern.search(raw_response)
-    if match:
-        return repair_truncated_json(match.group(1).strip())
-
-    if allow_bare_object:
-        bare = _BARE_OBJECT.search(raw_response)
-        if bare:
-            return repair_truncated_json(bare.group(1).strip())
-
-    return repair_truncated_json(raw_response.strip())

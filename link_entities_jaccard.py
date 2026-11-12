@@ -26,7 +26,7 @@ from utils.atomic_io import atomic_write_json, sanitize_filename
 from utils.checkpoint import load_json_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
 from utils.concept_ops import get_concept_full_text
-from utils.lemma import normalize_entity
+from utils.lemma import normalize_head_noun
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
 from utils.manifest import verify_stage_manifest, write_stage_manifest
@@ -101,22 +101,22 @@ async def enrich_graph_via_jaccard(
     for c in concepts:
         title = c["title"]
         concept_by_title[title] = c
-        norm_t = normalize_entity(title)
+        norm_t = normalize_head_noun(title)
         if len(norm_t) > 2:
             title_lookup[norm_t] = title
         for alias in c.get("aliases", []):
-            norm_a = normalize_entity(alias)
+            norm_a = normalize_head_noun(alias)
             if len(norm_a) > 2:
                 title_lookup[norm_a] = title
         for sub in c.get("subtopics", []):
-            norm_s = normalize_entity(sub)
+            norm_s = normalize_head_noun(sub)
             if len(norm_s) > 2:
                 title_lookup[norm_s] = title
 
         raw_entities = c.get("entities", [])
         norm_set = set()
         for ent in raw_entities:
-            norm_e = normalize_entity(ent)
+            norm_e = normalize_head_noun(ent)
             if len(norm_e) > 2:
                 norm_set.add(norm_e)
                 entity_to_concepts[norm_e].add(title)

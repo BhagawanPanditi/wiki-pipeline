@@ -53,8 +53,3 @@ def canonical_title_key(title: str) -> str:
     """Produce a canonical key for candidate grouping across titles."""
     return normalize_head_noun(title)
 
-
-@lru_cache(maxsize=100000)
-def normalize_entity(entity: str) -> str:
-    """Produce a normalized entity string for overlap computation."""
-    return normalize_head_noun(entity)

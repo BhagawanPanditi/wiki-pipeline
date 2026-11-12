@@ -1,58 +1,58 @@
 {
-  "servers": [
-    "http://cn19-dgx:8003/v1",
-    "http://cn19-dgx:8007/v1",
-    "http://cn35-a40:8010/v1",
-    "http://cn45-l40:8001/v1"
-  ],
+  "servers": {
+    "dgx": [
+      "http://cn19-dgx:8003/v1",
+      "http://cn19-dgx:8007/v1"
+    ],
+    "a40": [
+      "http://cn35-a40:8010/v1"
+    ],
+    "l40": [
+      "http://cn45-l40:8001/v1"
+    ]
+  },
   "model_name": "Qwen/Qwen3.8-27B",
   "enable_thinking": false,
   "stage_concurrency": {
     "extract-concepts": {
-      "http://cn19-dgx:8003/v1": 120,
-      "http://cn19-dgx:8007/v1": 120,
-      "http://cn35-a40:8010/v1": 35,
-      "http://cn45-l40:8001/v1": 35,
+      "dgx": 120,
+      "a40": 35,
+      "l40": 35,
       "max_tokens": 16000,
       "request_timeout": 2400.0
     },
     "refine-concepts": {
-      "http://cn19-dgx:8003/v1": 24,
-      "http://cn19-dgx:8007/v1": 24,
-      "http://cn35-a40:8010/v1": 8,
-      "http://cn45-l40:8001/v1": 8,
+      "dgx": 24,
+      "a40": 8,
+      "l40": 8,
       "max_tokens": 16000,
       "request_timeout": 2400.0
     },
     "consolidate-documents": {
-      "http://cn19-dgx:8003/v1": 24,
-      "http://cn19-dgx:8007/v1": 24,
-      "http://cn35-a40:8010/v1": 8,
-      "http://cn45-l40:8001/v1": 8,
+      "dgx": 24,
+      "a40": 8,
+      "l40": 8,
       "max_tokens": 32000,
       "request_timeout": 4500.0
     },
     "decompose-concepts": {
-      "http://cn19-dgx:8003/v1": 20,
-      "http://cn19-dgx:8007/v1": 20,
-      "http://cn35-a40:8010/v1": 8,
-      "http://cn45-l40:8001/v1": 8,
+      "dgx": 20,
+      "a40": 8,
+      "l40": 8,
       "max_tokens": 6144,
       "request_timeout": 1200.0
     },
     "write-briefs": {
-      "http://cn19-dgx:8003/v1": 64,
-      "http://cn19-dgx:8007/v1": 64,
-      "http://cn35-a40:8010/v1": 32,
-      "http://cn45-l40:8001/v1": 32,
+      "dgx": 64,
+      "a40": 32,
+      "l40": 32,
       "max_tokens": 1536,
       "request_timeout": 90.0
     },
     "link-entities": {
-      "http://cn19-dgx:8003/v1": 300,
-      "http://cn19-dgx:8007/v1": 300,
-      "http://cn35-a40:8010/v1": 100,
-      "http://cn45-l40:8001/v1": 100,
+      "dgx": 300,
+      "a40": 100,
+      "l40": 100,
       "max_tokens": 512,
       "request_timeout": 600.0
     }
