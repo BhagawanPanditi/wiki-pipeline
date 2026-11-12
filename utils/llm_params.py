@@ -81,19 +81,18 @@ async def call_llm(
     args: Any = None,
     cfg: Optional[Dict[str, Any]] = None,
     task: str = "generate",
-    max_growth: int = 0,
-    max_model_len: Optional[int] = None,
+    max_growth: int = 2,
+    max_model_len: Optional[int] = 65536,
     **override_kwargs
 ) -> str:
     """Call LLM with automatic thinking-stripping, finish_reason check, and token-growth retries.
 
-    Args:
-        max_growth: 1 for large extraction/refine/doc-merge stages; 0 for small output stages.
-        max_model_len: Server context limit (e.g. 65536 or 98304) to clamp token doubling.
+    Doubles max_tokens on finish_reason == 'length' up to max_growth times (or server context limit).
     """
     model_kwargs = get_llm_kwargs(args, cfg, task=task)
     model_kwargs.update(override_kwargs)
 
+    effective_max_len = max_model_len or 65536
     limit = max_tokens
     for attempt in range(max_growth + 1):
         resp = await client.chat.completions.create(
@@ -110,18 +109,14 @@ async def call_llm(
 
         if finish_reason == "length":
             prompt_tokens = getattr(resp.usage, "prompt_tokens", 0) if hasattr(resp, "usage") and resp.usage else 0
-            room = (max_model_len - prompt_tokens - 64) if max_model_len and prompt_tokens else limit * 2
+            room = max(1024, effective_max_len - prompt_tokens - 64)
             nxt = min(limit * 2, room)
-            if attempt == max_growth or nxt <= limit:
-                # If the truncated response already contains completed XML blocks, recover them gracefully
-                content = getattr(ch.message, "content", "") or ""
-                if "</concept>" in content or "<no_concepts" in content:
-                    return final_answer(content)
-                raise OutputTruncated(
-                    f"Hit max_tokens={limit} (finish_reason='length', prompt={prompt_tokens}); exhausted {max_growth} retries."
-                )
-            limit = nxt
-            continue
+            if attempt < max_growth and nxt > limit:
+                limit = nxt
+                continue
+            raise OutputTruncated(
+                f"Hit max_tokens={limit} (finish_reason='length', prompt={prompt_tokens}); exhausted {max_growth} doubling attempts."
+            )
 
         raise ValueError(f"Unexpected finish_reason={finish_reason!r} from LLM server")
 

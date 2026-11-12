@@ -297,7 +297,7 @@ Extract the substantive concepts from CURRENT CHUNK now according to the system 
             args=self.args,
             cfg=getattr(self, "cfg", None),
             task="generate",
-            max_growth=1,
+            max_growth=2,
             max_model_len=max_model_len,
         )
 
