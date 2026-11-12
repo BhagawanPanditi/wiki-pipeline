@@ -646,7 +646,7 @@ Output ONLY the <verification>...</verification> block.
             args=self.args,
             cfg=self.cfg,
             task="judge",
-            max_growth=0,
+            max_growth=2,
             max_model_len=max_model_len,
         )
         return self.parse_verification(content, item["key"])
