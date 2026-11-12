@@ -62,13 +62,13 @@ def get_llm_kwargs(args: Any, cfg: Optional[Dict[str, Any]] = None, task: str = 
             "temperature": 0.0,
             "top_p": 0.8,
             "presence_penalty": 0.0,
-            "extra_body": {**base, "repetition_penalty": 1.0},
+            "extra_body": {**base, "repetition_penalty": 1.05},
         }
     return {
         "temperature": 0.1,
         "top_p": 0.9,
-        "presence_penalty": 0.0,
-        "extra_body": {**base, "repetition_penalty": 1.0},
+        "presence_penalty": 0.05,
+        "extra_body": {**base, "repetition_penalty": 1.05},
     }
 
 
@@ -114,6 +114,10 @@ async def call_llm(
             if attempt < max_growth and nxt > limit:
                 limit = nxt
                 continue
+            # If the model produced completed concepts before length limit, salvage them
+            content = getattr(ch.message, "content", "") or ""
+            if "</concept>" in content or "<no_concepts" in content:
+                return final_answer(content)
             raise OutputTruncated(
                 f"Hit max_tokens={limit} (finish_reason='length', prompt={prompt_tokens}); exhausted {max_growth} doubling attempts."
             )
