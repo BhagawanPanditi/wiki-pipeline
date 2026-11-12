@@ -642,7 +642,7 @@ Output ONLY the <verification>...</verification> block.
                 {"role": "system", "content": VERIFICATION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=self.settings.max_tokens or 4096,
+            max_tokens=self.settings.max_tokens or 8192,
             args=self.args,
             cfg=self.cfg,
             task="judge",
@@ -783,7 +783,7 @@ def main():
     parser.add_argument("--phase", type=int, default=1, choices=(1, 2),
                         help="1 = audit raw Pass 1 output (default); "
                              "2 = re-audit after Pass 2 and report the improvement.")
-    parser.add_argument("--sample_size", type=int, default=50,
+    parser.add_argument("--sample_size", type=int, default=500,
                         help="Number of random chunks to audit (default: 50; set 0 to audit all chunks).")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for deterministic chunk sampling across phases (default: 42).")

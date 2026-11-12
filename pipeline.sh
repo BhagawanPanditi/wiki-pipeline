@@ -49,6 +49,8 @@ ALL_DOMAINS=(
     "psychology"
     "robotics"
     "stackoverflow"
+    "wix"
+    "browsecomp_plus"
 )
 
 TARGET_DOMAIN="${1:-sustainable_living}"

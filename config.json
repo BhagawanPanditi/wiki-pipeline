@@ -1,30 +1,36 @@
 {
   "servers": {
     "dgx": [
-      "http://cn19-dgx:8003/v1",
-      "http://cn19-dgx:8007/v1"
+      "http://cn18-dgx:8002/v1",
+      "http://cn13-dgx:8000/v1",
+      "http://cn15-dgx:8001/v1",
+      "http://cn15-dgx:8003/v1"
     ],
     "a40": [
-      "http://cn35-a40:8010/v1"
+      "http://cn33-a40:8001/v1",
+      "http://cn29-a40:8003/v1"
     ],
     "l40": [
-      "http://cn45-l40:8001/v1"
+      "http://cn41-l40:8000/v1",
+      "http://cn42-l40:8001/v1",
+      "http://cn41-l40:8002/v1",
+      "http://cn44-l40:8003/v1"
     ]
   },
   "model_name": "Qwen/Qwen3.8-27B",
   "enable_thinking": false,
   "stage_concurrency": {
     "extract-concepts": {
-      "dgx": 120,
-      "a40": 35,
-      "l40": 35,
+      "dgx": 100,
+      "a40": 40,
+      "l40": 40,
       "max_tokens": 16000,
       "request_timeout": 2400.0
     },
     "refine-concepts": {
-      "dgx": 24,
-      "a40": 8,
-      "l40": 8,
+      "dgx": 100,
+      "a40": 40,
+      "l40": 40,
       "max_tokens": 16000,
       "request_timeout": 2400.0
     },
