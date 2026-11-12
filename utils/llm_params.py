@@ -113,6 +113,10 @@ async def call_llm(
             room = (max_model_len - prompt_tokens - 64) if max_model_len and prompt_tokens else limit * 2
             nxt = min(limit * 2, room)
             if attempt == max_growth or nxt <= limit:
+                # If the truncated response already contains completed XML blocks, recover them gracefully
+                content = getattr(ch.message, "content", "") or ""
+                if "</concept>" in content or "<no_concepts" in content:
+                    return final_answer(content)
                 raise OutputTruncated(
                     f"Hit max_tokens={limit} (finish_reason='length', prompt={prompt_tokens}); exhausted {max_growth} retries."
                 )
