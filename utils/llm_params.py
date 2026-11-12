@@ -114,9 +114,9 @@ async def call_llm(
             if attempt < max_growth and nxt > limit:
                 limit = nxt
                 continue
-            # If the model produced completed concepts before length limit, salvage them
+            # If the model produced completed concepts or verification before length limit, salvage them
             content = getattr(ch.message, "content", "") or ""
-            if "</concept>" in content or "<no_concepts" in content:
+            if "</concept>" in content or "<no_concepts" in content or "</verification>" in content:
                 return final_answer(content)
             raise OutputTruncated(
                 f"Hit max_tokens={limit} (finish_reason='length', prompt={prompt_tokens}); exhausted {max_growth} doubling attempts."

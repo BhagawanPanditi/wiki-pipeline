@@ -34,6 +34,20 @@
       "max_tokens": 16000,
       "request_timeout": 2400.0
     },
+    "verify-pass1": {
+      "dgx": 100,
+      "a40": 40,
+      "l40": 40,
+      "max_tokens": 8192,
+      "request_timeout": 1200.0
+    },
+    "verify-pass2": {
+      "dgx": 100,
+      "a40": 40,
+      "l40": 40,
+      "max_tokens": 8192,
+      "request_timeout": 1200.0
+    },
     "consolidate-documents": {
       "dgx": 24,
       "a40": 8,
