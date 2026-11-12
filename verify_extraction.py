@@ -328,20 +328,21 @@ Your task is to compare a RAW TEXT CHUNK against the EXTRACTED CONCEPTS to verif
 
 AUDIT DEFINITIONS & EXPECTATIONS:
 1. SOLID CONCEPTS ONLY (NO FRAGMENTATION):
-   - A concept is a canonical, self-contained, semantically coherent unit of knowledge that captures a meaningful subject or body of information, along with its relevant facts, properties, and relationships. It is independent of document boundaries and is not merely a keyword or arbitrary text chunk.
-   - Minor parameters, sub-steps, properties, and narrow variants should NOT be standalone concepts; they are expected to be absorbed directly into the comprehensive description of their primary parent concept (with narrow sub-topic names preserved in aliases).
-   - Do NOT penalize the extraction for omitting meta-labels ("Introduction", "Summary") or for not creating thin stub concepts for minor properties.
+   - A concept is a canonical, self-contained unit of knowledge capturing a meaningful subject and its relevant facts, properties, and relationships.
+   - Minor parameters, mechanisms, sub-steps, and narrow variants should NOT be standalone concepts; they should be absorbed into the comprehensive description of their parent concept (with narrow sub-topics preserved in <subtopics>).
+   - Do NOT penalize the extraction for omitting meta-labels ("Introduction", "Summary") or for chunk-boundary artifacts (e.g. cut-off section headers with no body text in the current chunk).
 
-2. SUBSTANTIVE FACTS TO AUDIT (ZERO FACT LOSS):
-   - Verify that all core facts, properties, identifiers, terms, numbers, operational conditions, rules, relationships, chronology, and attributions from the raw text are explicitly retained inside concept descriptions.
-   - Verify that specific names, definitions, or classifications are retained.
+2. VERBATIM FIDELITY & FACT LOSS:
+   - Check that as much as possible, the extraction captured the source text VERBATIM without generalizing away specific information.
+   - Flag as missing facts whenever specific names, direct quotes, attributions, technical parameters, arguments, or code/robotics details (identifiers, terminal commands, file paths, launch files, configs, formulas, and units) present in the text were omitted or excessively generalized into vague summaries.
+   - For prose explanations, verify that core assertions, mechanisms, and attributions are preserved.
 
 3. NOISE & NON-FACTS (SILENTLY IGNORE):
-   - Silently ignore HTML tags, web scraping artifacts, navigation menus, headers/footers, cookie notices, citations, and boilerplate. Do NOT penalize the extraction for omitting them, and do NOT flag them as missing facts or missing concepts.
+   - Silently ignore HTML tags, web scraping artifacts, navigation menus, headers/footers, cookie notices, pure bibliography/references metadata, and boilerplate. Do NOT penalize the extraction for omitting them.
 
 4. SCORING CRITERIA:
 - `coverage_score` (0.0 to 1.0):
-  - 1.0: Perfect retention. All main themes and key facts captured.
+  - 1.0: Perfect retention. All substantive themes, verbatim specifics, and key facts captured.
   - 0.8 - 0.9: Main themes captured; missed minor secondary details.
   - 0.5 - 0.7: Omitted a primary thematic concept or several key details.
   - < 0.5: Severe omissions of main body content.

@@ -64,7 +64,7 @@ def extract_paragraphs_for_doc(md_dir: Path, target_doc_id: str) -> List[Dict[st
         return extracted
 
     for md_file in sorted(md_dir.glob("*.md")):
-        if md_file.name in ("concept_index.md", "entity_index.md"):
+        if md_file.name in ("concept_index.md", "entity_index.md", "subtopic_index.md"):
             continue
         try:
             content = md_file.read_text(encoding="utf-8", errors="ignore")

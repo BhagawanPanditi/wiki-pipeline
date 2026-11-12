@@ -34,17 +34,17 @@ SYSTEM_PROMPT_BRIEF_ENTITIES = """\
 You are an expert knowledge agent.
 Your task is to analyze a comprehensive concept description and produce two vital outputs in ONE pass:
 1. A condensed BRIEF (1-3 sentences, ~25-60 words).
-2. A list of 5 to 12 IMPORTANT ENTITIES mentioned in the text.
+2. A comprehensive list of ALL KEY ENTITIES AND KEYWORDS mentioned in the text (with NO artificial upper limit).
 
 RULES FOR BRIEF:
 - 1-3 complete sentences, about 25-60 words. If the description is under ~60 words, write ONE accurate sentence; never pad or infer.
 - Keep exact numbers, metrics, and identifiers. Silently omit internal provenance IDs like [doc_...].
 - No noise: do not add conversational filler.
 
-RULES FOR ENTITIES (5-12):
-- Specific named things in the text: proper names, standard terms of art, identifiers, quantities with units, named methods, or rules.
-- Use the standard singular, unqualified surface form.
-- Exclude words so vague they would fit almost any concept in the corpus.
+RULES FOR ENTITIES & KEYWORDS (NO UPPER LIMIT):
+- Extract ALL specific named things, keywords, and terms of art in the text: proper names, organizations, scientific terms, identifiers, technical components, file names, quantities with units, named methods, algorithms, and rules.
+- Do not artificially cap the list at 5 or 12; extract every distinct, meaningful entity present.
+- Exclude words so vague they would fit almost any concept in the corpus (e.g., "System", "Data").
 - Each entity 1-4 words in Title Case.
 
 OUTPUT FORMAT:

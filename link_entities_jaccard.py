@@ -272,12 +272,15 @@ async def enrich_graph_via_jaccard(
         )
         c["outbound_relations"] = existing_relations
 
-    # 3. LLM Relation Description Synthesis
+    # 3. LLM Relation Description Synthesis (Only for Top Candidate Links rendered on Concept Markdown)
+    max_rendered_links = getattr(args, "max_primary_links", 60)
     pairs_to_synthesize: Dict[str, Dict[str, Any]] = {}
     for c in concepts:
         t1 = c["title"]
         b1 = c.get("brief", "") or get_concept_full_text(c)[:250]
-        for rel in c.get("outbound_relations", []):
+        # Only synthesize phrases for links within the concept's markdown rendering budget
+        outbound_to_consider = c.get("outbound_relations", [])[:max_rendered_links]
+        for rel in outbound_to_consider:
             t2 = rel.get("target_concept", "")
             if not t2 or t2.lower() == t1.lower() or t2 not in concept_by_title:
                 continue
@@ -428,6 +431,8 @@ def main():
                         help="Minimum Jaccard similarity score (|A∩B| / |A∪B|).")
     parser.add_argument("--max_hub_threshold", type=int, default=150,
                         help="Max concepts sharing an entity before treating it as an ultra-generic hub.")
+    parser.add_argument("--max_primary_links", type=int, default=60,
+                        help="Max links rendered per concept on wiki markdown pages (only synthesize for these).")
     parser.add_argument("--specific_entity_threshold", type=int, default=50,
                         help="Max concepts sharing an entity for 1 shared entity to trigger a link.")
     parser.add_argument("--skip_llm_descriptions", action="store_true",

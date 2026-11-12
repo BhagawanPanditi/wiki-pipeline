@@ -69,28 +69,22 @@ Identify any missing concepts or omitted factual details, and generate XML patch
 
 INPUT & NOISE CLEANING:
 - Silently ignore HTML tags, scraping artifacts, navigation menus, headers/footers, cookie notices, and boilerplate.
-- If the chunk contains no substantive informational content, output nothing.
+- Content inside code blocks, configuration blocks, commands, and tables is ALWAYS substantive content.
+- Do not penalize or extract dangling section headers that have no body text in this chunk.
 
 CONTEXT BOUNDARIES:
-- CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g. "this system", "they") or acronyms to standard canonical titles.
-- Never extract facts that appear exclusively in CONTEXT BEFORE or CONTEXT AFTER.
+- CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns or acronyms to canonical titles.
 - Never invent facts or add outside knowledge.
 
-TITLES AND ALIASES:
-- Title: 1-6 words, Title Case, the full standard name (expand acronyms), singular unless the standard name is plural. Use the canonical name any other document would use for the same subject, ensuring concepts merge cleanly across sources.
-- Aliases: Semicolon-separated list of acronyms, alternate designations, or specific minor sub-topics/parameters absorbed into this concept. If none, leave empty.
+TITLES, ALIASES & SUBTOPICS:
+- Title: 1-6 words, Title Case, the full standard canonical name.
+- Aliases: Semicolon-separated list of acronyms or alternate designations.
+- Subtopics: Semicolon-separated list of absorbed specific sub-steps, mechanisms, or parameters.
 
-WHAT IS A CONCEPT (UNIVERSAL DEFINITION):
-A concept is a canonical, self-contained, semantically coherent unit of knowledge that captures a meaningful subject or body of information, along with its relevant facts, properties, and relationships. It is independent of document boundaries, can be consolidated and enriched across multiple sources, and is not merely a keyword or arbitrary text chunk.
-- Scope: Concepts may represent any meaningful subject across domains (e.g., architectures, software libraries, algorithms, financial entities, scientific phenomena, operational procedures, policies, historical events, or core definitions).
-- Granularity & Standalone Subtopics: Any distinct subtopic or specialized theme that contains substantial information (typically 300 to 600+ words/tokens with its own details, properties, or comparisons) SHOULD be extracted as an independent <new_concept>.
-- Avoid Trivial Fragmentation: Do not create thin 1-2 sentence stub concepts for trivial sub-steps or isolated numbers; absorb those facts directly into the description of their primary subject (prefer <update_concept> over creating thin new concepts) and record specific names in <aliases>.
-- Do not extract meta-labels ("Introduction", "Chapter 1", "Overview") or whole-chunk summaries.
-
-COMPREHENSIVE INFORMATION RETENTION (ZERO FACT LOSS):
-- Capture all substantive information present in the chunk inside the appropriate concept descriptions (either updating an existing concept via <update_concept> or adding a missed concept via <new_concept>). Leave no meaningful informational content unabsorbed.
-- Descriptions must preserve exact concrete details rather than high-level generalizations: retain specific names, identifiers, terms, numbers, metrics, operational conditions, rules, relationships, chronology, and attributions.
-- All substantive information must be expressed in complete, grammatically sound sentences. Descriptions must be dense, self-contained paragraphs that explicitly name the subject and stand entirely on their own.
+VERBATIM FIDELITY & ZERO FACT LOSS:
+- As much as possible, descriptions must be taken VERBATIM from the source text. Do not summarize away or paraphrase specific information.
+- Whenever the source provides specific names, direct quotes, attributions, technical parameters, arguments, or code/robotics details (identifiers, terminal commands, file paths, launch files, configs, formulas, and units), preserve them exactly as stated in the text.
+- Do not replace concrete specifics with high-level generalizations.
 
 OUTPUT FORMAT:
 Output ONLY completed XML blocks with no introductory or concluding text.
@@ -99,14 +93,15 @@ Output brand-new concepts using <new_concept>...</new_concept> blocks:
 <new_concept>
 <title>Exact Canonical Title</title>
 <aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
-<description>A single comprehensive, fact-dense paragraph detailing what the concept is along with all substantive facts, properties, and specific details from this chunk.</description>
+<subtopics>Absorbed Subtopic 1; Absorbed Subtopic 2</subtopics>
+<description>Verbatim factual text, properties, code blocks, parameters, or prose describing this concept from this chunk.</description>
 </new_concept>
 
 Output factual updates to existing Pass 1 concepts using <update_concept>...</update_concept> blocks:
 <update_concept>
 <title>Exact Canonical Title of Existing Concept</title>
 <additional_aliases>New Alt Name 1; New Alt Name 2</additional_aliases>
-<additional_description>Dense factual sentences containing newly extracted facts or details to append to the existing description.</additional_description>
+<additional_description>Verbatim factual sentences or code blocks containing newly extracted facts or details to append to the existing description.</additional_description>
 </update_concept>
 
 If the existing extraction is already complete and no updates or new concepts are needed, output strictly:
@@ -142,7 +137,7 @@ def parse_xml_refinement(text: str) -> Pass2ExtractionSchema:
         aliases_m = re.search(r"<aliases>(.*?)</aliases>", block, re.DOTALL | re.IGNORECASE)
         if aliases_m:
             raw_aliases = aliases_m.group(1).strip()
-            aliases = [a.strip() for a in re.split(r"[;,]", raw_aliases) if a.strip()]
+            aliases = [a.strip() for a in raw_aliases.split(";") if a.strip()]
 
         new_concepts.append(Concept(title=title, aliases=aliases, description=description))
 
@@ -165,7 +160,7 @@ def parse_xml_refinement(text: str) -> Pass2ExtractionSchema:
         aliases_m = re.search(r"<(?:additional_aliases|aliases)>(.*?)</(?:additional_aliases|aliases)>", block, re.DOTALL | re.IGNORECASE)
         if aliases_m:
             raw_aliases = aliases_m.group(1).strip()
-            aliases = [a.strip() for a in re.split(r"[;,]", raw_aliases) if a.strip()]
+            aliases = [a.strip() for a in raw_aliases.split(";") if a.strip()]
 
         concept_updates.append(ConceptUpdate(
             title=title,

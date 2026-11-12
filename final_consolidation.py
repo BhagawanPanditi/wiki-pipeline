@@ -1074,13 +1074,14 @@ class FinalConsolidationPipeline:
         }
         atomic_write_json(self.islands_file, islands_summary)
 
-        # 7. Compile and Export Markdown Wiki, concept_index.md & entity_index.md (with Stale File Cleanup)
+        # 7. Compile and Export Markdown Wiki, concept_index.md, entity_index.md & subtopic_index.md
         print(f"Exporting Markdown Wiki to {self.md_dir}...")
         self.md_dir.mkdir(parents=True, exist_ok=True)
-        surviving_md_names: Set[str] = {"concept_index.md", "entity_index.md"}
+        surviving_md_names: Set[str] = {"concept_index.md", "entity_index.md", "subtopic_index.md"}
 
         concept_index_entries: List[Tuple[str, str, str]] = []
         entity_to_concepts: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
+        subtopic_to_concepts: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
 
         for c in tqdm(final_concepts, desc="Exporting Markdown Pages"):
             title = c["title"]
@@ -1099,13 +1100,15 @@ class FinalConsolidationPipeline:
             # Track for concept_index.md
             concept_index_entries.append((slug, title, brief))
 
-            # Track for entity_index.md (key entities, aliases, and subtopics)
+            # Track for entity_index.md (key entities, keywords, and aliases)
             for ent in entities:
                 entity_to_concepts[ent].add((slug, title))
             for al in aliases:
                 entity_to_concepts[al].add((slug, title))
+
+            # Track for subtopic_index.md
             for st in subtopics:
-                entity_to_concepts[st].add((slug, title))
+                subtopic_to_concepts[st].add((slug, title))
 
             md_content = [f"# {title}\n"]
             if aliases:
@@ -1181,6 +1184,17 @@ class FinalConsolidationPipeline:
             e_lines.append(f"- **{ent}**: {links_str}")
         e_lines.append("")
         atomic_write_text(self.md_dir / "entity_index.md", "\n".join(e_lines))
+
+        # 10. Export subtopic_index.md (mapping covered subtopics and mechanisms to concepts)
+        print("Generating subtopic_index.md...")
+        sorted_subtopics = sorted(subtopic_to_concepts.keys(), key=lambda x: x.lower())
+        s_lines = ["# Subtopic Index\n"]
+        for st in sorted_subtopics:
+            target_links = sorted(subtopic_to_concepts[st], key=lambda x: x[1].lower())
+            links_str = ", ".join([f"[[{slug}]]" for slug, _ in target_links])
+            s_lines.append(f"- **{st}**: {links_str}")
+        s_lines.append("")
+        atomic_write_text(self.md_dir / "subtopic_index.md", "\n".join(s_lines))
 
         # Remove any stale/pruned/merged Markdown files from `concepts_md/`
         removed_stale = 0

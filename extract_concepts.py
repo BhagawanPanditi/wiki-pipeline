@@ -54,18 +54,19 @@ INPUT & NOISE CLEANING:
 - Ignore page chrome, navigation menus, headers/footers, cookie notices, and boilerplate.
 - Content inside code blocks, configuration blocks, commands, and tables is ALWAYS substantive content and must never be ignored or discarded.
 
-FACTUAL RETENTION & VERBATIM DETAIL:
-- Retain exact identifiers, command lines, code snippets, file paths, configurations, metrics, and parameters verbatim.
-- Do NOT aggressively summarize or paraphrase away specific technical details.
+VERBATIM FIDELITY & ZERO FACT LOSS:
+- As much as possible, descriptions should be taken VERBATIM from the source text. Do not summarize away or paraphrase specific information.
+- Whenever the source provides specific names, direct quotes, attributions, technical parameters, arguments, or code/robotics details (e.g. identifiers, terminal commands, file paths, launch files, configs, mathematical formulas, and units), preserve them exactly as stated in the text.
+- Do not replace concrete specifics with high-level generalizations.
 
 CONTEXT BOUNDARIES:
 - CURRENT CHUNK is your source for facts. Use CONTEXT BEFORE / CONTEXT AFTER ONLY to resolve pronouns (e.g. "this system", "they") or acronyms to standard canonical titles.
 - Never invent facts or add outside knowledge.
 
-TITLES AND ALIASES:
-- Title: 1-6 words, Title Case, the full standard name, singular unless the standard name is plural.
+TITLES, ALIASES & SUBTOPICS:
+- Title: 1-6 words, Title Case, the full standard canonical name, singular unless standard name is plural.
 - Aliases: Semicolon-separated list of acronyms or alternate designations. If none, leave empty.
-- Subtopics: Semicolon-separated list of absorbed specific sub-steps, variants, or parameters.
+- Subtopics: Semicolon-separated list of all specific covered sub-topics, variants, mechanisms, or parameters absorbed into this concept.
 
 EMPTY CASE:
 If the CURRENT CHUNK has no substantive informational content, output exactly: <no_concepts/>
@@ -76,7 +77,7 @@ Output ONLY completed <concept>...</concept> XML blocks with no introductory or 
 <title>Exact Canonical Title</title>
 <aliases>Acronym or Alt Name 1; Alt Name 2</aliases>
 <subtopics>Absorbed Subtopic 1; Absorbed Subtopic 2</subtopics>
-<description>Comprehensive factual details, properties, code blocks, parameters, or prose describing this concept from this chunk.</description>
+<description>Verbatim factual text, properties, code blocks, parameters, or prose describing this concept from this chunk.</description>
 </concept>
 
 If no substantive concepts exist in the chunk, output exactly: <no_concepts/>
