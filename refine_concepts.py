@@ -334,7 +334,7 @@ If the existing extraction is already factually complete, output strictly <no_ch
             args=self.args,
             cfg=self.cfg,
             task="generate",
-            max_growth=1,
+            max_growth=2,
             max_model_len=max_model_len,
         )
         return parse_xml_refinement(raw_text)
