@@ -296,10 +296,14 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
                 task="generate",
                 max_growth=1,
             )
-        except BadRequestError as exc:
-            if not is_context_overflow(exc):
-                raise
-            return await self.decompose_oversized(client, item, paras)
+        except Exception as exc:
+            from utils.llm_params import OutputTruncated
+            is_trunc = isinstance(exc, OutputTruncated) or "finish_reason='length'" in str(exc) or "OutputTruncated" in type(exc).__name__
+            is_overflow = isinstance(exc, BadRequestError) and is_context_overflow(exc)
+            if is_trunc or is_overflow:
+                print(f"[FALLBACK ROUTE] '{title}' hit token limits in single-shot ({exc}). Routing to map-reduce...")
+                return await self.decompose_oversized(client, item, paras)
+            raise
 
         default_src = paras[0].get("source_chunk") or paras[0].get("doc_id", "unknown") if paras else "unknown"
         res = parse_xml_decomposition(raw_text, default_source_chunk=default_src)
