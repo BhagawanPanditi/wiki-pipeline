@@ -16,8 +16,12 @@ def print_concept_word_distribution(concepts: List[Dict[str, Any]], title_label:
 
     word_counts = []
     for c in concepts:
-        desc = c.get("description", "")
-        word_counts.append(len(desc.split()))
+        # Check paragraphs first, then description
+        if "paragraphs" in c and c["paragraphs"]:
+            text = " ".join(p.get("text", "") for p in c["paragraphs"] if isinstance(p, dict))
+        else:
+            text = c.get("description", "")
+        word_counts.append(len(text.split()))
 
     word_counts.sort()
     total = len(word_counts)
