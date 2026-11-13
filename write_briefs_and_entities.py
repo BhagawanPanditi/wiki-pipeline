@@ -296,6 +296,7 @@ class BriefAndEntitiesPipeline:
         print(f"Total concepts: {total} | Pending brief & entity extraction: {len(pending)}")
         settings = self.settings
 
+        res = None
         try:
             if pending:
                 print(f"Distributing across {len(settings.servers)} server(s).")
@@ -316,7 +317,7 @@ class BriefAndEntitiesPipeline:
                     res.raise_if_failed(STAGE)
         finally:
             save_log_sync(self.log_file, self.checkpoint)
-            if not res or res.failed_count == 0:
+            if res is None or res.failed_count == 0:
                 self.assemble_and_save(concepts)
 
         print("\n============================================================")
