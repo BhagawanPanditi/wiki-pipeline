@@ -47,7 +47,7 @@ STAGE = "decompose-concepts"
 
 SYSTEM_PROMPT_DECOMPOSE = """\
 You are an expert scientific encyclopedist and knowledge graph architect.
-You are given a LARGE, COMPOSITE CONCEPT (>600 words) from a technical knowledge wiki, along with its absorbed subtopics and its source text broken down by document ID.
+You are given a LARGE, COMPOSITE CONCEPT (>600 words) from a technical knowledge wiki, along with its absorbed subtopics and its source text broken down by source chunk.
 
 YOUR TASK:
 Decompose this broad topic into more digestible, focused concepts:
@@ -55,9 +55,9 @@ Decompose this broad topic into more digestible, focused concepts:
 2. <child>: 2 to 4 discrete CHILD concepts (each 150 to 350 words) covering distinct subtopics, components, or operational phases.
 
 CRITICAL RULES:
-- 100% FACT & PROVENANCE PRESERVATION: Do NOT lose any specific numbers, metrics, or factual statements. Every source document present in the input must retain its factual contributions across either the pillar or one of the child concepts.
-- PRESERVE SOURCE DOC IDs: You MUST attribute each paragraph to its originating doc_id using <paragraph doc_id="doc_XXXXX">...</paragraph>. Never attribute facts from one document to another. If a child concept covers information discussed in a specific document, wrap that text inside a <paragraph doc_id="..."> block matching that document's ID.
-- NO INLINE CITATIONS IN PROSE: Do NOT write bracketed citations like [doc_00251] in the prose. The provenance is captured strictly by the doc_id attribute on <paragraph>.
+- 100% FACT & PROVENANCE PRESERVATION: Do NOT lose any specific numbers, metrics, or factual statements. Every source chunk present in the input must retain its factual contributions across either the pillar or one of the child concepts.
+- PRESERVE SOURCE CHUNKS: You MUST attribute each paragraph to its originating source chunk using <paragraph source_chunk="doc_XXXXX_chunk_YYY">...</paragraph>. Never attribute facts from one chunk to another.
+- NO INLINE CITATIONS IN PROSE: Do NOT write bracketed citations like [doc_00251] in the prose. The provenance is captured strictly by the source_chunk attribute on <paragraph>.
 - TITLES: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Workstation Ergonomics and Lighting", NOT just "Ergonomics").
 - NO NOISE: Output no introductory text, commentary, or markdown formatting outside the XML tags.
 - IF NOT DECOMPOSABLE: If the concept cannot be cleanly divided without severe redundancy, output exactly: <cannot_decompose/>
@@ -65,19 +65,19 @@ CRITICAL RULES:
 OUTPUT FORMAT:
 <decomposition>
 <pillar>
-<paragraph doc_id="doc_XXXXX">
+<paragraph source_chunk="doc_XXXXX_chunk_YYY">
 Overview description paragraph...
 </paragraph>
 </pillar>
 <child>
 <title>Specific Child Concept Title A</title>
-<paragraph doc_id="doc_XXXXX">
+<paragraph source_chunk="doc_XXXXX_chunk_YYY">
 Detailed factual paragraph focusing strictly on this subtopic...
 </paragraph>
 </child>
 <child>
 <title>Specific Child Concept Title B</title>
-<paragraph doc_id="doc_XXXXX">
+<paragraph source_chunk="doc_XXXXX_chunk_YYY">
 Detailed factual paragraph focusing strictly on this subtopic...
 </paragraph>
 </child>
@@ -94,21 +94,22 @@ class DecompositionResult(BaseModel):
     children: List[DecomposedChild] = Field(default_factory=list)
 
 
-def parse_xml_decomposition(text: str, default_doc_id: str = "unknown") -> DecompositionResult:
+def parse_xml_decomposition(text: str, default_source_chunk: str = "unknown") -> DecompositionResult:
     if not text or "<cannot_decompose" in text.lower():
         return DecompositionResult(decomposed=False)
 
     def extract_paragraphs(xml_block: str) -> List[Dict[str, str]]:
         paras: List[Dict[str, str]] = []
-        p_matches = re.findall(r'<paragraph(?:\s+doc_id="([^"]+)")?>(.*?)</paragraph>', xml_block, re.DOTALL | re.IGNORECASE)
-        for doc_attr, p_text in p_matches:
-            did = doc_attr.strip() if doc_attr else default_doc_id
+        p_matches = re.findall(r'<paragraph(?:\s+(?:source_chunk|doc_id)="([^"]+)")?>(.*?)</paragraph>', xml_block, re.DOTALL | re.IGNORECASE)
+        for chunk_attr, p_text in p_matches:
+            src = chunk_attr.strip().replace("::", "_") if chunk_attr else default_source_chunk
+            did = src.split("_chunk_")[0] if "_chunk_" in src else src
             clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", p_text).strip()
             clean_t = re.sub(r"\.\s*\.", ".", clean_t)
             clean_t = re.sub(r"\s+([.,;:!?])", r"\1", clean_t)
             clean_t = " ".join(clean_t.split())
             if clean_t:
-                paras.append({"doc_id": did, "text": clean_t})
+                paras.append({"source_chunk": src, "doc_id": did, "text": clean_t})
         if not paras:
             # Fallback if model used <description>...</description>
             desc_m = re.search(r"<description>(.*?)</description>", xml_block, re.DOTALL | re.IGNORECASE)
@@ -118,7 +119,8 @@ def parse_xml_decomposition(text: str, default_doc_id: str = "unknown") -> Decom
             clean_t = re.sub(r"\s+([.,;:!?])", r"\1", clean_t)
             clean_t = " ".join(clean_t.split())
             if clean_t:
-                paras.append({"doc_id": default_doc_id, "text": clean_t})
+                did = default_source_chunk.split("_chunk_")[0] if "_chunk_" in default_source_chunk else default_source_chunk
+                paras.append({"source_chunk": default_source_chunk, "doc_id": did, "text": clean_t})
         return paras
 
     pillar_m = re.search(r"<pillar>(.*?)</pillar>", text, re.DOTALL | re.IGNORECASE)
@@ -198,9 +200,9 @@ class ConceptDecompositionPipeline(OversizedDecomposerMixin):
 
         doc_blocks = []
         for p in paras:
-            did = p.get("doc_id", "unknown")
+            src = (p.get("source_chunk") or p.get("doc_id", "unknown")).replace("::", "_")
             ptxt = p.get("text", "").strip()
-            doc_blocks.append(f"DOCUMENT ID: {did}\nTEXT:\n{ptxt}\n")
+            doc_blocks.append(f"SOURCE CHUNK: {src}\nTEXT:\n{ptxt}\n")
         source_presentation = "\n".join(doc_blocks)
 
         prompt = f"""\
@@ -208,7 +210,7 @@ COMPOSITE CONCEPT TITLE: "{title}"
 CURRENT LENGTH: {words} words
 ABSORBED SUBTOPICS: {subtopics}
 
-SOURCE PARAGRAPHS BY DOCUMENT ID:
+SOURCE PARAGRAPHS BY SOURCE CHUNK:
 {source_presentation}
 """
         max_out = self.single_shot_max_out()
@@ -230,8 +232,8 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
                 raise
             return await self.decompose_oversized(client, item, paras)
 
-        default_doc = paras[0].get("doc_id", "unknown") if paras else "unknown"
-        res = parse_xml_decomposition(raw_text, default_doc_id=default_doc)
+        default_src = paras[0].get("source_chunk") or paras[0].get("doc_id", "unknown") if paras else "unknown"
+        res = parse_xml_decomposition(raw_text, default_source_chunk=default_src)
         return {
             "title": title,
             "decomposed": res.decomposed,
@@ -318,15 +320,16 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
                 for ch in decomp_data.get("children", []):
                     all_child_paras.extend(ch.get("paragraphs", []))
 
-                surviving_docs = {p.get("doc_id") for p in pillar_paras + all_child_paras if p.get("doc_id")}
-                # If any original doc_id was omitted by LLM in decomposition, retain FULL evidence in the pillar
+                surviving_chunks = {p.get("source_chunk") or p.get("doc_id") for p in pillar_paras + all_child_paras if p.get("source_chunk") or p.get("doc_id")}
+                # If any original chunk was omitted by LLM in decomposition, retain FULL evidence in the pillar
                 for orig_p in orig_paras:
-                    did = orig_p.get("doc_id")
-                    if did and did != "unknown" and did not in surviving_docs:
-                        print(f"[PROVENANCE RESCUE] Rescued omitted doc '{did}' back into pillar '{t}'.")
+                    src = orig_p.get("source_chunk") or orig_p.get("doc_id")
+                    if src and src != "unknown" and src not in surviving_chunks:
+                        print(f"[PROVENANCE RESCUE] Rescued omitted chunk '{src}' back into pillar '{t}'.")
                         rescue_text = (orig_p.get("text") or "").strip()
-                        pillar_paras.append({"doc_id": did, "text": rescue_text})
-                        surviving_docs.add(did)
+                        did = src.split("_chunk_")[0] if "_chunk_" in src else src
+                        pillar_paras.append({"source_chunk": src, "doc_id": did, "text": rescue_text})
+                        surviving_chunks.add(src)
 
                 # Retain all pillar paragraphs without destructive truncation
                 c["paragraphs"] = pillar_paras
