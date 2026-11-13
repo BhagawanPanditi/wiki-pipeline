@@ -24,7 +24,7 @@ import networkx as nx
 from tqdm import tqdm
 
 from utils.atomic_io import atomic_write_json, sanitize_filename
-from utils.checkpoint import load_json_log, save_log_sync
+from utils.checkpoint import load_json_log, save_log_async, save_log_sync
 from utils.cli import build_parser, resolve_settings
 from utils.concept_ops import get_concept_full_text
 from utils.lemma import normalize_head_noun
