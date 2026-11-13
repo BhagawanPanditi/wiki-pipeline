@@ -56,9 +56,11 @@ Output your detailed analysis followed strictly by a JSON block:
 
 
 def extract_paragraphs_for_doc(md_dir: Path, target_doc_id: str) -> List[Dict[str, str]]:
-    """Scan all markdown concept files and return all paragraphs citing target_doc_id."""
+    """Scan all markdown concept files and return all paragraphs citing target_doc_id.
+    Matches citations in formats: [doc_XXXXX], [doc_XXXXX_chunk_YYY], [doc_XXXXX::chunk_YYY].
+    """
     extracted = []
-    doc_pattern = re.compile(rf"\[\s*{re.escape(target_doc_id)}(?:::[^\]]+)?\s*\]", re.IGNORECASE)
+    doc_pattern = re.compile(rf"\[\s*{re.escape(target_doc_id)}(?:(?:_|::)[^\]]+)?\s*\]", re.IGNORECASE)
 
     if not md_dir.is_dir():
         return extracted
