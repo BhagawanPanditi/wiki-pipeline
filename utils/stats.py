@@ -9,44 +9,58 @@ from typing import Any, Dict, List
 
 
 def print_concept_word_distribution(concepts: List[Dict[str, Any]], title_label: str = "GLOBAL CONCEPTS") -> None:
-    """Compute and print word count distribution statistics for concept descriptions."""
+    """Compute and print clean ASCII histogram word-count distribution statistics."""
     if not concepts:
-        print(f"\n--- {title_label} WORD COUNT DISTRIBUTION --- (0 concepts)")
+        print(f"\n============================================================")
+        print(f"WORD-COUNT DISTRIBUTION [{title_label}] (0 concepts)")
+        print(f"============================================================\n")
         return
 
     word_counts = []
     for c in concepts:
-        # Check paragraphs first, then description
         if "paragraphs" in c and c["paragraphs"]:
             text = " ".join(p.get("text", "") for p in c["paragraphs"] if isinstance(p, dict))
         else:
             text = c.get("description", "")
         word_counts.append(len(text.split()))
 
-    word_counts.sort()
+    bins = [
+        ("0 - 10 words", lambda w: w <= 10),
+        ("11 - 20 words", lambda w: 11 <= w <= 20),
+        ("21 - 30 words", lambda w: 21 <= w <= 30),
+        ("31 - 50 words", lambda w: 31 <= w <= 50),
+        ("51 - 100 words", lambda w: 51 <= w <= 100),
+        ("101 - 200 words", lambda w: 101 <= w <= 200),
+        ("201 - 350 words", lambda w: 201 <= w <= 350),
+        ("351 - 500 words", lambda w: 351 <= w <= 500),
+        ("501 - 750 words", lambda w: 501 <= w <= 750),
+        ("751 - 1000 words", lambda w: 751 <= w <= 1000),
+        ("1001+ words", lambda w: w > 1000),
+    ]
+
+    bin_counts = {label: 0 for label, _ in bins}
+    for count in word_counts:
+        for label, fn in bins:
+            if fn(count):
+                bin_counts[label] += 1
+                break
+
     total = len(word_counts)
-    mean_wc = sum(word_counts) / total
-    median_wc = word_counts[total // 2]
-    min_wc = word_counts[0]
-    max_wc = word_counts[-1]
-    p10 = word_counts[int(total * 0.10)]
-    p25 = word_counts[int(total * 0.25)]
-    p75 = word_counts[int(total * 0.75)]
-    p90 = word_counts[int(total * 0.90)]
+    avg_words = sum(word_counts) / total if total else 0
+    thin_30 = sum(1 for w in word_counts if w <= 30)
 
-    under_60 = sum(1 for w in word_counts if w < 60)
-    under_100 = sum(1 for w in word_counts if w < 100)
-    over_900 = sum(1 for w in word_counts if w > 900)
-
-    print(f"\n{'='*70}")
-    print(f"📊 {title_label} WORD COUNT DISTRIBUTION (N={total})")
-    print(f"{'='*70}")
-    print(f"  Min: {min_wc:<5} | P10: {p10:<5} | P25: {p25:<5} | Median: {median_wc:<5} | Mean: {mean_wc:.1f}")
-    print(f"  P75: {p75:<5} | P90: {p90:<5} | Max: {max_wc:<5}")
-    print(f"  Thin (<60 words):  {under_60} ({under_60/total*100:.1f}%)")
-    print(f"  Brief (<100 words): {under_100} ({under_100/total*100:.1f}%)")
-    print(f"  Large (>900 words): {over_900} ({over_900/total*100:.1f}%)")
-    print(f"{'='*70}\n")
+    print("\n============================================================")
+    print(f"WORD-COUNT DISTRIBUTION [{title_label}] (Total Concepts: {total})")
+    print(f"Average Words per Concept: {avg_words:.1f} | Thin Concepts (<= 30 words): {thin_30} ({thin_30 / total * 100:.1f}%)")
+    print("------------------------------------------------------------")
+    print(f"{'Word Count Range':<20} {'Count':<10} {'Percentage':<12}")
+    print("------------------------------------------------------------")
+    for label, _ in bins:
+        count = bin_counts[label]
+        pct = (count / total * 100) if total else 0.0
+        bar = "█" * int(pct / 4)
+        print(f"{label:<20} {count:<10} {pct:>5.1f}%   {bar}")
+    print("============================================================\n")
 
 
 def print_link_distribution(concepts: List[Dict[str, Any]], title_label: str = "RELATED LINKS") -> None:
