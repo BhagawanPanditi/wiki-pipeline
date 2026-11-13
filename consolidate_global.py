@@ -366,6 +366,7 @@ def global_consolidate(domain_dir: Path, args: Any):
             "aliases": final_aliases,
             "subtopics": final_subtopics,
             "paragraphs": fused_paragraphs,
+            "source_chunks": sorted(list(global_source_chunks)),
         })
 
     # Save summary and global concepts
