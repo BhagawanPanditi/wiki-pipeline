@@ -145,31 +145,6 @@ def parse_xml_decomposition(text: str, default_doc_id: str = "unknown") -> Decom
 
     return DecompositionResult(decomposed=True, pillar_paragraphs=pillar_paras, children=children)
 
-def clamp_concept_paragraphs(paragraphs: List[Dict[str, Any]], max_tokens: int = 600) -> List[Dict[str, Any]]:
-    """Strictly enforce that a concept's combined text does not exceed max_tokens (progressive disclosure)."""
-    if not paragraphs:
-        return []
-    total = sum(count_tokens(p.get("text", "")) for p in paragraphs)
-    if total <= max_tokens:
-        return paragraphs
-
-    clamped = []
-    budget_left = max_tokens
-    for p in paragraphs:
-        ptxt = (p.get("text") or "").strip()
-        t_count = count_tokens(ptxt)
-        if t_count <= budget_left:
-            clamped.append(p)
-            budget_left -= t_count
-        else:
-            # Word-level truncation to fit remaining budget
-            words = ptxt.split()
-            allowed_words = max(20, int(budget_left / 1.3))
-            if allowed_words > 0 and words:
-                truncated_text = " ".join(words[:allowed_words]) + " …"
-                clamped.append({"doc_id": p.get("doc_id", "unknown"), "text": truncated_text})
-            break
-    return clamped
 
 class ConceptDecompositionPipeline(OversizedDecomposerMixin):
     def __init__(self, args):
@@ -420,10 +395,20 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
 
         # Save back to global_concepts.json and refresh concepts/
         atomic_write_json(self.global_concepts_file, {"concepts": final_concepts})
+        surviving_slugs = set()
         for fc in final_concepts:
             s = fc.get("slug")
             if s:
+                surviving_slugs.add(f"{s}.json")
                 atomic_write_json(self.concepts_dir / f"{s}.json", fc)
+
+        # Clean stale concept JSON files from earlier runs
+        for old_f in self.concepts_dir.glob("*.json"):
+            if old_f.name not in surviving_slugs:
+                try:
+                    old_f.unlink()
+                except OSError:
+                    pass
 
         print_concept_word_distribution(final_concepts, title_label="STAGE 6b: AFTER SUBTOPIC DECOMPOSITION")
 
