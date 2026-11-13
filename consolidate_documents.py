@@ -10,6 +10,7 @@ Usage:
 
 
 import asyncio
+from collections import defaultdict
 import hashlib
 import json
 import re
