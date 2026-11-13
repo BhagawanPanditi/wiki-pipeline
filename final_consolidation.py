@@ -1051,6 +1051,20 @@ class FinalConsolidationPipeline:
         # 5b. Score Ranking + Reciprocal Rescue Backlinks
         primary_cap = getattr(self.args, "max_primary_links", 60)
         rescue_slots = getattr(self.args, "rescue_slots", 2)
+
+        # Filter out superficial acronym collision and weak co-occurrence relations before ranking
+        weak_relation_pattern = re.compile(
+            r"(?:shares\s+(?:the\s+)?(?:acronym|abbreviation|name|term)\b|co-occurs\s+with\b)",
+            re.IGNORECASE,
+        )
+        for c in final_concepts:
+            filtered_out = []
+            for r in c.get("outbound_relations", []):
+                rel_text = r.get("relation", "").strip()
+                if not weak_relation_pattern.search(rel_text):
+                    filtered_out.append(r)
+            c["outbound_relations"] = filtered_out
+
         directed_link_stats = self._rank_links_and_inject_rescue_backlinks(
             final_concepts,
             primary_cap=primary_cap,
