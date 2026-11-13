@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from utils.atomic_io import atomic_write_json, sanitize_filename
 from utils.checkpoint import load_bool_log, save_log_sync
 from utils.cli import build_parser, resolve_settings
-from utils.concept_ops import get_concept_full_text
+from utils.concept_ops import generate_stable_slug, get_concept_full_text
 from utils.errors import StageBudget
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
@@ -227,21 +227,44 @@ class BriefAndEntitiesPipeline:
         assembled_concepts = []
         missing_briefs = []
 
+        # Build slug and title indexes for existing files in concepts/
+        disk_files_by_title: Dict[str, Dict[str, Any]] = {}
+        for c_file in self.concepts_dir.glob("*.json"):
+            try:
+                with open(c_file, "r", encoding="utf-8") as cf:
+                    disk_data = json.load(cf)
+                    t = disk_data.get("title")
+                    if t and disk_data.get("brief"):
+                        disk_files_by_title[t.strip().casefold()] = disk_data
+            except Exception:
+                pass
+
         for c in concepts:
+            t_key = c.get("title", "").strip().casefold()
             slug = c.get("slug")
             if not slug:
-                slug = sanitize_filename(c.get("title", "")) or "unnamed_concept"
+                slug = generate_stable_slug(c.get("title", ""))
+                c["slug"] = slug
+
             c_file = self.concepts_dir / f"{slug}.json"
+            disk_data = None
             if c_file.exists():
                 try:
                     with open(c_file, "r", encoding="utf-8") as cf:
                         disk_data = json.load(cf)
-                        if disk_data.get("brief"):
-                            c["brief"] = disk_data["brief"]
-                        if disk_data.get("entities"):
-                            c["entities"] = disk_data["entities"]
                 except Exception:
                     pass
+
+            if not disk_data and t_key in disk_files_by_title:
+                disk_data = disk_files_by_title[t_key]
+
+            if disk_data:
+                if disk_data.get("brief"):
+                    c["brief"] = disk_data["brief"]
+                if disk_data.get("entities"):
+                    c["entities"] = disk_data["entities"]
+                # Ensure the disk file is saved under the canonical slug
+                atomic_write_json(c_file, c)
 
             if not c.get("brief"):
                 missing_briefs.append(c.get("title", slug))
