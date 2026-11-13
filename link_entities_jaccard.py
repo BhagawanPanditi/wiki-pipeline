@@ -13,6 +13,7 @@ Usage:
 
 import asyncio
 import json
+import resource
 import re
 import math
 from collections import defaultdict
@@ -329,8 +330,8 @@ async def enrich_graph_via_jaccard(
                 async with log_lock:
                     checkpoint[pk] = res
                     flush_counter += 1
-                    if flush_counter >= 20:
-                        save_log_sync(log_file, checkpoint)
+                    if flush_counter >= 100:
+                        await save_log_async(log_file, checkpoint)
                         flush_counter = 0
 
             async def generate_relation(client: Any, item: Dict[str, Any], server_index: int) -> str:
@@ -444,6 +445,15 @@ def main():
     wiki_path = getattr(args, "wiki_path", None)
     if not wiki_path:
         raise ValueError("Missing required --wiki_path argument.")
+
+    # Raise open file descriptor limits for high-concurrency async operations
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(65536, hard) if hard > 0 else 65536
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        pass
 
     asyncio.run(enrich_graph_via_jaccard(
         args=args,
