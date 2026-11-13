@@ -116,7 +116,7 @@ async def call_llm(
                 continue
             # If the model produced completed concepts or verification before length limit, salvage them
             content = getattr(ch.message, "content", "") or ""
-            if "</concept>" in content or "<no_concepts" in content or "</verification>" in content:
+            if "</concept>" in content or "<no_concepts" in content or "</verification>" in content or "</entities>" in content:
                 return final_answer(content)
             raise OutputTruncated(
                 f"Hit max_tokens={limit} (finish_reason='length', prompt={prompt_tokens}); exhausted {max_growth} doubling attempts."

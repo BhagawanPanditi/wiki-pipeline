@@ -179,7 +179,7 @@ class BriefAndEntitiesPipeline:
             args=self.args,
             cfg=getattr(self, "cfg", None),
             task="generate",
-            max_growth=0,
+            max_growth=2,
             max_model_len=max_model_len,
         )
         try:
