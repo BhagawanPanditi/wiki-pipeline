@@ -287,10 +287,10 @@ class BriefAndEntitiesPipeline:
             concepts = data.get("concepts", [])
 
         total = len(concepts)
-        # An item is pending only if it's missing from checkpoint OR missing its brief on disk
+        # An item is pending if it has no brief in checkpoint and no brief on disk
         pending = [
             c for c in concepts 
-            if not (self.checkpoint.get(c.get("title", ""), False) and self._has_disk_enrichment(c))
+            if not (self.checkpoint.get(c.get("title", ""), False) or self._has_disk_enrichment(c))
         ]
 
         print(f"Total concepts: {total} | Pending brief & entity extraction: {len(pending)}")
