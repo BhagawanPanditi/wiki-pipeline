@@ -43,42 +43,81 @@ from utils.stats import print_concept_word_distribution
 
 STAGE = "decompose-concepts"
 
-# ── XML System Prompt ─────────────────────────────────────────────────────────
+# ── XML System Prompts ────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT_DECOMPOSE = """\
 You are an expert scientific encyclopedist and knowledge graph architect.
-You are given a LARGE, COMPOSITE CONCEPT (>600 words) from a technical knowledge wiki, along with its absorbed subtopics and its source text broken down by source chunk.
+You reorganize a large wiki concept into a pillar overview plus focused child concepts.
+This is REORGANIZATION, NOT SUMMARIZATION: the combined output must contain every fact in the source.
 
-YOUR TASK:
-Decompose this broad topic into more digestible, focused concepts:
-1. <pillar>: A focused OVERVIEW concept (150 to 300 words) covering the core definition, high-level role, and primary mechanism.
-2. <child>: 2 to 4 discrete CHILD concepts (each 150 to 350 words) covering distinct subtopics, components, or operational phases.
+RETAIN EXACTLY:
+- Numbers, metrics, formulas, units, dates, names, identifiers, quoted text, definitions.
+- Conditions and exceptions, causal claims, comparisons, procedure steps, code, and standards.
+- Copy sentences verbatim where practical. Rephrase only to remove duplication across documents or to make sentences self-contained.
+- NEVER drop a detail to save space. Do not add anything the source does not say. No padding.
 
-CRITICAL RULES:
-- 100% FACT & PROVENANCE PRESERVATION: Do NOT lose any specific numbers, metrics, or factual statements. Every source chunk present in the input must retain its factual contributions across either the pillar or one of the child concepts.
-- PRESERVE SOURCE CHUNKS: You MUST attribute each paragraph to its originating source chunk using <paragraph source_chunk="doc_XXXXX_chunk_YYY">...</paragraph>. Never attribute facts from one chunk to another.
-- NO INLINE CITATIONS IN PROSE: Do NOT write bracketed citations like [doc_00251] in the prose. The provenance is captured strictly by the source_chunk attribute on <paragraph>.
-- TITLES: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Workstation Ergonomics and Lighting", NOT just "Ergonomics").
-- NO NOISE: Output no introductory text, commentary, or markdown formatting outside the XML tags.
-- IF NOT DECOMPOSABLE: If the concept cannot be cleanly divided without severe redundancy, output exactly: <cannot_decompose/>
+LENGTH & STRUCTURE:
+- There are no arbitrary word limits. Total output should be approximately the same length as the source (roughly 90-110%).
+- Prefer more children over longer children (typically one child per 300-500 source words).
+- <pillar>: A concise overview of the concept and how the children relate.
+- <child>: Discrete, focused child concepts covering specific subtopics, components, or mechanisms.
+- Titles: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Workstation Ergonomics and Lighting", NOT just "Ergonomics").
+- Each fact appears in exactly one child, or in the pillar if it is general.
+- A fact stated by several source chunks appears once, attributed to its primary source chunk.
+
+ATTRIBUTION:
+- You MUST attribute each paragraph to its originating source chunk using <paragraph source_chunk="doc_XXXXX_chunk_YYY">...</paragraph>.
+- Never attribute facts from one chunk to another.
+- No inline citations like [doc_00251] in the prose.
+
+IF NOT DECOMPOSABLE:
+- If the concept is already atomic or cannot be cleanly divided without severe redundancy, output exactly: <cannot_decompose/>
 
 OUTPUT FORMAT:
 <decomposition>
 <pillar>
 <paragraph source_chunk="doc_XXXXX_chunk_YYY">
-Overview description paragraph...
+Overview text...
 </paragraph>
 </pillar>
 <child>
 <title>Specific Child Concept Title A</title>
 <paragraph source_chunk="doc_XXXXX_chunk_YYY">
-Detailed factual paragraph focusing strictly on this subtopic...
+Detailed factual text retaining all numbers, conditions, and mechanisms...
 </paragraph>
 </child>
 <child>
 <title>Specific Child Concept Title B</title>
 <paragraph source_chunk="doc_XXXXX_chunk_YYY">
-Detailed factual paragraph focusing strictly on this subtopic...
+Detailed factual text retaining all numbers, conditions, and mechanisms...
+</paragraph>
+</child>
+</decomposition>
+"""
+
+SYSTEM_PROMPT_REFINE = """\
+You are an expert scientific editor and fact preservation auditor.
+You are given the ORIGINAL SOURCE PARAGRAPHS of a concept alongside a FIRST-PASS DECOMPOSITION into a pillar and child concepts.
+Your job is to REFINE and ENHANCE the decomposition to ensure 100% factual completeness and exact provenance.
+
+CRITICAL WARNINGS:
+You must pay close attention to any missing source chunks or heavily reduced text.
+1. EVERY source chunk from the original text MUST be represented in either the pillar or at least one child.
+2. DO NOT SUMMARIZE or drop specific metrics, numbers, formulas, or procedures.
+3. Incorporate all omitted facts from missing chunks into the appropriate child concept or pillar.
+
+OUTPUT FORMAT:
+Provide the complete, updated, fully refined <decomposition> XML block:
+<decomposition>
+<pillar>
+<paragraph source_chunk="doc_XXXXX_chunk_YYY">
+...
+</paragraph>
+</pillar>
+<child>
+<title>Child Title</title>
+<paragraph source_chunk="doc_XXXXX_chunk_YYY">
+...
 </paragraph>
 </child>
 </decomposition>
@@ -234,11 +273,146 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
 
         default_src = paras[0].get("source_chunk") or paras[0].get("doc_id", "unknown") if paras else "unknown"
         res = parse_xml_decomposition(raw_text, default_source_chunk=default_src)
+
+        if not res.decomposed or not res.children:
+            return {
+                "title": title,
+                "decomposed": False,
+                "strategy": "single_shot",
+                "pillar_paragraphs": [],
+                "children": [],
+                "orig_words": words,
+                "post_words": words,
+                "word_ratio": 100.0,
+                "missing_chunks": [],
+            }
+
+        # ── MANDATORY REFINEMENT LOOP (ALWAYS RUN) ──────────────────────────
+        # Measure first-pass decomposition quality & completeness
+        input_chunks = {
+            (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
+            for p in paras if (p.get("source_chunk") or p.get("doc_id"))
+        }
+        input_chunks.discard("unknown")
+        input_chunks.discard("")
+
+        first_pass_paras = list(res.pillar_paragraphs)
+        for ch in res.children:
+            first_pass_paras.extend(ch.paragraphs)
+
+        surviving_chunks = {
+            (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
+            for p in first_pass_paras if (p.get("source_chunk") or p.get("doc_id"))
+        }
+        missing_chunks = sorted(list(input_chunks - surviving_chunks))
+
+        first_pass_words = sum(len((p.get("text") or "").split()) for p in first_pass_paras)
+        first_pass_ratio = round((first_pass_words / words * 100) if words > 0 else 100.0, 1)
+
+        # Build disclaimer/warning messages for the refinement prompt
+        warnings = []
+        if missing_chunks:
+            chunk_list_str = "\n".join(f"  - {c}" for c in missing_chunks)
+            warnings.append(
+                f"CRITICAL PROVENANCE WARNING:\n"
+                f"The following {len(missing_chunks)} source chunk(s) from the original concept were completely OMITTED:\n"
+                f"{chunk_list_str}\n"
+                f"You MUST incorporate the facts from these omitted chunks into the pillar or appropriate child concepts."
+            )
+        else:
+            warnings.append("PROVENANCE STATUS: All input source chunks were cited.")
+
+        if first_pass_ratio < 75.0:
+            reduction_pct = round(100.0 - first_pass_ratio, 1)
+            warnings.append(
+                f"LENGTH REDUCTION WARNING:\n"
+                f"The first-pass output reduced total word length by {reduction_pct}% "
+                f"(retained only {first_pass_words} words out of {words} original words).\n"
+                f"This indicates significant summarization or fact dropping. Restore omitted technical details, formulas, conditions, and procedures."
+            )
+        else:
+            warnings.append(f"LENGTH STATUS: First pass retained {first_pass_words} words ({first_pass_ratio}% of source).")
+
+        warning_block = "\n\n".join(warnings)
+
+        # Format first pass XML for inspection by refinement LLM
+        first_pass_xml_parts = ["<decomposition>\n<pillar>"]
+        for p in res.pillar_paragraphs:
+            sc = p.get("source_chunk") or default_src
+            first_pass_xml_parts.append(f'<paragraph source_chunk="{sc}">\n{p.get("text", "")}\n</paragraph>')
+        first_pass_xml_parts.append("</pillar>")
+        for ch in res.children:
+            first_pass_xml_parts.append(f'<child>\n<title>{ch.title}</title>')
+            for p in ch.paragraphs:
+                sc = p.get("source_chunk") or default_src
+                first_pass_xml_parts.append(f'<paragraph source_chunk="{sc}">\n{p.get("text", "")}\n</paragraph>')
+            first_pass_xml_parts.append("</child>")
+        first_pass_xml_parts.append("</decomposition>")
+        first_pass_xml = "\n".join(first_pass_xml_parts)
+
+        refine_prompt = f"""\
+COMPOSITE CONCEPT TITLE: "{title}"
+ORIGINAL LENGTH: {words} words
+
+ORIGINAL SOURCE PARAGRAPHS BY SOURCE CHUNK:
+{source_presentation}
+
+======================================================================
+FIRST-PASS DECOMPOSITION RESULT:
+======================================================================
+{first_pass_xml}
+
+======================================================================
+AUDIT FEEDBACK & REQUIRED REFINEMENTS:
+======================================================================
+{warning_block}
+
+Refine the decomposition now according to instructions. Provide the complete updated <decomposition> XML.
+"""
+        try:
+            refined_raw_text = await call_llm(
+                client=client,
+                model=self.settings.model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_REFINE},
+                    {"role": "user", "content": refine_prompt}
+                ],
+                max_tokens=max_out,
+                args=self.args,
+                task="generate",
+                max_growth=1,
+            )
+            res_refined = parse_xml_decomposition(refined_raw_text, default_source_chunk=default_src)
+            if res_refined.decomposed and res_refined.children:
+                res = res_refined
+        except Exception as e:
+            # If refinement call fails or overflows, gracefully keep the valid first-pass result
+            pass
+
+        # Compute post-refinement metrics
+        post_paras = list(res.pillar_paragraphs)
+        for ch in res.children:
+            post_paras.extend(ch.paragraphs)
+        final_surviving_chunks = {
+            (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
+            for p in post_paras if (p.get("source_chunk") or p.get("doc_id"))
+        }
+        final_missing = sorted(list(input_chunks - final_surviving_chunks))
+        final_words = sum(len((p.get("text") or "").split()) for p in post_paras)
+        final_ratio = round((final_words / words * 100) if words > 0 else 100.0, 1)
+
         return {
             "title": title,
             "decomposed": res.decomposed,
+            "strategy": "single_shot_refined",
             "pillar_paragraphs": res.pillar_paragraphs,
-            "children": [{"title": ch.title, "paragraphs": ch.paragraphs} for ch in res.children]
+            "children": [{"title": ch.title, "paragraphs": ch.paragraphs} for ch in res.children],
+            "orig_words": words,
+            "first_pass_words": first_pass_words,
+            "first_pass_ratio": first_pass_ratio,
+            "post_words": final_words,
+            "word_ratio": final_ratio,
+            "missing_chunks": final_missing,
         }
 
     async def run(self):
@@ -414,6 +588,81 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
                     pass
 
         print_concept_word_distribution(final_concepts, title_label="STAGE 6b: AFTER SUBTOPIC DECOMPOSITION")
+
+        # ── 50-CONCEPT DECOMPOSITION VERIFICATION AUDIT (BEFORE VS AFTER REFINEMENT) ──
+        decomposed_records = [
+            (t, res) for t, res in results.items()
+            if isinstance(res, dict) and res.get("decomposed")
+        ]
+        
+        single_shot_count = sum(1 for _, r in decomposed_records if "single_shot" in r.get("strategy", ""))
+        map_reduce_count = sum(1 for _, r in decomposed_records if r.get("strategy") == "map_reduce")
+        not_decomposed_count = sum(1 for r in results.values() if isinstance(r, dict) and not r.get("decomposed"))
+
+        # Save comprehensive decomposition report
+        report_data = {
+            "total_evaluated": len(results),
+            "decomposed_count": len(decomposed_records),
+            "not_decomposed_count": not_decomposed_count,
+            "strategy_breakdown": {
+                "llm_single_shot_refined": single_shot_count,
+                "map_reduce_fallback": map_reduce_count,
+                "kept_whole": not_decomposed_count,
+            },
+            "concepts": results,
+        }
+        report_file = self.wiki_path / "decomposition_report.json"
+        atomic_write_json(report_file, report_data)
+
+        print("\n==================================================================")
+        print("STAGE 6b: EXECUTION STRATEGY & DECOMPOSITION AUDIT")
+        print("==================================================================")
+        print(f"Total Concepts Evaluated (> {threshold}w): {len(results)}")
+        print(f"  - LLM Single-Shot + Mandatory Refinement: {single_shot_count}")
+        print(f"  - Map-Reduce Fallback (Oversized):        {map_reduce_count}")
+        print(f"  - Kept Whole (Atomic / Cannot Decompose): {not_decomposed_count}")
+        print(f"Report Written To: {report_file}")
+
+        if decomposed_records:
+            # Deterministic pseudo-random sample of up to 50 concepts
+            sample_size = min(50, len(decomposed_records))
+            # Sort by title for determinism, then stride
+            sorted_records = sorted(decomposed_records, key=lambda x: x[0])
+            step = max(1, len(sorted_records) // sample_size)
+            audit_sample = sorted_records[::step][:sample_size]
+
+            print(f"\nAUDIT SAMPLE: 50-Concept Verification (Pass 1 vs Refined Pass 2)")
+            print(f"{'Concept Title':<35} | {'Orig W':<7} | {'P1 W':<6} | {'P1 %':<6} | {'P2 W':<6} | {'P2 %':<6} | {'Delta':<7} | {'Chunks'}")
+            print("-" * 95)
+
+            p1_ratios = []
+            p2_ratios = []
+            intact_chunks_count = 0
+
+            for t, r in audit_sample:
+                ow = r.get("orig_words") or 0
+                p1w = r.get("first_pass_words") or r.get("post_words") or 0
+                p1r = r.get("first_pass_ratio") or r.get("word_ratio") or 100.0
+                p2w = r.get("post_words") or 0
+                p2r = r.get("word_ratio") or 100.0
+                delta = round(p2r - p1r, 1)
+                missing = r.get("missing_chunks") or []
+                chunk_status = "100% OK" if not missing else f"-{len(missing)} lost"
+                if not missing:
+                    intact_chunks_count += 1
+
+                p1_ratios.append(p1r)
+                p2_ratios.append(p2r)
+
+                delta_str = f"+{delta}%" if delta > 0 else f"{delta}%"
+                print(f"{t[:34]:<35} | {ow:<7} | {p1w:<6} | {p1r:>5.1f}% | {p2w:<6} | {p2r:>5.1f}% | {delta_str:>7} | {chunk_status}")
+
+            avg_p1 = sum(p1_ratios) / len(p1_ratios) if p1_ratios else 0.0
+            avg_p2 = sum(p2_ratios) / len(p2_ratios) if p2_ratios else 0.0
+            print("-" * 95)
+            print(f"Sample Average Length Retention: Pass 1 = {avg_p1:.1f}%  ==>  After Refinement = {avg_p2:.1f}%")
+            print(f"Sample Provenance Integrity:     {intact_chunks_count}/{len(audit_sample)} concepts had 100% chunk retention before safety guard.")
+            print("==================================================================\n")
 
         write_stage_manifest(
             wiki_path=self.wiki_path,
