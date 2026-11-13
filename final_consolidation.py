@@ -790,6 +790,15 @@ class FinalConsolidationPipeline:
                 pk = ":::".join(sorted([pair[0]["title"], pair[1]["title"]]))
                 if pk in deep_checkpoint:
                     decisions.append((pair, FinalActionVerdict(**deep_checkpoint[pk])))
+        elif candidate_pairs and getattr(self.args, "skip_deep_verify", False):
+            # Load existing deep verification log if available
+            deep_log_file = self.wiki_path / "deep_verify_log.json"
+            if deep_log_file.exists():
+                deep_checkpoint = load_json_log(deep_log_file)
+                for pair in candidate_pairs:
+                    pk = ":::".join(sorted([pair[0]["title"], pair[1]["title"]]))
+                    if pk in deep_checkpoint:
+                        decisions.append((pair, FinalActionVerdict(**deep_checkpoint[pk])))
 
         # 3. Sequential Deterministic Application: PRUNE -> MERGE -> LINK
         pruned_titles: Set[str] = set()
