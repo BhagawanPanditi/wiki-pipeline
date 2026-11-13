@@ -384,6 +384,15 @@ def global_consolidate(domain_dir: Path, args: Any):
     print(f"Saving global_concepts.json to {domain_dir}...")
     atomic_write_json(domain_dir / "global_concepts.json", {"concepts": global_concepts})
 
+    # Invalidate any stale pre-decomposition backup from previous runs
+    stale_bak = domain_dir / "global_concepts.json.bak"
+    if stale_bak.exists():
+        try:
+            stale_bak.unlink()
+            print("Invalidated stale global_concepts.json.bak for fresh decomposition.")
+        except OSError:
+            pass
+
     # F-11 & F-12: Write individual concept files using deterministic, collision-free slugs
     # Preserve existing briefs/entities if concepts/ already had them
     existing_enrichments: Dict[str, Tuple[str, List[str]]] = {}

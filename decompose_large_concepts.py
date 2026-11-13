@@ -265,17 +265,19 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
         }
 
     async def run(self):
-        print(f"Loading concepts from {self.global_concepts_file}...")
-        with open(self.global_concepts_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            concepts = data.get("concepts", [])
-
-        # Create safety backup of pre-decomposition global_concepts.json
+        # Create safety backup of pre-decomposition global_concepts.json if not present
         bak_file = self.global_concepts_file.with_suffix(".json.bak")
-        if not bak_file.exists():
+        if not bak_file.exists() and self.global_concepts_file.exists():
             import shutil
             shutil.copy(self.global_concepts_file, bak_file)
             print(f"Created backup of pre-decomposition concepts at {bak_file}")
+
+        # Idempotent source loading: always read from pristine pre-decomposition backup if available
+        src_file = bak_file if bak_file.exists() else self.global_concepts_file
+        print(f"Loading concepts from {src_file}...")
+        with open(src_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            concepts = data.get("concepts", [])
 
         total = len(concepts)
         print(f"Loaded {total} global concepts.")
@@ -342,16 +344,12 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
                     all_child_paras.extend(ch.get("paragraphs", []))
 
                 surviving_docs = {p.get("doc_id") for p in pillar_paras + all_child_paras if p.get("doc_id")}
-                # If any original doc_id was omitted by LLM in decomposition, retain concise evidence in the pillar
+                # If any original doc_id was omitted by LLM in decomposition, retain FULL evidence in the pillar
                 for orig_p in orig_paras:
                     did = orig_p.get("doc_id")
                     if did and did != "unknown" and did not in surviving_docs:
                         print(f"[PROVENANCE RESCUE] Rescued omitted doc '{did}' back into pillar '{t}'.")
                         rescue_text = (orig_p.get("text") or "").strip()
-                        # Keep concise summary snippet (up to 40 words) to avoid blowing pillar context
-                        words = rescue_text.split()
-                        if len(words) > 40:
-                            rescue_text = " ".join(words[:40]) + " …"
                         pillar_paras.append({"doc_id": did, "text": rescue_text})
                         surviving_docs.add(did)
 
@@ -365,19 +363,19 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
 
                 final_concepts.append(c)
 
+                # Consistent chunk-key inheritance from parent's source_chunks
+                parent_chunks = c.get("source_chunks", [])
+
                 # Add children without destructive truncation
                 for ch in decomp_data.get("children", []):
                     ch_title = ch["title"].strip()
                     ch_slug = generate_stable_slug(ch_title, used_slugs)
                     new_children_count += 1
 
-                    # Inherit source_chunks from child paragraphs
                     ch_paras = ch.get("paragraphs", [])
-                    ch_chunks = set()
-                    for p in ch_paras:
-                        sc = p.get("source_chunk") or p.get("doc_id")
-                        if sc:
-                            ch_chunks.add(sc.replace("::", "_"))
+                    child_docs = {p.get("doc_id") for p in ch_paras if p.get("doc_id")}
+                    # Inherit matching chunk-level keys from parent
+                    ch_chunks = sorted(sc for sc in parent_chunks if sc.split("_chunk_")[0].split("::")[0] in child_docs) or sorted(child_docs)
 
                     child_concept = {
                         "title": ch_title,
@@ -386,7 +384,7 @@ SOURCE PARAGRAPHS BY DOCUMENT ID:
                         "subtopics": [],
                         "entities": [],
                         "paragraphs": ch_paras,
-                        "source_chunks": sorted(list(ch_chunks)),
+                        "source_chunks": ch_chunks,
                         "outbound_relations": [
                             {
                                 "target_concept": t,
