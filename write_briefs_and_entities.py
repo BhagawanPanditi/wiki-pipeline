@@ -73,23 +73,34 @@ def parse_xml_brief_and_entities(text: str) -> BriefAndEntities:
     if not text:
         raise ValueError("Empty response received from LLM")
 
-    # Brief: opened by <brief>, closed by </brief>, or by <entities> / </entities> / end of string
-    brief_m = re.search(r"<brief>(.*?)(?:</brief>|</entities>|<entities>|\Z)", text, re.DOTALL | re.IGNORECASE)
-    if not brief_m or not brief_m.group(1).strip():
+    # Brief: find the LAST <brief>...</brief> block in the text
+    brief_matches = list(re.finditer(r"<brief>(.*?)(?:</brief>|</entities>|<entities>|\Z)", text, re.DOTALL | re.IGNORECASE))
+    if not brief_matches:
         raise ValueError("Missing or empty <brief> block in LLM response")
+    
+    # Pick the last matched brief block (safeguard against model draft mentions in thinking/preamble)
+    raw_brief = ""
+    for bm in reversed(brief_matches):
+        candidate = bm.group(1).strip()
+        if candidate and len(candidate.split()) >= 3:
+            raw_brief = candidate
+            break
 
-    raw_brief = brief_m.group(1).strip()
+    if not raw_brief:
+        raise ValueError("Missing substantive <brief> block in LLM response")
+
     # Strip citation brackets like [doc_...::chunk_...]
     raw_brief = re.sub(r"\[(?:doc_|canon_)[^\]]+\]", "", raw_brief)
     brief = " ".join(raw_brief.split())
 
     entities = []
-    # Entities: look inside <entities>...</entities>, or if the model typo'd opening tags, scan after the brief
-    entities_m = re.search(r"<entities>(.*?)</entities>", text, re.DOTALL | re.IGNORECASE)
-    if entities_m and entities_m.group(1).strip():
-        raw_entities = entities_m.group(1).strip().splitlines()
+    # Entities: look for the LAST <entities>...</entities> block
+    ent_matches = list(re.finditer(r"<entities>(.*?)</entities>", text, re.DOTALL | re.IGNORECASE))
+    if ent_matches:
+        raw_entities = ent_matches[-1].group(1).strip().splitlines()
     else:
-        after_brief = text[brief_m.end():]
+        # Fallback to lines after the selected brief
+        after_brief = text[text.rfind("<brief>"):]
         raw_entities = after_brief.strip().splitlines()
 
     for line in raw_entities:
