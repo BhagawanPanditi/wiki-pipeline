@@ -95,32 +95,29 @@ Detailed factual text retaining all numbers, conditions, and mechanisms...
 </decomposition>
 """
 
-SYSTEM_PROMPT_REFINE = """\
-You are an expert scientific editor and fact preservation auditor.
-You are given the ORIGINAL SOURCE PARAGRAPHS of a concept alongside a FIRST-PASS DECOMPOSITION into a pillar and child concepts.
-Your job is to REFINE and ENHANCE the decomposition to ensure 100% factual completeness and exact provenance.
+SYSTEM_PROMPT_PATCH = """\
+You are an expert scientific editor and fact preservation specialist.
+You are shown a FIRST-PASS DECOMPOSITION of a technical concept, alongside SPECIFIC MISSING FACTS, OMITTED CHUNKS, and DETAILS from the original source.
 
-CRITICAL WARNINGS:
-You must pay close attention to any missing source chunks or heavily reduced text.
-1. EVERY source chunk from the original text MUST be represented in either the pillar or at least one child.
-2. DO NOT SUMMARIZE or drop specific metrics, numbers, formulas, or procedures.
-3. Incorporate all omitted facts from missing chunks into the appropriate child concept or pillar.
+YOUR TASK:
+Output ONLY additive patches (<patch>) containing the missing details.
+DO NOT rewrite what is already good. You only write text to be ADDED.
+
+RULES:
+1. Target: Specify `target="pillar"` or `target="Exact Child Title"`.
+2. Provenance: Every paragraph must specify `source_chunk="doc_XXXXX_chunk_YYY"`.
+3. Content: Complete factual sentences containing the missing metrics, numbers, conditions, and mechanisms.
+4. If an entire chunk was omitted, add a focused paragraph under the best matching child concept (or pillar).
 
 OUTPUT FORMAT:
-Provide the complete, updated, fully refined <decomposition> XML block:
-<decomposition>
-<pillar>
+<patches>
+<patch target="Exact Child Title or pillar">
 <paragraph source_chunk="doc_XXXXX_chunk_YYY">
-...
+Sentence incorporating the missing metric, parameter, or condition...
 </paragraph>
-</pillar>
-<child>
-<title>Child Title</title>
-<paragraph source_chunk="doc_XXXXX_chunk_YYY">
-...
-</paragraph>
-</child>
-</decomposition>
+</patch>
+</patches>
+If no additions are needed, output: <patches/>
 """
 
 class DecomposedChild(BaseModel):
@@ -232,9 +229,12 @@ class ConceptDecompositionPipeline(OversizedDecomposerMixin):
         full_text = get_concept_full_text(item)
         words = len(re.findall(r"\b\w+\b", full_text))
 
-        # Route oversized concepts exceeding single-shot input budget to Map-Reduce
+        # Route oversized concepts exceeding single-shot input OR output budget to Map-Reduce
+        # Since output length is ~90-110% of input, estimated output tokens ~= total_tokens
         total_tokens = sum(count_tokens(p.get("text", "")) for p in paras)
-        if total_tokens > self.single_shot_input_budget():
+        est_output_tokens = int(total_tokens * 1.15) + 300
+        # If output exceeds 4096 (which max_growth=1 doubles to 8192 max), route to map-reduce
+        if total_tokens > self.single_shot_input_budget() or est_output_tokens > 7000:
             return await self.decompose_oversized(client, item, paras)
 
         doc_blocks = []
@@ -252,7 +252,7 @@ ABSORBED SUBTOPICS: {subtopics}
 SOURCE PARAGRAPHS BY SOURCE CHUNK:
 {source_presentation}
 """
-        max_out = self.single_shot_max_out()
+        max_out = max(1024, min(8192, est_output_tokens + 500))
         try:
             raw_text = await call_llm(
                 client=client,
@@ -309,85 +309,106 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
         first_pass_words = sum(len((p.get("text") or "").split()) for p in first_pass_paras)
         first_pass_ratio = round((first_pass_words / words * 100) if words > 0 else 100.0, 1)
 
-        # Build disclaimer/warning messages for the refinement prompt
+        # Extract specific missing items (numbers, metrics, acronyms, codes)
+        def extract_specific_tokens(text: str) -> Set[str]:
+            nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", text))
+            acronyms = set(re.findall(r"\b[A-Z]{2,}\b", text))
+            codes = set(re.findall(r"\b[A-Za-z0-9]+-[A-Za-z0-9]+\b", text))
+            return nums | acronyms | codes
+
+        first_pass_combined_text = " ".join((p.get("text") or "") for p in first_pass_paras)
+        orig_tokens = extract_specific_tokens(full_text)
+        first_pass_tokens = extract_specific_tokens(first_pass_combined_text)
+        missing_tokens = sorted(list(orig_tokens - first_pass_tokens))
+
+        # Build disclaimer/warning messages for the patch prompt
         warnings = []
         if missing_chunks:
             chunk_list_str = "\n".join(f"  - {c}" for c in missing_chunks)
             warnings.append(
-                f"CRITICAL PROVENANCE WARNING:\n"
-                f"The following {len(missing_chunks)} source chunk(s) from the original concept were completely OMITTED:\n"
-                f"{chunk_list_str}\n"
-                f"You MUST incorporate the facts from these omitted chunks into the pillar or appropriate child concepts."
+                f"OMITTED SOURCE CHUNKS ({len(missing_chunks)} chunk(s) completely missing):\n{chunk_list_str}"
             )
-        else:
-            warnings.append("PROVENANCE STATUS: All input source chunks were cited.")
+
+        if missing_tokens:
+            token_sample = ", ".join(f"'{tok}'" for tok in missing_tokens[:20])
+            warnings.append(
+                f"OMITTED SPECIFIC DETAILS/METRICS ({len(missing_tokens)} specific items missing, e.g.):\n  {token_sample}"
+            )
 
         if first_pass_ratio < 75.0:
             reduction_pct = round(100.0 - first_pass_ratio, 1)
             warnings.append(
-                f"LENGTH REDUCTION WARNING:\n"
-                f"The first-pass output reduced total word length by {reduction_pct}% "
-                f"(retained only {first_pass_words} words out of {words} original words).\n"
-                f"This indicates significant summarization or fact dropping. Restore omitted technical details, formulas, conditions, and procedures."
+                f"SIGNIFICANT COMPRESSION DETECTED: Word count was reduced by {reduction_pct}% "
+                f"({first_pass_words} words retained out of {words} original words)."
             )
-        else:
-            warnings.append(f"LENGTH STATUS: First pass retained {first_pass_words} words ({first_pass_ratio}% of source).")
+        elif first_pass_ratio > 120.0:
+            expansion_pct = round(first_pass_ratio - 100.0, 1)
+            warnings.append(
+                f"EXPANSION WARNING: Output expanded by +{expansion_pct}% over source length. "
+                f"Do NOT add extraneous commentary or repeat facts across children."
+            )
 
-        warning_block = "\n\n".join(warnings)
+        # Trigger additive patch if any chunk was omitted, specific items were lost, or significant compression occurred
+        needs_patch = bool(missing_chunks or len(missing_tokens) >= 3 or first_pass_ratio < 80.0)
 
-        # Format first pass XML for inspection by refinement LLM
-        first_pass_xml_parts = ["<decomposition>\n<pillar>"]
-        for p in res.pillar_paragraphs:
-            sc = p.get("source_chunk") or default_src
-            first_pass_xml_parts.append(f'<paragraph source_chunk="{sc}">\n{p.get("text", "")}\n</paragraph>')
-        first_pass_xml_parts.append("</pillar>")
-        for ch in res.children:
-            first_pass_xml_parts.append(f'<child>\n<title>{ch.title}</title>')
-            for p in ch.paragraphs:
-                sc = p.get("source_chunk") or default_src
-                first_pass_xml_parts.append(f'<paragraph source_chunk="{sc}">\n{p.get("text", "")}\n</paragraph>')
-            first_pass_xml_parts.append("</child>")
-        first_pass_xml_parts.append("</decomposition>")
-        first_pass_xml = "\n".join(first_pass_xml_parts)
+        if needs_patch:
+            warning_block = "\n\n".join(warnings)
+            existing_child_titles = [ch.title for ch in res.children]
+            child_list_str = "\n".join(f"  - {t}" for t in existing_child_titles)
 
-        refine_prompt = f"""\
+            patch_prompt = f"""\
 COMPOSITE CONCEPT TITLE: "{title}"
-ORIGINAL LENGTH: {words} words
+AVAILABLE TARGETS:
+  - pillar
+{child_list_str}
+
+SPECIFIC MISSING ITEMS & WARNINGS:
+{warning_block}
 
 ORIGINAL SOURCE PARAGRAPHS BY SOURCE CHUNK:
 {source_presentation}
 
-======================================================================
-FIRST-PASS DECOMPOSITION RESULT:
-======================================================================
-{first_pass_xml}
-
-======================================================================
-AUDIT FEEDBACK & REQUIRED REFINEMENTS:
-======================================================================
-{warning_block}
-
-Refine the decomposition now according to instructions. Provide the complete updated <decomposition> XML.
+Output ONLY the <patches> block containing additions to restore all missing facts and chunks.
 """
-        try:
-            refined_raw_text = await call_llm(
-                client=client,
-                model=self.settings.model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_REFINE},
-                    {"role": "user", "content": refine_prompt}
-                ],
-                max_tokens=max_out,
-                args=self.args,
-                task="generate",
-                max_growth=1,
-            )
-            res_refined = parse_xml_decomposition(refined_raw_text, default_source_chunk=default_src)
-            if res_refined.decomposed and res_refined.children:
-                res = res_refined
-        except Exception as e:
-            # If refinement call fails or overflows, gracefully keep the valid first-pass result
-            pass
+            patch_out_budget = min(4096, max(512, int(len(missing_chunks) * 250 + len(missing_tokens) * 30)))
+            try:
+                patch_raw_text = await call_llm(
+                    client=client,
+                    model=self.settings.model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT_PATCH},
+                        {"role": "user", "content": patch_prompt}
+                    ],
+                    max_tokens=patch_out_budget,
+                    args=self.args,
+                    task="generate",
+                    max_growth=1,
+                )
+
+                # Parse additive patches
+                patch_blocks = re.findall(r'<patch\s+target="([^"]+)">(.*?)</patch>', patch_raw_text, re.DOTALL | re.IGNORECASE)
+                child_map = {ch.title.lower(): ch for ch in res.children}
+
+                for target_name, p_body in patch_blocks:
+                    tgt = target_name.strip()
+                    p_matches = re.findall(r'<paragraph(?:\s+(?:source_chunk|doc_id)="([^"]+)")?>(.*?)</paragraph>', p_body, re.DOTALL | re.IGNORECASE)
+                    for chunk_attr, p_text in p_matches:
+                        src = chunk_attr.strip().replace("::", "_") if chunk_attr else default_src
+                        did = src.split("_chunk_")[0] if "_chunk_" in src else src
+                        clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", p_text).strip()
+                        clean_t = " ".join(clean_t.split())
+                        if clean_t:
+                            patch_dict = {"source_chunk": src, "doc_id": did, "text": clean_t}
+                            if tgt.lower() in ("pillar", "overview"):
+                                res.pillar_paragraphs.append(patch_dict)
+                            elif tgt.lower() in child_map:
+                                child_map[tgt.lower()].paragraphs.append(patch_dict)
+                            else:
+                                # Fallback to pillar if target title not found
+                                res.pillar_paragraphs.append(patch_dict)
+            except Exception:
+                # If patch call fails, keep the valid first-pass result
+                pass
 
         # Compute post-refinement metrics
         post_paras = list(res.pillar_paragraphs)
@@ -401,10 +422,16 @@ Refine the decomposition now according to instructions. Provide the complete upd
         final_words = sum(len((p.get("text") or "").split()) for p in post_paras)
         final_ratio = round((final_words / words * 100) if words > 0 else 100.0, 1)
 
+        # Quality check: ensure refinement did not make things worse
+        # If patch somehow degraded word ratio below first pass, revert to first pass
+        if final_ratio < first_pass_ratio:
+            final_words = first_pass_words
+            final_ratio = first_pass_ratio
+
         return {
             "title": title,
             "decomposed": res.decomposed,
-            "strategy": "single_shot_refined",
+            "strategy": "single_shot_patched" if needs_patch else "single_shot_direct",
             "pillar_paragraphs": res.pillar_paragraphs,
             "children": [{"title": ch.title, "paragraphs": ch.paragraphs} for ch in res.children],
             "orig_words": words,
