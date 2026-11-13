@@ -305,7 +305,8 @@ class BriefAndEntitiesPipeline:
                     res.raise_if_failed(STAGE)
         finally:
             save_log_sync(self.log_file, self.checkpoint)
-            self.assemble_and_save(concepts)
+            if not res or res.failed_count == 0:
+                self.assemble_and_save(concepts)
 
         print("\n============================================================")
         print("STAGE 7: BRIEF & IMPORTANT ENTITIES EXTRACTION COMPLETE")
