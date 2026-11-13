@@ -210,14 +210,14 @@ You are an expert knowledge consolidator performing final quality verification.
 You are given a candidate pair or cluster of concepts with their Canonical Titles, Briefs, and Top Entities.
 
 Determine the definitive action for this group:
-- MERGE: If both concepts represent the EXACT SAME single subject.
+- MERGE: If both concepts represent the EXACT SAME single subject, OR if one concept is a thin stub/minor subtopic (<=35 words) that should be absorbed into the overarching primary concept.
 - LINK: If concepts are functionally related, parent/child, version, or part/whole pairs.
 - PRUNE: If one is confirmed boilerplate, navigational junk, or scraping residue.
 - KEEP_SEPARATE: If they are distinct concepts with no direct relationship.
 
-GUIDELINES FOR LINK:
-If action is LINK, output a concise directional relationship phrase (2 to 6 words, no parentheses, no meta-reasoning, no trailing punctuation) in <relation_phrase>.
-Example good phrases: "is a specialized subsystem of", "is a common pathology affecting", "serves as an input to".
+GUIDELINES:
+- For MERGE: Always specify the overarching canonical title to keep in <primary_title>. When absorbing a thin stub into a broader concept, <primary_title> MUST be the broader concept.
+- For LINK: Output a concise directional relationship phrase (2 to 6 words, no parentheses, no meta-reasoning, no trailing punctuation) in <relation_phrase>. Example: "is a specialized subsystem of", "serves as an input to".
 
 OUTPUT FORMAT:
 Output ONLY the final <verdict>...</verdict> XML block:
@@ -682,6 +682,29 @@ class FinalConsolidationPipeline:
         for t1, t2 in candidate_pair_keys:
             if t1.lower() in concept_by_name and t2.lower() in concept_by_name:
                 candidate_pairs.append((concept_by_name[t1.lower()], concept_by_name[t2.lower()]))
+
+        # Include candidate pairs for thin concepts (<= 35 words) with their top related concept for LLM absorption
+        thin_word_threshold = getattr(self.args, "thin_word_threshold", 35)
+        thin_candidates_added = 0
+        for c in concepts:
+            words = len(get_concept_full_text(c).split())
+            if 0 < words <= thin_word_threshold:
+                # Find top related candidate concept
+                rels = c.get("outbound_relations", [])
+                if rels:
+                    for r in rels:
+                        tgt = r.get("target_concept", "")
+                        tgt_c = concept_by_name.get(tgt.lower())
+                        if tgt_c and tgt.lower() != c["title"].lower():
+                            pair_key = tuple(sorted([c["title"], tgt_c["title"]]))
+                            if pair_key not in candidate_pair_keys:
+                                candidate_pair_keys.add(pair_key)
+                                candidate_pairs.append((c, tgt_c))
+                                thin_candidates_added += 1
+                            break
+
+        if thin_candidates_added:
+            print(f"Paired {thin_candidates_added} thin concept(s) (<= {thin_word_threshold} words) with parent candidates for LLM absorption audit.")
 
         print(f"\nDiscovered {len(candidate_pairs)} candidate pair(s) and {len(prune_candidate_titles)} macro prune candidate(s) for deep verification.")
 
