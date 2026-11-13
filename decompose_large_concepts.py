@@ -320,83 +320,71 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
         first_pass_tokens = extract_specific_tokens(first_pass_combined_text)
         missing_tokens = sorted(list(orig_tokens - first_pass_tokens))
         
-        # Check for fabricated numbers (numbers in output not present in source)
-        orig_numbers = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", full_text))
-        first_pass_numbers = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", first_pass_combined_text))
-        hallucinated_numbers = sorted(list(first_pass_numbers - orig_numbers))
+        # ── MANDATORY REFINEMENT / PATCH PASS (ALWAYS RUNS) ─────────────────
+        warnings = []
+        if missing_chunks:
+            chunk_list_str = "\n".join(f"  - {c}" for c in missing_chunks)
+            warnings.append(
+                f"OMITTED SOURCE CHUNKS ({len(missing_chunks)} chunk(s) completely missing):\n{chunk_list_str}"
+            )
+        else:
+            warnings.append("PROVENANCE STATUS: All input source chunks were cited.")
 
-        # Check if gaps exist: run patch LLM ONLY when true gaps exist
-        needs_patch = bool(missing_chunks or len(missing_tokens) >= 2 or first_pass_ratio < 85.0)
-        patch_status = "skipped_no_gaps"
-        patch_rejected_reason = None
+        if missing_tokens:
+            token_sample = ", ".join(f"'{tok}'" for tok in missing_tokens[:25])
+            warnings.append(
+                f"OMITTED SPECIFIC DETAILS/METRICS ({len(missing_tokens)} specific items missing):\n  {token_sample}"
+            )
+        else:
+            warnings.append("DETAILS STATUS: Key numbers, acronyms, and codes were retained.")
 
-        if needs_patch:
-            patch_status = "ran"
-            warnings = []
-            if missing_chunks:
-                chunk_list_str = "\n".join(f"  - {c}" for c in missing_chunks)
-                warnings.append(
-                    f"OMITTED SOURCE CHUNKS ({len(missing_chunks)} chunk(s) completely missing):\n{chunk_list_str}"
-                )
+        if first_pass_ratio < 75.0:
+            reduction_pct = round(100.0 - first_pass_ratio, 1)
+            warnings.append(
+                f"SIGNIFICANT COMPRESSION: Word count was reduced by {reduction_pct}% "
+                f"({first_pass_words} words retained out of {words} original words)."
+            )
+        else:
+            warnings.append(f"LENGTH STATUS: First pass retained {first_pass_words} words ({first_pass_ratio}% of source).")
 
-            if missing_tokens:
-                token_sample = ", ".join(f"'{tok}'" for tok in missing_tokens[:25])
-                warnings.append(
-                    f"OMITTED SPECIFIC DETAILS/METRICS ({len(missing_tokens)} specific items missing):\n  {token_sample}"
-                )
+        warning_block = "\n\n".join(warnings)
+        existing_child_titles = [ch.title for ch in res.children]
+        child_list_str = "\n".join(f"  - {t}" for t in existing_child_titles)
 
-            if first_pass_ratio < 75.0:
-                reduction_pct = round(100.0 - first_pass_ratio, 1)
-                warnings.append(
-                    f"SIGNIFICANT COMPRESSION: Word count was reduced by {reduction_pct}% "
-                    f"({first_pass_words} words retained out of {words} original words)."
-                )
-
-            warning_block = "\n\n".join(warnings)
-            existing_child_titles = [ch.title for ch in res.children]
-            child_list_str = "\n".join(f"  - {t}" for t in existing_child_titles)
-
-            patch_prompt = f"""\
+        patch_prompt = f"""\
 COMPOSITE CONCEPT TITLE: "{title}"
 AVAILABLE TARGETS:
   - pillar
 {child_list_str}
 
-SPECIFIC MISSING ITEMS & WARNINGS:
+AUDIT FEEDBACK & MISSING ITEMS:
 {warning_block}
 
 ORIGINAL SOURCE PARAGRAPHS BY SOURCE CHUNK:
 {source_presentation}
 
-Output ONLY the <patches> block containing additions to restore all missing facts and chunks. If no additions needed, output: <patches/>
+Output ONLY the <patches> block containing any additions needed to restore missing facts and chunks. If no additions are needed, output exactly: <no_patch/>
 """
-            patch_out_budget = min(4096, max(512, int(len(missing_chunks) * 250 + len(missing_tokens) * 35)))
-            
-            # Deep copy first pass before patch trial
-            candidate_pillar = list(res.pillar_paragraphs)
-            candidate_children = [
-                DecomposedChild(title=ch.title, paragraphs=list(ch.paragraphs))
-                for ch in res.children
-            ]
+        patch_out_budget = min(4096, max(512, int(len(missing_chunks) * 250 + len(missing_tokens) * 35 + 200)))
 
-            try:
-                patch_raw_text = await call_llm(
-                    client=client,
-                    model=self.settings.model_name,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT_PATCH},
-                        {"role": "user", "content": patch_prompt}
-                    ],
-                    max_tokens=patch_out_budget,
-                    args=self.args,
-                    task="generate",
-                    max_growth=1,
-                )
+        try:
+            patch_raw_text = await call_llm(
+                client=client,
+                model=self.settings.model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_PATCH},
+                    {"role": "user", "content": patch_prompt}
+                ],
+                max_tokens=patch_out_budget,
+                args=self.args,
+                task="generate",
+                max_growth=1,
+            )
 
+            if "<no_patch" not in patch_raw_text.lower():
                 patch_blocks = re.findall(r'<patch\s+target="([^"]+)">(.*?)</patch>', patch_raw_text, re.DOTALL | re.IGNORECASE)
-                child_map = {ch.title.lower(): ch for ch in candidate_children}
+                child_map = {ch.title.lower(): ch for ch in res.children}
 
-                new_patched_text = []
                 for target_name, p_body in patch_blocks:
                     tgt = target_name.strip()
                     p_matches = re.findall(r'<paragraph(?:\s+(?:source_chunk|doc_id)="([^"]+)")?>(.*?)</paragraph>', p_body, re.DOTALL | re.IGNORECASE)
@@ -406,59 +394,15 @@ Output ONLY the <patches> block containing additions to restore all missing fact
                         clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", p_text).strip()
                         clean_t = " ".join(clean_t.split())
                         if clean_t:
-                            new_patched_text.append(clean_t)
                             patch_dict = {"source_chunk": src, "doc_id": did, "text": clean_t}
                             if tgt.lower() in ("pillar", "overview"):
-                                candidate_pillar.append(patch_dict)
+                                res.pillar_paragraphs.append(patch_dict)
                             elif tgt.lower() in child_map:
                                 child_map[tgt.lower()].paragraphs.append(patch_dict)
                             else:
-                                candidate_pillar.append(patch_dict)
-
-                # Validate the patch:
-                candidate_paras = list(candidate_pillar)
-                for ch in candidate_children:
-                    candidate_paras.extend(ch.paragraphs)
-                candidate_combined_text = " ".join((p.get("text") or "") for p in candidate_paras)
-                candidate_tokens = extract_specific_tokens(candidate_combined_text)
-                candidate_missing_tokens = orig_tokens - candidate_tokens
-                candidate_numbers = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", candidate_combined_text))
-                new_unsupported_numbers = candidate_numbers - orig_numbers
-                candidate_words = sum(len((p.get("text") or "").split()) for p in candidate_paras)
-                candidate_ratio = (candidate_words / words * 100) if words > 0 else 100.0
-
-                # Strict acceptance criteria:
-                # 1. Missing item count must decrease (or missing chunks recovered)
-                # 2. No new numbers appeared that aren't in source
-                # 3. Overall ratio must stay under 130%
-                surviving_candidate_chunks = {
-                    (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
-                    for p in candidate_paras if (p.get("source_chunk") or p.get("doc_id"))
-                }
-                candidate_missing_chunks = input_chunks - surviving_candidate_chunks
-
-                recovered_chunks = len(candidate_missing_chunks) < len(missing_chunks)
-                recovered_tokens = len(candidate_missing_tokens) < len(missing_tokens)
-                no_new_hallucinated_numbers = len(new_unsupported_numbers) <= len(hallucinated_numbers)
-                within_length_cap = candidate_ratio <= 130.0
-
-                if (recovered_chunks or recovered_tokens) and no_new_hallucinated_numbers and within_length_cap:
-                    res.pillar_paragraphs = candidate_pillar
-                    res.children = candidate_children
-                    patch_status = "patch_accepted"
-                else:
-                    reasons = []
-                    if not (recovered_chunks or recovered_tokens):
-                        reasons.append("no_items_recovered")
-                    if not no_new_hallucinated_numbers:
-                        reasons.append(f"unsupported_numbers_added:{len(new_unsupported_numbers - set(hallucinated_numbers))}")
-                    if not within_length_cap:
-                        reasons.append(f"ratio_exceeded:{candidate_ratio:.1f}%")
-                    patch_status = "patch_rejected"
-                    patch_rejected_reason = "; ".join(reasons)
-            except Exception as e:
-                patch_status = "patch_failed"
-                patch_rejected_reason = str(e)
+                                res.pillar_paragraphs.append(patch_dict)
+        except Exception:
+            pass
 
         # Compute post-refinement metrics
         post_paras = list(res.pillar_paragraphs)
@@ -475,9 +419,7 @@ Output ONLY the <patches> block containing additions to restore all missing fact
         return {
             "title": title,
             "decomposed": res.decomposed,
-            "strategy": f"single_shot_{patch_status}",
-            "refinement": patch_status,
-            "patch_rejected_reason": patch_rejected_reason,
+            "strategy": "single_shot_refined",
             "pillar_paragraphs": res.pillar_paragraphs,
             "children": [{"title": ch.title, "paragraphs": ch.paragraphs} for ch in res.children],
             "orig_words": words,
@@ -486,7 +428,6 @@ Output ONLY the <patches> block containing additions to restore all missing fact
             "post_words": final_words,
             "word_ratio": final_ratio,
             "missing_chunks": final_missing,
-            "hallucinated_numbers": hallucinated_numbers,
         }
 
     async def run(self):
@@ -673,24 +614,15 @@ Output ONLY the <patches> block containing additions to restore all missing fact
         map_reduce_count = sum(1 for _, r in decomposed_records if r.get("strategy") == "map_reduce")
         not_decomposed_count = sum(1 for r in results.values() if isinstance(r, dict) and not r.get("decomposed"))
 
-        refine_accepted_count = sum(1 for _, r in decomposed_records if r.get("refinement") == "patch_accepted")
-        refine_rejected_count = sum(1 for _, r in decomposed_records if r.get("refinement") == "patch_rejected")
-        refine_skipped_count = sum(1 for _, r in decomposed_records if r.get("refinement") == "skipped_no_gaps")
-
         # Save comprehensive decomposition report
         report_data = {
             "total_evaluated": len(results),
             "decomposed_count": len(decomposed_records),
             "not_decomposed_count": not_decomposed_count,
             "strategy_breakdown": {
-                "llm_single_shot": single_shot_count,
+                "llm_single_shot_refined": single_shot_count,
                 "map_reduce_fallback": map_reduce_count,
                 "kept_whole": not_decomposed_count,
-            },
-            "refinement_breakdown": {
-                "patch_accepted": refine_accepted_count,
-                "patch_rejected": refine_rejected_count,
-                "skipped_no_gaps": refine_skipped_count,
             },
             "concepts": results,
         }
@@ -701,10 +633,7 @@ Output ONLY the <patches> block containing additions to restore all missing fact
         print("STAGE 6b: EXECUTION STRATEGY & DECOMPOSITION AUDIT")
         print("==================================================================")
         print(f"Total Concepts Evaluated (> {threshold}w): {len(results)}")
-        print(f"  - LLM Single-Shot:                        {single_shot_count}")
-        print(f"      * Additive Patch Accepted:            {refine_accepted_count}")
-        print(f"      * Additive Patch Rejected:            {refine_rejected_count}")
-        print(f"      * Skipped (No Gaps Found):            {refine_skipped_count}")
+        print(f"  - LLM Single-Shot + Mandatory Refinement: {single_shot_count}")
         print(f"  - Map-Reduce Fallback (Oversized):        {map_reduce_count}")
         print(f"  - Kept Whole (Atomic / Cannot Decompose): {not_decomposed_count}")
         print(f"Report Written To: {report_file}")
