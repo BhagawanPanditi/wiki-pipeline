@@ -343,18 +343,19 @@ class WikiDocumentConsolidatorPipeline:
                 except Exception:
                     pass
 
+            batch_text = format_batch_for_prompt(batch)
+            user_prompt = (
+                f"DOCUMENT ID: {doc_id}\nTOTAL UNIQUE EXTRACTED CONCEPTS: "
+                f"{len(lightweight_concepts)}\nCONCEPTS IN THIS BATCH: {len(batch)}\n\n"
+                "CANDIDATE CONCEPTS LIST (only merge titles present in this list):\n\n"
+                f"{batch_text}\n"
+            )
+
             last_exc: Exception | None = None
             for attempt in range(CALL_RETRIES):
                 async with semaphore:
-                    batch_text = format_batch_for_prompt(batch)
-                    user_prompt = (
-                        f"DOCUMENT ID: {doc_id}\nTOTAL UNIQUE EXTRACTED CONCEPTS: "
-                        f"{len(lightweight_concepts)}\nCONCEPTS IN THIS BATCH: {len(batch)}\n\n"
-                        "CANDIDATE CONCEPTS LIST (only merge titles present in this list):\n\n"
-                        f"{batch_text}\n"
-                    )
-
                     try:
+                        t_call0 = asyncio.get_event_loop().time()
                         raw_text = await asyncio.wait_for(
                             call_llm(
                                 client=client,
@@ -371,6 +372,7 @@ class WikiDocumentConsolidatorPipeline:
                             ),
                             timeout=CALL_TIMEOUT_S,
                         )
+                        call_dur = asyncio.get_event_loop().time() - t_call0
                         clusters = parse_xml_merge_clusters(raw_text)
                         try:
                             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -379,6 +381,7 @@ class WikiDocumentConsolidatorPipeline:
                             pass
                         if batch_pbar is not None:
                             batch_pbar.update(1)
+                        tqdm.write(f"    → [{doc_id[:12]}] Batch done ({len(batch)} concepts, {call_dur:.1f}s, {len(clusters)} clusters)")
                         return clusters
                     except Exception as exc:
                         msg = str(exc).lower()
