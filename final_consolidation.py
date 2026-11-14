@@ -393,28 +393,53 @@ class FinalConsolidationPipeline:
 
             # Multi-Tier Priority Ranking:
             # Tier 1: Subtopic Decomposition (pillar <-> child)
-            # Tier 2: Same Document Affinity (co-document concepts)
-            # Tier 3: Macro Scan & Deep LLM Verified
+            # Tier 2: LLM Deep / Macro Verified (cross-document true semantic relations)
+            # Tier 3: Same Document Affinity (co-document concepts, capped to quota of 5 max)
             # Tier 4: Direct Title Mentions
             # Tier 5: TF-IDF Weighted Entity Jaccard & Containment
             type_rank = {
                 "subtopic_decomposition": 4,
-                "deep_verify_llm": 3,
                 "llm_verified": 3,
                 "title_mention": 2,
                 "entity_overlap": 1
             }
-            c["outbound_relations"].sort(
+
+            # Partition outbound relations to enforce same-document quota
+            same_doc_rels = [r for r in c.get("outbound_relations", []) if r.get("same_document")]
+            cross_doc_rels = [r for r in c.get("outbound_relations", []) if not r.get("same_document")]
+
+            # Sort both pools by their intrinsic strength
+            def rel_sort_key(r):
+                return (
+                    1 if r.get("link_type") == "subtopic_decomposition" else 0,
+                    1 if r.get("verified_by_llm") else 0,
+                    type_rank.get(r.get("link_type", ""), 1),
+                    r.get("hybrid_score", 0.0),
+                    r.get("jaccard_similarity", 0.0),
+                )
+
+            same_doc_rels.sort(key=rel_sort_key, reverse=True)
+            cross_doc_rels.sort(key=rel_sort_key, reverse=True)
+
+            # Cap same-doc links to quota of 5 so they don't crowd out external links
+            SAME_DOC_QUOTA = 5
+            top_same_doc = same_doc_rels[:SAME_DOC_QUOTA]
+            remaining_same_doc = same_doc_rels[SAME_DOC_QUOTA:]
+
+            # Interleave: High-priority (Decomp + Verified) -> Top Same-Doc -> Cross-Doc -> Remainder
+            final_sorted = sorted(
+                c["outbound_relations"],
                 key=lambda r: (
                     1 if r.get("link_type") == "subtopic_decomposition" else 0,
-                    1 if r.get("same_document") else 0,
                     1 if r.get("verified_by_llm") else 0,
+                    1 if (r.get("same_document") and r in top_same_doc) else 0,
                     type_rank.get(r.get("link_type", ""), 1),
                     r.get("hybrid_score", 0.0),
                     r.get("jaccard_similarity", 0.0),
                 ),
                 reverse=True,
             )
+            c["outbound_relations"] = final_sorted
 
         # Step 2: Measure initial Top-K (`primary_cap`) directed in-degree for every concept
         primary_inbound_from: Dict[str, Set[str]] = defaultdict(set)

@@ -291,22 +291,39 @@ async def enrich_graph_via_jaccard(
 
         # Multi-Tier Priority:
         # Tier 1: Subtopic Decomposition (pillar <-> child)
-        # Tier 2: Same Document Affinity (co-document concepts)
-        # Tier 3: Macro / Deep LLM Verified
+        # Tier 2: LLM Verified (cross-document true semantic relations)
+        # Tier 3: Same Document Affinity (co-document concepts, capped to quota of 5 max)
         # Tier 4: Direct Title Mentions
         # Tier 5: Statistical IDF Entity Jaccard / Overlap
         type_rank = {
             "subtopic_decomposition": 4,
-            "deep_verify_llm": 3,
             "llm_verified": 3,
             "title_mention": 2,
             "entity_overlap": 1
         }
+
+        same_doc_rels = [r for r in existing_relations if r.get("same_document")]
+        cross_doc_rels = [r for r in existing_relations if not r.get("same_document")]
+
+        def rel_sort_key(r):
+            return (
+                1 if r.get("link_type") == "subtopic_decomposition" else 0,
+                1 if r.get("verified_by_llm") else 0,
+                type_rank.get(r.get("link_type", ""), 1),
+                float(r.get("jaccard_similarity") or 0.0),
+            )
+
+        same_doc_rels.sort(key=rel_sort_key, reverse=True)
+        cross_doc_rels.sort(key=rel_sort_key, reverse=True)
+
+        SAME_DOC_QUOTA = 5
+        top_same_doc = same_doc_rels[:SAME_DOC_QUOTA]
+
         existing_relations.sort(
             key=lambda r: (
                 1 if r.get("link_type") == "subtopic_decomposition" else 0,
-                1 if r.get("same_document") else 0,
                 1 if r.get("verified_by_llm") else 0,
+                1 if (r.get("same_document") and r in top_same_doc) else 0,
                 type_rank.get(r.get("link_type", ""), 1),
                 float(r.get("jaccard_similarity") or 0.0),
             ),

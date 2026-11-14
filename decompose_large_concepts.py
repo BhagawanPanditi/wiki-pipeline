@@ -124,6 +124,17 @@ class DecompositionResult(BaseModel):
     children: List[DecomposedChild] = Field(default_factory=list)
 
 
+def clean_extracted_prose(text: str) -> str:
+    """Clean internal provenance brackets and excessive inline spaces without mangling code, paths, or double periods."""
+    if not text:
+        return ""
+    # Strip internal doc brackets like [doc_00291_chunk_001] or [canon_123]
+    t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", text).strip()
+    # Normalize excessive spaces without collapsing intentional paragraph newlines
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in t.splitlines()]
+    return "\n".join(l for l in lines if l)
+
+
 def parse_xml_decomposition(text: str, default_source_chunk: str = "unknown") -> DecompositionResult:
     if not text or "<cannot_decompose" in text.lower():
         return DecompositionResult(decomposed=False)
@@ -134,20 +145,14 @@ def parse_xml_decomposition(text: str, default_source_chunk: str = "unknown") ->
         for chunk_attr, p_text in p_matches:
             src = chunk_attr.strip().replace("::", "_") if chunk_attr else default_source_chunk
             did = src.split("_chunk_")[0] if "_chunk_" in src else src
-            clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", p_text).strip()
-            clean_t = re.sub(r"\.\s*\.", ".", clean_t)
-            clean_t = re.sub(r"\s+([.,;:!?])", r"\1", clean_t)
-            clean_t = " ".join(clean_t.split())
+            clean_t = clean_extracted_prose(p_text)
             if clean_t:
                 paras.append({"source_chunk": src, "doc_id": did, "text": clean_t})
         if not paras:
             # Fallback if model used <description>...</description>
             desc_m = re.search(r"<description>(.*?)</description>", xml_block, re.DOTALL | re.IGNORECASE)
             fallback_text = desc_m.group(1).strip() if desc_m else xml_block.strip()
-            clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", fallback_text).strip()
-            clean_t = re.sub(r"\.\s*\.", ".", clean_t)
-            clean_t = re.sub(r"\s+([.,;:!?])", r"\1", clean_t)
-            clean_t = " ".join(clean_t.split())
+            clean_t = clean_extracted_prose(fallback_text)
             if clean_t:
                 did = default_source_chunk.split("_chunk_")[0] if "_chunk_" in default_source_chunk else default_source_chunk
                 paras.append({"source_chunk": default_source_chunk, "doc_id": did, "text": clean_t})
@@ -238,20 +243,20 @@ class ConceptDecompositionPipeline(OversizedDecomposerMixin):
             doc_blocks.append(f"SOURCE CHUNK: {src}\nTEXT:\n{ptxt}\n")
         source_presentation = "\n".join(doc_blocks)
 
-        # Dynamic child target calculation
-        min_children = max(2, words // 500)
-        max_children = max(3, (words + 249) // 250)
+        # Dynamic child target floor (never cap upper bound, so model is never forced to merge subtopics)
+        min_children = max(2, words // 450)
 
         prompt = f"""\
 COMPOSITE CONCEPT TITLE: "{title}"
 CURRENT LENGTH: {words} words
-TARGET SUBTOPIC COUNT: Approximately {min_children} to {max_children} focused child concepts
+MINIMUM SUBTOPIC COUNT: At least {min_children} focused child concepts
 ABSORBED SUBTOPICS: {subtopics}
 
 GUIDANCE:
-- Reorganize this content into a concise pillar overview plus approximately {min_children} to {max_children} distinct child concepts.
+- Reorganize this content into a concise pillar overview plus focused child concepts.
+- Let the number of children naturally follow the substantive subtopics present (at least {min_children} children). Never artificially merge distinct subtopics just to reduce the count.
 - Use the listed ABSORBED SUBTOPICS as primary candidates for child titles and boundaries when backed by substantive source text.
-- Do NOT combine unrelated subtopics to meet an arbitrary size. If a subtopic is short (e.g. 50-100 words), it can either be its own concise child or stay in the pillar overview.
+- Do NOT combine unrelated subtopics. If a subtopic is short (e.g. 50-100 words), it can either be its own concise child or stay in the pillar overview.
 
 SOURCE PARAGRAPHS BY SOURCE CHUNK:
 {source_presentation}
@@ -295,30 +300,39 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
                 "missing_chunks": [],
             }
 
-        # Measure decomposition completeness
-        input_chunks = {
-            (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
-            for p in paras if (p.get("source_chunk") or p.get("doc_id"))
-        }
+        # Measure decomposition completeness (normalizing at both chunk and doc level to avoid false missing triggers)
+        def norm_key(s: str) -> str:
+            return s.replace("::", "_").strip()
+
+        input_chunks = {norm_key(p.get("source_chunk") or p.get("doc_id") or "") for p in paras}
         input_chunks.discard("unknown")
         input_chunks.discard("")
+        input_docs = {c.split("_chunk_")[0] for c in input_chunks}
 
         post_paras = list(res.pillar_paragraphs)
         for ch in res.children:
             post_paras.extend(ch.paragraphs)
 
-        surviving_chunks = {
-            (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
-            for p in post_paras if (p.get("source_chunk") or p.get("doc_id"))
-        }
-        missing_chunks = sorted(list(input_chunks - surviving_chunks))
+        surviving_chunks = {norm_key(p.get("source_chunk") or p.get("doc_id") or "") for p in post_paras}
+        surviving_docs = {c.split("_chunk_")[0] for c in surviving_chunks}
 
-        # Targeted Refinement: If chunks were omitted by Pass 1, ask the LLM to integrate only those chunks
+        # A chunk is genuinely missing only if its chunk-id AND parent doc-id are absent from output
+        missing_chunks = sorted(list(
+            c for c in input_chunks
+            if c not in surviving_chunks and c.split("_chunk_")[0] not in surviving_docs
+        ))
+
+        rescue_attempted = False
+        rescue_succeeded = False
+        missing_before_rescue = len(missing_chunks)
+
+        # Targeted Refinement: If chunks/docs were omitted by Pass 1, ask the LLM to integrate only those
         if missing_chunks:
+            rescue_attempted = True
             omitted_chunk_texts = []
             for p in paras:
-                sc = (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
-                if sc in missing_chunks:
+                sc = norm_key(p.get("source_chunk") or p.get("doc_id") or "")
+                if sc in missing_chunks or sc.split("_chunk_")[0] in missing_chunks:
                     omitted_chunk_texts.append(f"SOURCE CHUNK: {sc}\nTEXT:\n{p.get('text', '').strip()}\n")
 
             child_titles_str = "\n".join(f"  - {ch.title}" for ch in res.children)
@@ -334,6 +348,7 @@ OMITTED SOURCE CHUNK(S) TO INTEGRATE:
 Output ONLY the <patches> block integrating these exact facts with their source_chunk attribute.
 """
             try:
+                rescue_budget = min(4096, max(1024, len(omitted_chunk_texts) * 500 + 400))
                 rescue_raw = await call_llm(
                     client=client,
                     model=self.settings.model_name,
@@ -341,10 +356,10 @@ Output ONLY the <patches> block integrating these exact facts with their source_
                         {"role": "system", "content": SYSTEM_PROMPT_CHUNK_RESCUE},
                         {"role": "user", "content": rescue_prompt}
                     ],
-                    max_tokens=min(3000, len(omitted_chunk_texts) * 400 + 400),
+                    max_tokens=rescue_budget,
                     args=self.args,
                     task="generate",
-                    max_growth=0,
+                    max_growth=1,
                 )
                 child_map = {ch.title.lower(): ch for ch in res.children}
                 patch_blocks = re.findall(r'<patch\s+target="([^"]+)">(.*?)</patch>', rescue_raw, re.DOTALL | re.IGNORECASE)
@@ -354,8 +369,7 @@ Output ONLY the <patches> block integrating these exact facts with their source_
                     for chunk_attr, p_text in p_matches:
                         src = chunk_attr.strip().replace("::", "_") if chunk_attr else default_src
                         did = src.split("_chunk_")[0] if "_chunk_" in src else src
-                        clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", p_text).strip()
-                        clean_t = " ".join(clean_t.split())
+                        clean_t = clean_extracted_prose(p_text)
                         if clean_t:
                             patch_dict = {"source_chunk": src, "doc_id": did, "text": clean_t}
                             if tgt.lower() in ("pillar", "overview"):
@@ -364,18 +378,20 @@ Output ONLY the <patches> block integrating these exact facts with their source_
                                 child_map[tgt.lower()].paragraphs.append(patch_dict)
                             else:
                                 res.pillar_paragraphs.append(patch_dict)
-            except Exception:
-                pass
 
-            # Recompute surviving chunks after targeted rescue
-            post_paras = list(res.pillar_paragraphs)
-            for ch in res.children:
-                post_paras.extend(ch.paragraphs)
-            surviving_chunks = {
-                (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
-                for p in post_paras if (p.get("source_chunk") or p.get("doc_id"))
-            }
-            missing_chunks = sorted(list(input_chunks - surviving_chunks))
+                # Recompute surviving chunks after targeted rescue
+                post_paras = list(res.pillar_paragraphs)
+                for ch in res.children:
+                    post_paras.extend(ch.paragraphs)
+                surviving_chunks = {norm_key(p.get("source_chunk") or p.get("doc_id") or "") for p in post_paras}
+                surviving_docs = {c.split("_chunk_")[0] for c in surviving_chunks}
+                missing_chunks = sorted(list(
+                    c for c in input_chunks
+                    if c not in surviving_chunks and c.split("_chunk_")[0] not in surviving_docs
+                ))
+                rescue_succeeded = len(missing_chunks) < missing_before_rescue
+            except Exception as exc:
+                print(f"[RESCUE ERROR] Failed targeted rescue for '{title}': {exc}")
 
         post_words = sum(len((p.get("text") or "").split()) for p in post_paras)
         word_ratio = round((post_words / words * 100) if words > 0 else 100.0, 1)
@@ -390,6 +406,9 @@ Output ONLY the <patches> block integrating these exact facts with their source_
             "post_words": post_words,
             "word_ratio": word_ratio,
             "missing_chunks": missing_chunks,
+            "rescue_attempted": rescue_attempted,
+            "rescue_succeeded": rescue_succeeded,
+            "missing_before_rescue": missing_before_rescue,
         }
 
     async def run(self):
