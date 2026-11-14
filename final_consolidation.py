@@ -33,6 +33,7 @@ from utils.concept_ops import (
     get_concept_full_text,
     render_paragraphs_to_markdown,
 )
+from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
 from utils.manifest import verify_stage_manifest, write_stage_manifest
 from utils.stats import print_link_distribution
@@ -1161,6 +1162,12 @@ class FinalConsolidationPipeline:
                 if not weak_relation_pattern.search(rel_text):
                     filtered_out.append(r)
             c["outbound_relations"] = filtered_out
+
+        directed_link_stats = self._rank_links_and_inject_rescue_backlinks(
+            final_concepts,
+            primary_cap=primary_cap,
+            rescue_slots=rescue_slots,
+        )
 
         # 5b. Unified 25-Candidate Menu Preparation & Single-Call LLM Link Selection
         print(f"\nDistributing across servers for Final LLM Link Selection & Phrasing (up to 25 candidates per concept)...")
