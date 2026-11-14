@@ -254,9 +254,26 @@ async def enrich_graph_via_jaccard(
     print(f"Graph After Linking: {len(post_components)} components (down from {len(initial_components)}).")
     print(f"Giant component size: {post_giant}/{len(concepts)} ({post_giant/len(concepts)*100:.1f}%)")
 
-    # Update concepts in memory & sort outbound relations by Jaccard descending
+    # Precompute doc set for each concept to enable same-document affinity
+    concept_docs = {}
+    for c in concepts:
+        c_title_low = c["title"].lower()
+        d_set = set()
+        for sc in c.get("source_chunks", []):
+            d_id = sc.split("_chunk_")[0].split("::")[0].strip()
+            if d_id:
+                d_set.add(d_id)
+        for p in c.get("paragraphs", []):
+            d_id = (p.get("doc_id") or (p.get("source_chunk") or "").split("_chunk_")[0].split("::")[0]).strip()
+            if d_id:
+                d_set.add(d_id)
+        concept_docs[c_title_low] = d_set
+
+    # Update concepts in memory & sort outbound relations by multi-tier priority
     for c in concepts:
         title = c["title"]
+        t_low = title.lower()
+        docs_a = concept_docs.get(t_low, set())
         existing_relations = c.get("outbound_relations", [])
         existing_targets = {r.get("target_concept", "").lower() for r in existing_relations}
 
@@ -266,13 +283,29 @@ async def enrich_graph_via_jaccard(
                     existing_relations.append(new_rel)
                     existing_targets.add(new_rel["target_concept"].lower())
 
-        # Sort all outbound relations using the same multi-key ranking as Stage 10:
-        # 1. Structural / LLM verified (decomposition parent-child)
-        # 2. Title mentions (concept title appears in key entities)
-        # 3. Jaccard similarity score
-        type_rank = {"title_mention": 3, "llm_verified": 2, "subtopic_decomposition": 2, "entity_overlap": 1}
+        # Tag same_document affinity
+        for rel in existing_relations:
+            tgt_low = rel.get("target_concept", "").strip().lower()
+            docs_b = concept_docs.get(tgt_low, set())
+            rel["same_document"] = bool(docs_a & docs_b)
+
+        # Multi-Tier Priority:
+        # Tier 1: Subtopic Decomposition (pillar <-> child)
+        # Tier 2: Same Document Affinity (co-document concepts)
+        # Tier 3: Macro / Deep LLM Verified
+        # Tier 4: Direct Title Mentions
+        # Tier 5: Statistical IDF Entity Jaccard / Overlap
+        type_rank = {
+            "subtopic_decomposition": 4,
+            "deep_verify_llm": 3,
+            "llm_verified": 3,
+            "title_mention": 2,
+            "entity_overlap": 1
+        }
         existing_relations.sort(
             key=lambda r: (
+                1 if r.get("link_type") == "subtopic_decomposition" else 0,
+                1 if r.get("same_document") else 0,
                 1 if r.get("verified_by_llm") else 0,
                 type_rank.get(r.get("link_type", ""), 1),
                 float(r.get("jaccard_similarity") or 0.0),

@@ -342,15 +342,35 @@ class FinalConsolidationPipeline:
             for c in final_concepts
         }
 
+        # Precompute document associations for all final concepts to enable same-document affinity
+        concept_docs = {}
+        for c in final_concepts:
+            c_low = c["title"].lower()
+            d_set = set()
+            for sc in c.get("source_chunks", []):
+                d_id = sc.split("_chunk_")[0].split("::")[0].strip()
+                if d_id:
+                    d_set.add(d_id)
+            for p in c.get("paragraphs", []):
+                d_id = (p.get("doc_id") or (p.get("source_chunk") or "").split("_chunk_")[0].split("::")[0]).strip()
+                if d_id:
+                    d_set.add(d_id)
+            concept_docs[c_low] = d_set
+
         # Step 1: Compute Score for all outbound relations
         for idx_a, c in enumerate(final_concepts):
             t_a_low = c["title"].lower()
             ents_a = entity_sets.get(t_a_low, set())
+            docs_a = concept_docs.get(t_a_low, set())
 
             for rel in c.get("outbound_relations", []):
                 t_b = rel.get("target_concept", "").strip()
                 t_b_low = t_b.lower()
                 ents_b = entity_sets.get(t_b_low, set())
+                docs_b = concept_docs.get(t_b_low, set())
+
+                # Check same_document affinity
+                rel["same_document"] = bool(docs_a & docs_b)
 
                 inter_len = len(ents_a & ents_b)
                 union_len = len(ents_a | ents_b)
@@ -371,10 +391,23 @@ class FinalConsolidationPipeline:
                 hybrid = 0.55 * jacc + 0.45 * containment
                 rel["hybrid_score"] = round(float(hybrid), 3)
 
-            # F-19: Final ranking: (verified_by_llm, link_type_rank, hybrid_score)
-            type_rank = {"title_mention": 3, "llm_verified": 2, "entity_overlap": 1}
+            # Multi-Tier Priority Ranking:
+            # Tier 1: Subtopic Decomposition (pillar <-> child)
+            # Tier 2: Same Document Affinity (co-document concepts)
+            # Tier 3: Macro Scan & Deep LLM Verified
+            # Tier 4: Direct Title Mentions
+            # Tier 5: TF-IDF Weighted Entity Jaccard & Containment
+            type_rank = {
+                "subtopic_decomposition": 4,
+                "deep_verify_llm": 3,
+                "llm_verified": 3,
+                "title_mention": 2,
+                "entity_overlap": 1
+            }
             c["outbound_relations"].sort(
                 key=lambda r: (
+                    1 if r.get("link_type") == "subtopic_decomposition" else 0,
+                    1 if r.get("same_document") else 0,
                     1 if r.get("verified_by_llm") else 0,
                     type_rank.get(r.get("link_type", ""), 1),
                     r.get("hybrid_score", 0.0),
