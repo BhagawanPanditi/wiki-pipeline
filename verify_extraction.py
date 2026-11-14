@@ -643,7 +643,7 @@ Output ONLY the <verification>...</verification> block.
                 {"role": "system", "content": VERIFICATION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=self.settings.max_tokens or 8192,
+            max_tokens=16000,
             args=self.args,
             cfg=self.cfg,
             task="judge",

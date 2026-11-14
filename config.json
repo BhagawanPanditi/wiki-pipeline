@@ -1,20 +1,14 @@
 {
   "servers": {
     "dgx": [
-      "http://cn18-dgx:8002/v1",
-      "http://cn13-dgx:8000/v1",
-      "http://cn15-dgx:8001/v1",
-      "http://cn15-dgx:8003/v1"
     ],
     "a40": [
-      "http://cn33-a40:8001/v1",
-      "http://cn29-a40:8003/v1"
+      "http://cn35-a40:8019/v1",
+      "http://cn29-a40:8010/v1"
     ],
     "l40": [
-      "http://cn41-l40:8000/v1",
-      "http://cn42-l40:8001/v1",
-      "http://cn41-l40:8002/v1",
-      "http://cn44-l40:8003/v1"
+      "http://cn44-l40:8004/v1",
+      "http://cn43-l40:8019/v1"
     ]
   },
   "model_name": "Qwen/Qwen3.8-27B",
@@ -56,25 +50,25 @@
       "request_timeout": 4500.0
     },
     "decompose-concepts": {
-      "dgx": 20,
-      "a40": 8,
-      "l40": 8,
-      "max_tokens": 6144,
+      "dgx": 40,
+      "a40": 16,
+      "l40": 16,
+      "max_tokens": 16000,
       "request_timeout": 1200.0
     },
     "write-briefs": {
       "dgx": 64,
       "a40": 32,
       "l40": 32,
-      "max_tokens": 1536,
-      "request_timeout": 90.0
+      "max_tokens": 4096,
+      "request_timeout": 1200.0
     },
     "link-entities": {
-      "dgx": 300,
-      "a40": 100,
-      "l40": 100,
-      "max_tokens": 512,
-      "request_timeout": 600.0
+      "dgx": 800,
+      "a40": 200,
+      "l40": 200,
+      "max_tokens": 4096,
+      "request_timeout": 1200.0
     }
   }
 }

@@ -42,9 +42,9 @@ DATA_DIR="${DATA_DIR:-/home/compiling-ganesh/24m0829/long_document/wiki_pipeline
 WIKI_BASE_DIR="${WIKI_BASE_DIR:-/home/compiling-ganesh/24m0829/long_document/wiki}"
 
 ALL_DOMAINS=(
-    "sustainable_living"
-    "biology"
-    "earth_science"
+    # "sustainable_living"
+    # "biology"
+    # "earth_science"
     "economics"
     "psychology"
     "robotics"
@@ -176,36 +176,36 @@ run_domain_pipeline() {
 
     mkdir -p "$wiki_path"
 
-    # Stage 1: Concept Extraction (Pass 1)
-    run_stage 1 "Concept Extraction (Pass 1)" \
-        python3 extract_concepts.py \
-            --input_path "$input_corpus" \
-            --wiki_path "$wiki_path" \
-            $THINKING_FLAG \
-            --resume "${EXTRA_ARGS[@]}"
+    # # Stage 1: Concept Extraction (Pass 1)
+    # run_stage 1 "Concept Extraction (Pass 1)" \
+    #     python3 extract_concepts.py \
+    #         --input_path "$input_corpus" \
+    #         --wiki_path "$wiki_path" \
+    #         $THINKING_FLAG \
+    #         --resume "${EXTRA_ARGS[@]}"
 
-    # Stage 2: Audit Verification (Phase 1)
-    run_stage 2 "Verification Audit (Phase 1)" \
-        python3 verify_extraction.py \
-            --wiki_path "$wiki_path" \
-            --phase 1 \
-            $THINKING_FLAG \
-            --resume "${EXTRA_ARGS[@]}"
+    # # Stage 2: Audit Verification (Phase 1)
+    # run_stage 2 "Verification Audit (Phase 1)" \
+    #     python3 verify_extraction.py \
+    #         --wiki_path "$wiki_path" \
+    #         --phase 1 \
+    #         $THINKING_FLAG \
+    #         --resume "${EXTRA_ARGS[@]}"
 
-    # Stage 3: Second-Pass Refinement
-    run_stage 3 "Concept Refinement (Pass 2)" \
-        python3 refine_concepts.py \
-            --wiki_path "$wiki_path" \
-            $THINKING_FLAG \
-            --resume "${EXTRA_ARGS[@]}"
+    # # Stage 3: Second-Pass Refinement
+    # run_stage 3 "Concept Refinement (Pass 2)" \
+    #     python3 refine_concepts.py \
+    #         --wiki_path "$wiki_path" \
+    #         $THINKING_FLAG \
+    #         --resume "${EXTRA_ARGS[@]}"
 
-    # Stage 4: Second-Pass Verification (Phase 2)
-    run_stage 4 "Verification Delta (Phase 2)" \
-        python3 verify_extraction.py \
-            --wiki_path "$wiki_path" \
-            --phase 2 \
-            $THINKING_FLAG \
-            --resume "${EXTRA_ARGS[@]}"
+    # # Stage 4: Second-Pass Verification (Phase 2)
+    # run_stage 4 "Verification Delta (Phase 2)" \
+    #     python3 verify_extraction.py \
+    #         --wiki_path "$wiki_path" \
+    #         --phase 2 \
+    #         $THINKING_FLAG \
+    #         --resume "${EXTRA_ARGS[@]}"
 
     # Stage 5: Document Consolidation
     run_stage 5 "Document Consolidation" \
@@ -240,6 +240,7 @@ run_domain_pipeline() {
     run_stage 9 "Jaccard Linking & Relation Synthesis" \
         python3 link_entities_jaccard.py \
             --wiki_path "$wiki_path" \
+            --max_primary_links 20 \
             $THINKING_FLAG \
             --max_primary_links 20 \
             --resume "${EXTRA_ARGS[@]}"
@@ -250,7 +251,7 @@ run_domain_pipeline() {
             --wiki_path "$wiki_path" \
             $THINKING_FLAG \
             --max_primary_links 20 \
-            --rescue_slots 3 \
+            --rescue_slots 2 \
             --resume "${EXTRA_ARGS[@]}"
 
     # Stage 11: Benchmark Quality & Fact Retention Audit (Top 40 docs < 20k tokens)
@@ -258,7 +259,7 @@ run_domain_pipeline() {
         python3 audit_wiki_quality.py \
             --wiki_path "$wiki_path" \
             --corpus_path "$input_corpus" \
-            --limit 40 \
+            --limit 100 \
             $THINKING_FLAG "${EXTRA_ARGS[@]}"
 
     echo ""
