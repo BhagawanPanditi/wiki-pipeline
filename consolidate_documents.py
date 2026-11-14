@@ -551,10 +551,12 @@ class WikiDocumentConsolidatorPipeline:
         def on_attempt_err(attempt: int, exc: BaseException, classification: str, doc_id: str, server_url: str):
             tqdm.write(f"[{doc_id}] Attempt {attempt} failed on {server_url}: {type(exc).__name__}: {exc}")
 
+        server_urls = list(settings.servers.keys()) if isinstance(settings.servers, dict) else list(settings.servers)
+
         async def wrap_get_merge_clusters(client: Any, item: Dict[str, Any], server_index: int) -> DocumentConsolidationSchema:
             doc_id = item["doc_id"]
             num_concepts = len(item["raw_concepts"])
-            server_url = settings.servers[server_index] if server_index < len(settings.servers) else f"server-{server_index}"
+            server_url = server_urls[server_index] if server_index < len(server_urls) else f"server-{server_index}"
             try:
                 t0 = asyncio.get_event_loop().time()
                 res = await self.get_merge_clusters(client, item, server_index)
