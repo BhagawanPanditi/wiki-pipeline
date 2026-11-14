@@ -432,7 +432,7 @@ def main():
                         help="Minimum Jaccard similarity score (|A∩B| / |A∪B|).")
     parser.add_argument("--max_hub_threshold", type=int, default=150,
                         help="Max concepts sharing an entity before treating it as an ultra-generic hub.")
-    parser.add_argument("--max_primary_links", type=int, default=60,
+    parser.add_argument("--max_primary_links", type=int, default=20,
                         help="Max links rendered per concept on wiki markdown pages (only synthesize for these).")
     parser.add_argument("--specific_entity_threshold", type=int, default=50,
                         help="Max concepts sharing an entity for 1 shared entity to trigger a link.")

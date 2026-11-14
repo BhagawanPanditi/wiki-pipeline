@@ -241,6 +241,7 @@ run_domain_pipeline() {
         python3 link_entities_jaccard.py \
             --wiki_path "$wiki_path" \
             $THINKING_FLAG \
+            --max_primary_links 20 \
             --resume "${EXTRA_ARGS[@]}"
 
     # Stage 10: Final Consolidation & Wiki Export
@@ -248,7 +249,8 @@ run_domain_pipeline() {
         python3 final_consolidation.py \
             --wiki_path "$wiki_path" \
             $THINKING_FLAG \
-            --max_primary_links 60 \
+            --max_primary_links 20 \
+            --rescue_slots 3 \
             --resume "${EXTRA_ARGS[@]}"
 
     # Stage 11: Benchmark Quality & Fact Retention Audit (Top 40 docs < 20k tokens)
