@@ -56,13 +56,13 @@ RETAIN EXACTLY:
 - Copy sentences verbatim where practical. Make sentences self-contained.
 - NEVER drop a detail to save space. Do NOT remove or deduplicate facts. Do not add anything the source does not say. No padding.
 
-LENGTH & STRUCTURE:
-- There are no arbitrary word limits. Total output should be approximately the same length as the source (roughly 90-110%).
-- Prefer more children over longer children (typically one child per 300-500 source words).
+STRUCTURE & SUBTOPIC DECOMPOSITION:
 - <pillar>: A concise overview of the concept and how the children relate.
 - <child>: Discrete, focused child concepts covering specific subtopics, components, or mechanisms.
-- Titles: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Workstation Ergonomics and Lighting", NOT just "Ergonomics").
-- Each fact appears in the child it belongs to, or in the pillar if it is general. All facts and sentences must be preserved.
+- Use the provided ABSORBED SUBTOPICS as primary candidate guidance for child concept titles and boundaries when supported by substantive paragraphs in the source.
+- Each <child> must represent ONE cohesive topic. NEVER combine two distinct topics into a compound child (e.g., do NOT join unrelated topics with "and" or "&" such as "Prevalence and Genetic Testing").
+- Titles: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Workstation Lighting", NOT a vague single word or compound topic).
+- Each fact appears in the child it belongs to, or in the pillar if it is general background. All facts and sentences must be preserved.
 
 ATTRIBUTION:
 - You MUST attribute each paragraph to its originating source chunk using <paragraph source_chunk="doc_XXXXX_chunk_YYY">...</paragraph>.
@@ -70,7 +70,7 @@ ATTRIBUTION:
 - No inline citations like [doc_00251] in the prose.
 
 IF NOT DECOMPOSABLE:
-- If the concept is already atomic or cannot be cleanly divided without severe redundancy, output exactly: <cannot_decompose/>
+- If the concept is already atomic, unified, or cannot be cleanly divided without severe redundancy, output exactly: <cannot_decompose/>
 
 OUTPUT FORMAT:
 <decomposition>
@@ -92,6 +92,26 @@ Detailed factual text retaining all numbers, conditions, and mechanisms...
 </paragraph>
 </child>
 </decomposition>
+"""
+
+SYSTEM_PROMPT_CHUNK_RESCUE = """\
+You are an expert knowledge integrator.
+You are given a DECOMPOSITION of a concept along with ONE OR MORE SOURCE CHUNKS that were omitted.
+Your task is to integrate the missing chunk's facts cleanly into either an existing child concept or the pillar overview.
+
+RULES:
+1. Target: Specify `target="pillar"` or `target="Exact Existing Child Title"`. If the missing chunk represents a distinct new subtopic, you may specify `target="new_child"` with `<title>New Subtopic Title</title>`.
+2. Provenance: Every paragraph must specify `source_chunk="doc_XXXXX_chunk_YYY"`.
+3. Preserve all factual details, metrics, names, and parameters verbatim.
+
+OUTPUT FORMAT:
+<patches>
+<patch target="Exact Child Title or pillar">
+<paragraph source_chunk="doc_XXXXX_chunk_YYY">
+Factual sentences incorporating the omitted chunk...
+</paragraph>
+</patch>
+</patches>
 """
 
 class DecomposedChild(BaseModel):
@@ -218,10 +238,20 @@ class ConceptDecompositionPipeline(OversizedDecomposerMixin):
             doc_blocks.append(f"SOURCE CHUNK: {src}\nTEXT:\n{ptxt}\n")
         source_presentation = "\n".join(doc_blocks)
 
+        # Dynamic child target calculation
+        min_children = max(2, words // 500)
+        max_children = max(3, (words + 249) // 250)
+
         prompt = f"""\
 COMPOSITE CONCEPT TITLE: "{title}"
 CURRENT LENGTH: {words} words
+TARGET SUBTOPIC COUNT: Approximately {min_children} to {max_children} focused child concepts
 ABSORBED SUBTOPICS: {subtopics}
+
+GUIDANCE:
+- Reorganize this content into a concise pillar overview plus approximately {min_children} to {max_children} distinct child concepts.
+- Use the listed ABSORBED SUBTOPICS as primary candidates for child titles and boundaries when backed by substantive source text.
+- Do NOT combine unrelated subtopics to meet an arbitrary size. If a subtopic is short (e.g. 50-100 words), it can either be its own concise child or stay in the pillar overview.
 
 SOURCE PARAGRAPHS BY SOURCE CHUNK:
 {source_presentation}
@@ -282,6 +312,70 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
             for p in post_paras if (p.get("source_chunk") or p.get("doc_id"))
         }
         missing_chunks = sorted(list(input_chunks - surviving_chunks))
+
+        # Targeted Refinement: If chunks were omitted by Pass 1, ask the LLM to integrate only those chunks
+        if missing_chunks:
+            omitted_chunk_texts = []
+            for p in paras:
+                sc = (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
+                if sc in missing_chunks:
+                    omitted_chunk_texts.append(f"SOURCE CHUNK: {sc}\nTEXT:\n{p.get('text', '').strip()}\n")
+
+            child_titles_str = "\n".join(f"  - {ch.title}" for ch in res.children)
+            rescue_prompt = f"""\
+COMPOSITE CONCEPT TITLE: "{title}"
+EXISTING TARGETS:
+  - pillar
+{child_titles_str}
+
+OMITTED SOURCE CHUNK(S) TO INTEGRATE:
+{"".join(omitted_chunk_texts)}
+
+Output ONLY the <patches> block integrating these exact facts with their source_chunk attribute.
+"""
+            try:
+                rescue_raw = await call_llm(
+                    client=client,
+                    model=self.settings.model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT_CHUNK_RESCUE},
+                        {"role": "user", "content": rescue_prompt}
+                    ],
+                    max_tokens=min(3000, len(omitted_chunk_texts) * 400 + 400),
+                    args=self.args,
+                    task="generate",
+                    max_growth=0,
+                )
+                child_map = {ch.title.lower(): ch for ch in res.children}
+                patch_blocks = re.findall(r'<patch\s+target="([^"]+)">(.*?)</patch>', rescue_raw, re.DOTALL | re.IGNORECASE)
+                for target_name, p_body in patch_blocks:
+                    tgt = target_name.strip()
+                    p_matches = re.findall(r'<paragraph(?:\s+(?:source_chunk|doc_id)="([^"]+)")?>(.*?)</paragraph>', p_body, re.DOTALL | re.IGNORECASE)
+                    for chunk_attr, p_text in p_matches:
+                        src = chunk_attr.strip().replace("::", "_") if chunk_attr else default_src
+                        did = src.split("_chunk_")[0] if "_chunk_" in src else src
+                        clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", p_text).strip()
+                        clean_t = " ".join(clean_t.split())
+                        if clean_t:
+                            patch_dict = {"source_chunk": src, "doc_id": did, "text": clean_t}
+                            if tgt.lower() in ("pillar", "overview"):
+                                res.pillar_paragraphs.append(patch_dict)
+                            elif tgt.lower() in child_map:
+                                child_map[tgt.lower()].paragraphs.append(patch_dict)
+                            else:
+                                res.pillar_paragraphs.append(patch_dict)
+            except Exception:
+                pass
+
+            # Recompute surviving chunks after targeted rescue
+            post_paras = list(res.pillar_paragraphs)
+            for ch in res.children:
+                post_paras.extend(ch.paragraphs)
+            surviving_chunks = {
+                (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
+                for p in post_paras if (p.get("source_chunk") or p.get("doc_id"))
+            }
+            missing_chunks = sorted(list(input_chunks - surviving_chunks))
 
         post_words = sum(len((p.get("text") or "").split()) for p in post_paras)
         word_ratio = round((post_words / words * 100) if words > 0 else 100.0, 1)

@@ -107,7 +107,11 @@ def parse_xml_brief_and_entities(text: str) -> BriefAndEntities:
         # Strip list markers like '-', '*', '•', or '1.', '2)' only at start of line without stripping numeric entities (e.g. '20,000 Hz')
         cleaned = re.sub(r"^(?:[-*•]|\d+[\.\)])\s*", "", line.strip())
         cleaned = re.sub(r"^[,\.\s;:-]+", "", cleaned).strip()
+        # Drop stray XML wrapper tags (e.g. <brief>, </brief>, <entities>, </entities>)
+        if cleaned.lower() in ("<brief>", "</brief>", "<entities>", "</entities>"):
+            continue
         cleaned = re.sub(r"</?entities>", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"</?brief>", "", cleaned, flags=re.IGNORECASE).strip()
         if cleaned and len(cleaned) > 2 and len(cleaned) < 80:
             entities.append(cleaned)
 
