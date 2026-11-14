@@ -43,11 +43,11 @@
       "request_timeout": 1200.0
     },
     "consolidate-documents": {
-      "dgx": 24,
-      "a40": 8,
-      "l40": 8,
-      "max_tokens": 32000,
-      "request_timeout": 4500.0
+      "dgx": 32,
+      "a40": 24,
+      "l40": 24,
+      "max_tokens": 4096,
+      "request_timeout": 600.0
     },
     "decompose-concepts": {
       "dgx": 40,

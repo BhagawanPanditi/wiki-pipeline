@@ -75,6 +75,30 @@ Output ONLY the final <verdicts>...</verdicts> XML block with no introductory or
 </verdicts>
 """
 
+SYSTEM_PROMPT_STUB_ABSORB = """\
+You are an expert knowledge curator. Your task is to determine whether a thin stub concept (<50 words) should be absorbed into one of the candidate parent concepts from the same document or context, or kept separate.
+
+A stub concept SHOULD be absorbed into a parent if:
+- The stub is a specific facet, subtopic, example, method, or section of the parent concept.
+- Merging it will enrich the parent concept without distorting the parent's core identity.
+
+A stub concept should NOT be absorbed (return NONE) if:
+- None of the candidates are closely related.
+- The stub represents a completely independent, distinct topic that does not belong inside any candidate.
+
+Input:
+- Stub Concept: Title, aliases, and its complete paragraph text.
+- Candidate Parents: Numbered list with Title, aliases, and the first 20-30 words of context.
+
+Output Format:
+Wrap your answer strictly in XML tags:
+<stub_absorption>
+  <parent_choice>NUMBER or NONE</parent_choice>
+  <reason>Brief 1-sentence justification</reason>
+</stub_absorption>
+"""
+
+
 class MergeVerdict(BaseModel):
     pair_index: int = 1
     is_same_entity: bool = False
@@ -375,35 +399,147 @@ def global_consolidate(domain_dir: Path, args: Any):
             "source_chunks": sorted(list(global_source_chunks)),
         })
 
-    # Absorb thin stubs (< 50 words) into closest parent/subtopic concept if possible
-    valid_concepts = []
-    absorbed_stubs = 0
+    # Absorb thin stubs (< 50 words) into closest parent/subtopic concept using LLM guidance
     stubs = [c for c in global_concepts if sum(len(p.get("text", "").split()) for p in c.get("paragraphs", [])) < 50]
     non_stubs = [c for c in global_concepts if sum(len(p.get("text", "").split()) for p in c.get("paragraphs", [])) >= 50]
-    non_stub_map = {c["title"].lower(): c for c in non_stubs}
 
-    for c in global_concepts:
-        w_cnt = sum(len(p.get("text", "").split()) for p in c.get("paragraphs", []))
-        if w_cnt < 50 and non_stubs:
-            # Try to absorb into a matching non-stub by title overlap or subtopics
-            t_words = set(c["title"].lower().split())
-            best_parent = None
-            for p_cand in non_stubs:
-                cand_words = set(p_cand["title"].lower().split())
-                if t_words & cand_words:
-                    best_parent = p_cand
-                    break
-            if best_parent:
-                # Absorb paragraphs and add title as subtopic
-                best_parent["paragraphs"].extend(c.get("paragraphs", []))
-                best_parent["subtopics"].append(c["title"])
-                absorbed_stubs += 1
-                continue
-        valid_concepts.append(c)
+    absorbed_stubs = 0
+    if stubs and non_stubs and not getattr(args, "skip_alias_verification", False):
+        print(f"Auditing {len(stubs)} thin stub concept(s) (<50 words) for LLM-guided absorption...")
 
-    if absorbed_stubs > 0:
-        print(f"Absorbed {absorbed_stubs} thin stub concepts (<50 words) into parent concepts.")
-        global_concepts = valid_concepts
+        # Build lookup maps for non-stubs by chunk and doc
+        chunk_to_non_stubs: Dict[str, List[Dict[str, Any]]] = {}
+        doc_to_non_stubs: Dict[str, List[Dict[str, Any]]] = {}
+        for ns in non_stubs:
+            for sc in ns.get("source_chunks", []):
+                chunk_to_non_stubs.setdefault(sc, []).append(ns)
+                doc_id = sc.split("::")[0] if "::" in sc else sc
+                doc_to_non_stubs.setdefault(doc_id, []).append(ns)
+
+        # Prepare stub audit tasks
+        stub_tasks = []
+        for stub in stubs:
+            stub_chunks = set(stub.get("source_chunks", []))
+            stub_docs = {sc.split("::")[0] for sc in stub_chunks if sc}
+
+            # Prioritize candidates: 1. same chunk, 2. same doc, 3. global title overlap
+            candidate_parents: List[Dict[str, Any]] = []
+            seen_cand_titles = set()
+
+            # Tier 1: Same chunk
+            for sc in stub_chunks:
+                for cand in chunk_to_non_stubs.get(sc, []):
+                    if cand["title"] not in seen_cand_titles and cand["title"] != stub["title"]:
+                        candidate_parents.append(cand)
+                        seen_cand_titles.add(cand["title"])
+
+            # Tier 2: Same doc
+            if len(candidate_parents) < 8:
+                for doc_id in stub_docs:
+                    for cand in doc_to_non_stubs.get(doc_id, []):
+                        if cand["title"] not in seen_cand_titles and cand["title"] != stub["title"]:
+                            candidate_parents.append(cand)
+                            seen_cand_titles.add(cand["title"])
+                        if len(candidate_parents) >= 8:
+                            break
+
+            # Tier 3: Title word overlap from remaining non-stubs if still empty
+            if not candidate_parents:
+                stub_words = set(re.findall(r"\b\w{3,}\b", stub["title"].lower()))
+                for cand in non_stubs:
+                    cand_words = set(re.findall(r"\b\w{3,}\b", cand["title"].lower()))
+                    if stub_words & cand_words:
+                        candidate_parents.append(cand)
+                        seen_cand_titles.add(cand["title"])
+                        if len(candidate_parents) >= 5:
+                            break
+
+            if candidate_parents:
+                stub_tasks.append((stub, candidate_parents[:8]))
+
+        if stub_tasks:
+            settings = resolve_settings(args, STAGE)
+            stub_pool = pool_for_stage(args, settings, STAGE)
+
+            async def audit_stub(client, task_item, server_index):
+                stub_c, cands = task_item
+                stub_text = "\n\n".join(p.get("text", "") for p in stub_c.get("paragraphs", []))
+                stub_aliases = ", ".join(stub_c.get("aliases", [])) or "None"
+
+                cands_text = []
+                for idx, cand in enumerate(cands, 1):
+                    cand_hint = get_context_hint(cand.get("description") or (cand.get("paragraphs", [{}])[0].get("text", "")), max_words=30)
+                    cand_aliases = ", ".join(cand.get("aliases", [])) or "None"
+                    cands_text.append(f"{idx}. Title: \"{cand['title']}\"\n   Aliases: {cand_aliases}\n   Context: {cand_hint}")
+
+                prompt = (
+                    f"STUB CONCEPT TO ABSORB:\n"
+                    f"Title: \"{stub_c['title']}\"\n"
+                    f"Aliases: {stub_aliases}\n"
+                    f"Full Content:\n{stub_text}\n\n"
+                    f"CANDIDATE PARENT CONCEPTS:\n"
+                    + "\n\n".join(cands_text) + "\n\n"
+                    f"Determine if the stub concept belongs as a subtopic inside one of these candidates, or NONE."
+                )
+
+                raw = await call_llm(
+                    client=client,
+                    model=settings.model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT_STUB_ABSORB},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=512,
+                    args=args,
+                    task="judge",
+                    max_growth=1,
+                )
+
+                choice_m = re.search(r"<parent_choice>\s*(\d+|NONE)\s*</parent_choice>", raw, re.IGNORECASE)
+                choice = choice_m.group(1).upper() if choice_m else "NONE"
+                return stub_c, cands, choice
+
+            absorbed_stub_titles = set()
+
+            async def run_stub_audits():
+                nonlocal absorbed_stubs
+                async with stub_pool:
+                    results = await stub_pool.map(
+                        stub_tasks,
+                        audit_stub,
+                        attempts=settings.attempts,
+                        desc="Absorbing Thin Stubs",
+                        key_fn=lambda t: t[0]["title"],
+                    )
+                    for item in results.results:
+                        stub_c, cands, choice = item
+                        if choice.isdigit():
+                            c_idx = int(choice) - 1
+                            if 0 <= c_idx < len(cands):
+                                parent = cands[c_idx]
+                                # Absorb paragraphs, source_chunks, and add stub title as subtopic
+                                parent["paragraphs"].extend(stub_c.get("paragraphs", []))
+                                for sc in stub_c.get("source_chunks", []):
+                                    if sc not in parent["source_chunks"]:
+                                        parent["source_chunks"].append(sc)
+                                parent["source_chunks"].sort()
+                                if stub_c["title"] not in parent["subtopics"]:
+                                    parent["subtopics"].append(stub_c["title"])
+                                for al in stub_c.get("aliases", []):
+                                    if al not in parent["aliases"] and al.casefold() != parent["title"].casefold():
+                                        parent["aliases"].append(al)
+                                absorbed_stub_titles.add(stub_c["title"])
+                                absorbed_stubs += 1
+
+            try:
+                asyncio.run(run_stub_audits())
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(run_stub_audits())
+
+            if absorbed_stub_titles:
+                global_concepts = [c for c in global_concepts if c["title"] not in absorbed_stub_titles]
+                print(f"Absorbed {absorbed_stubs} thin stub concepts (<50 words) into verified parent concepts via LLM.")
 
     log_data = {
         "summary": {

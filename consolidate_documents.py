@@ -546,6 +546,25 @@ class WikiDocumentConsolidatorPipeline:
         print_concept_word_distribution(all_raw_concepts, title_label="STAGE 5: BEFORE DOCUMENT CONSOLIDATION")
 
         settings = self.settings
+        pbar = None
+
+        def on_attempt_err(attempt: int, exc: BaseException, classification: str, doc_id: str, server_url: str):
+            tqdm.write(f"[{doc_id}] Attempt {attempt} failed on {server_url}: {type(exc).__name__}: {exc}")
+
+        async def wrap_get_merge_clusters(client: Any, item: Dict[str, Any], server_index: int) -> DocumentConsolidationSchema:
+            doc_id = item["doc_id"]
+            num_concepts = len(item["raw_concepts"])
+            server_url = settings.servers[server_index] if server_index < len(settings.servers) else f"server-{server_index}"
+            try:
+                t0 = asyncio.get_event_loop().time()
+                res = await self.get_merge_clusters(client, item, server_index)
+                elapsed = asyncio.get_event_loop().time() - t0
+                tqdm.write(f"✓ [{doc_id}] Finished ({num_concepts} raw concepts -> {len(res.merge_clusters)} merge clusters) in {elapsed:.1f}s on {server_url}")
+                return res
+            except Exception as e:
+                tqdm.write(f"✗ [{doc_id}] Error on {server_url} ({type(e).__name__}: {e})")
+                raise
+
         if not chunking_enabled(self.base_wiki_dir):
             print("Chunking disabled: passing documents through without LLM calls.")
             await self.pass_through(pending)
@@ -560,12 +579,12 @@ class WikiDocumentConsolidatorPipeline:
             async with pool:
                 res = await pool.map(
                     pending,
-                    self.get_merge_clusters,
+                    wrap_get_merge_clusters,
                     attempts=settings.attempts,
                     desc="Consolidating Documents",
                     key_fn=lambda it: it["doc_id"],
                     budget=self.budget,
-                    attempt_timeout=settings.profile.attempt_timeout,
+                    attempt_timeout=min(settings.profile.attempt_timeout, 300.0),
                     on_result=self.persist_consolidation,
                 )
                 res.raise_if_failed(STAGE)
