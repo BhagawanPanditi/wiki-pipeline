@@ -94,62 +94,6 @@ Detailed factual text retaining all numbers, conditions, and mechanisms...
 </decomposition>
 """
 
-SYSTEM_PROMPT_AUDIT_DECOMP = """\
-You are an expert scientific auditor evaluating factual completeness and preservation in a Knowledge Wiki.
-You are comparing the ORIGINAL SOURCE PARAGRAPHS of a broad concept against a CANDIDATE DECOMPOSITION (consisting of an overview Pillar plus Child Concepts).
-
-EVALUATION CRITERIA:
-1. Coverage Score (0 to 100): Percentage of core factual statements, numbers, parameters, conditions, and mechanisms retained.
-2. Missing Source Chunks: Any source chunk present in the original text that was omitted or under-represented.
-3. Missing Facts & Details: Specific technical details, numbers, formulas, or steps in the source that are absent in the decomposition.
-4. Sufficiency: Is the decomposition sufficiently complete to replace the original without factual loss? (true/false)
-
-OUTPUT FORMAT:
-Output ONLY the <audit> XML block:
-<audit>
-<coverage_score>85</coverage_score>
-<is_sufficient>true/false</is_sufficient>
-<missing_chunks>
-- doc_XXXXX_chunk_YYY
-</missing_chunks>
-<missing_facts>
-- Specific factual statement or metric missing...
-</missing_facts>
-</audit>
-If nothing is missing and decomposition is completely sufficient, output:
-<audit>
-<coverage_score>100</coverage_score>
-<is_sufficient>true</is_sufficient>
-<missing_chunks/>
-<missing_facts/>
-</audit>
-"""
-
-SYSTEM_PROMPT_PATCH = """\
-You are an expert scientific editor and fact preservation specialist.
-You are shown a FIRST-PASS DECOMPOSITION of a technical concept, alongside the AUDIT REPORT detailing missing facts and omitted chunks from the original source.
-
-YOUR TASK:
-Output ONLY additive patches (<patch>) containing the missing details identified by the audit.
-DO NOT rewrite what is already good. You only write text to be ADDED.
-
-RULES:
-1. Target: Specify `target="pillar"` or `target="Exact Child Title"`.
-2. Provenance: Every paragraph must specify `source_chunk="doc_XXXXX_chunk_YYY"`.
-3. Content: Complete factual sentences containing the missing metrics, numbers, conditions, and mechanisms.
-4. If an entire chunk was omitted, add a focused paragraph under the best matching child concept (or pillar).
-
-OUTPUT FORMAT:
-<patches>
-<patch target="Exact Child Title or pillar">
-<paragraph source_chunk="doc_XXXXX_chunk_YYY">
-Sentence incorporating the missing metric, parameter, or condition...
-</paragraph>
-</patch>
-</patches>
-If no additions are needed, output exactly: <no_patch/>
-"""
-
 class DecomposedChild(BaseModel):
     title: str
     paragraphs: List[Dict[str, str]] = Field(default_factory=list)
@@ -321,8 +265,7 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
                 "missing_chunks": [],
             }
 
-        # ── MANDATORY REFINEMENT LOOP (ALWAYS RUN) ──────────────────────────
-        # Measure first-pass decomposition quality & completeness
+        # Measure decomposition completeness
         input_chunks = {
             (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
             for p in paras if (p.get("source_chunk") or p.get("doc_id"))
@@ -330,191 +273,29 @@ SOURCE PARAGRAPHS BY SOURCE CHUNK:
         input_chunks.discard("unknown")
         input_chunks.discard("")
 
-        first_pass_paras = list(res.pillar_paragraphs)
-        for ch in res.children:
-            first_pass_paras.extend(ch.paragraphs)
-
-        surviving_chunks = {
-            (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
-            for p in first_pass_paras if (p.get("source_chunk") or p.get("doc_id"))
-        }
-        missing_chunks = sorted(list(input_chunks - surviving_chunks))
-
-        first_pass_words = sum(len((p.get("text") or "").split()) for p in first_pass_paras)
-        first_pass_ratio = round((first_pass_words / words * 100) if words > 0 else 100.0, 1)
-
-        # ── STEP 2: AUDIT / VERIFICATION PASS (The Judge) ───────────────────
-        first_pass_xml_parts = ["<decomposition>\n<pillar>"]
-        for p in res.pillar_paragraphs:
-            sc = p.get("source_chunk") or default_src
-            first_pass_xml_parts.append(f'<paragraph source_chunk="{sc}">\n{p.get("text", "")}\n</paragraph>')
-        first_pass_xml_parts.append("</pillar>")
-        for ch in res.children:
-            first_pass_xml_parts.append(f'<child>\n<title>{ch.title}</title>')
-            for p in ch.paragraphs:
-                sc = p.get("source_chunk") or default_src
-                first_pass_xml_parts.append(f'<paragraph source_chunk="{sc}">\n{p.get("text", "")}\n</paragraph>')
-            first_pass_xml_parts.append("</child>")
-        first_pass_xml_parts.append("</decomposition>")
-        first_pass_xml = "\n".join(first_pass_xml_parts)
-
-        audit_prompt = f"""\
-COMPOSITE CONCEPT TITLE: "{title}"
-ORIGINAL LENGTH: {words} words
-
-ORIGINAL SOURCE PARAGRAPHS BY SOURCE CHUNK:
-{source_presentation}
-
-======================================================================
-CANDIDATE DECOMPOSITION TO EVALUATE:
-======================================================================
-{first_pass_xml}
-
-Evaluate factual coverage, completeness, and list any missing chunks or facts. Output ONLY the <audit> XML block.
-"""
-        audit_raw_text = ""
-        coverage_score = 80.0
-        is_sufficient = False
-        audit_missing_chunks = list(missing_chunks)
-        audit_missing_facts = []
-
-        try:
-            audit_raw_text = await call_llm(
-                client=client,
-                model=self.settings.model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_AUDIT_DECOMP},
-                    {"role": "user", "content": audit_prompt}
-                ],
-                max_tokens=1500,
-                args=self.args,
-                task="judge",
-                max_growth=1,
-            )
-
-            # Parse audit XML
-            cov_m = re.search(r"<coverage_score>(\d+(?:\.\d+)?)</coverage_score>", audit_raw_text, re.IGNORECASE)
-            if cov_m:
-                coverage_score = float(cov_m.group(1))
-
-            suff_m = re.search(r"<is_sufficient>(true|false)</is_sufficient>", audit_raw_text, re.IGNORECASE)
-            if suff_m:
-                is_sufficient = suff_m.group(1).lower() == "true"
-
-            chunks_m = re.search(r"<missing_chunks>(.*?)</missing_chunks>", audit_raw_text, re.DOTALL | re.IGNORECASE)
-            if chunks_m:
-                for line in chunks_m.group(1).splitlines():
-                    cleaned = line.strip().lstrip("-*•").strip()
-                    if cleaned and cleaned not in audit_missing_chunks:
-                        audit_missing_chunks.append(cleaned)
-
-            facts_m = re.search(r"<missing_facts>(.*?)</missing_facts>", audit_raw_text, re.DOTALL | re.IGNORECASE)
-            if facts_m:
-                for line in facts_m.group(1).splitlines():
-                    cleaned = line.strip().lstrip("-*•").strip()
-                    if cleaned and len(cleaned) > 5:
-                        audit_missing_facts.append(cleaned)
-        except Exception:
-            pass
-
-        # ── STEP 3: REFINEMENT / PATCH PASS (The Editor) ───────────────────
-        existing_child_titles = [ch.title for ch in res.children]
-        child_list_str = "\n".join(f"  - {t}" for t in existing_child_titles)
-
-        audit_feedback_lines = [
-            f"Coverage Score: {coverage_score}%",
-            f"Sufficient: {'Yes' if is_sufficient else 'No'}"
-        ]
-        if audit_missing_chunks:
-            audit_feedback_lines.append("Omitted Source Chunks:")
-            audit_feedback_lines.extend(f"  - {c}" for c in audit_missing_chunks)
-        if audit_missing_facts:
-            audit_feedback_lines.append("Missing Facts / Details:")
-            audit_feedback_lines.extend(f"  - {f}" for f in audit_missing_facts[:15])
-
-        audit_feedback_block = "\n".join(audit_feedback_lines)
-
-        patch_prompt = f"""\
-COMPOSITE CONCEPT TITLE: "{title}"
-AVAILABLE TARGETS:
-  - pillar
-{child_list_str}
-
-======================================================================
-AUDIT REPORT:
-======================================================================
-{audit_feedback_block}
-
-ORIGINAL SOURCE PARAGRAPHS BY SOURCE CHUNK:
-{source_presentation}
-
-Output ONLY the <patches> block containing any additions needed to address the audit findings. If no additions are needed, output exactly: <no_patch/>
-"""
-        patch_out_budget = min(4096, max(512, int(len(audit_missing_chunks) * 350 + len(audit_missing_facts) * 60 + 400)))
-
-        try:
-            patch_raw_text = await call_llm(
-                client=client,
-                model=self.settings.model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_PATCH},
-                    {"role": "user", "content": patch_prompt}
-                ],
-                max_tokens=patch_out_budget,
-                args=self.args,
-                task="generate",
-                max_growth=1,
-            )
-
-            if "<no_patch" not in patch_raw_text.lower():
-                patch_blocks = re.findall(r'<patch\s+target="([^"]+)">(.*?)</patch>', patch_raw_text, re.DOTALL | re.IGNORECASE)
-                child_map = {ch.title.lower(): ch for ch in res.children}
-
-                for target_name, p_body in patch_blocks:
-                    tgt = target_name.strip()
-                    p_matches = re.findall(r'<paragraph(?:\s+(?:source_chunk|doc_id)="([^"]+)")?>(.*?)</paragraph>', p_body, re.DOTALL | re.IGNORECASE)
-                    for chunk_attr, p_text in p_matches:
-                        src = chunk_attr.strip().replace("::", "_") if chunk_attr else default_src
-                        did = src.split("_chunk_")[0] if "_chunk_" in src else src
-                        clean_t = re.sub(r"\[\s*(?:doc_|canon_)[A-Za-z0-9_-]+(?:::[^\]]+)?\s*\]", "", p_text).strip()
-                        clean_t = " ".join(clean_t.split())
-                        if clean_t:
-                            patch_dict = {"source_chunk": src, "doc_id": did, "text": clean_t}
-                            if tgt.lower() in ("pillar", "overview"):
-                                res.pillar_paragraphs.append(patch_dict)
-                            elif tgt.lower() in child_map:
-                                child_map[tgt.lower()].paragraphs.append(patch_dict)
-                            else:
-                                res.pillar_paragraphs.append(patch_dict)
-        except Exception:
-            pass
-
-        # Compute post-refinement metrics
         post_paras = list(res.pillar_paragraphs)
         for ch in res.children:
             post_paras.extend(ch.paragraphs)
-        final_surviving_chunks = {
+
+        surviving_chunks = {
             (p.get("source_chunk") or p.get("doc_id") or "").replace("::", "_").strip()
             for p in post_paras if (p.get("source_chunk") or p.get("doc_id"))
         }
-        final_missing = sorted(list(input_chunks - final_surviving_chunks))
-        final_words = sum(len((p.get("text") or "").split()) for p in post_paras)
-        final_ratio = round((final_words / words * 100) if words > 0 else 100.0, 1)
+        missing_chunks = sorted(list(input_chunks - surviving_chunks))
+
+        post_words = sum(len((p.get("text") or "").split()) for p in post_paras)
+        word_ratio = round((post_words / words * 100) if words > 0 else 100.0, 1)
 
         return {
             "title": title,
             "decomposed": res.decomposed,
-            "strategy": "single_shot_refined",
-            "coverage_score": coverage_score,
-            "is_sufficient": is_sufficient,
+            "strategy": "single_shot_direct",
             "pillar_paragraphs": res.pillar_paragraphs,
             "children": [{"title": ch.title, "paragraphs": ch.paragraphs} for ch in res.children],
             "orig_words": words,
-            "first_pass_words": first_pass_words,
-            "first_pass_ratio": first_pass_ratio,
-            "post_words": final_words,
-            "word_ratio": final_ratio,
-            "missing_chunks": final_missing,
+            "post_words": post_words,
+            "word_ratio": word_ratio,
+            "missing_chunks": missing_chunks,
         }
 
     async def run(self):
@@ -691,7 +472,7 @@ Output ONLY the <patches> block containing any additions needed to address the a
 
         print_concept_word_distribution(final_concepts, title_label="STAGE 6b: AFTER SUBTOPIC DECOMPOSITION")
 
-        # ── 50-CONCEPT DECOMPOSITION VERIFICATION AUDIT (BEFORE VS AFTER REFINEMENT) ──
+        # ── 50-CONCEPT DECOMPOSITION VERIFICATION AUDIT ──
         decomposed_records = [
             (t, res) for t, res in results.items()
             if isinstance(res, dict) and res.get("decomposed")
@@ -707,7 +488,7 @@ Output ONLY the <patches> block containing any additions needed to address the a
             "decomposed_count": len(decomposed_records),
             "not_decomposed_count": not_decomposed_count,
             "strategy_breakdown": {
-                "llm_single_shot_refined": single_shot_count,
+                "llm_single_shot_direct": single_shot_count,
                 "map_reduce_fallback": map_reduce_count,
                 "kept_whole": not_decomposed_count,
             },
@@ -720,9 +501,9 @@ Output ONLY the <patches> block containing any additions needed to address the a
         print("STAGE 6b: EXECUTION STRATEGY & DECOMPOSITION AUDIT")
         print("==================================================================")
         print(f"Total Concepts Evaluated (> {threshold}w): {len(results)}")
-        print(f"  - LLM Single-Shot + Mandatory Refinement: {single_shot_count}")
-        print(f"  - Map-Reduce Fallback (Oversized):        {map_reduce_count}")
-        print(f"  - Kept Whole (Atomic / Cannot Decompose): {not_decomposed_count}")
+        print(f"  - LLM Single-Shot Direct:          {single_shot_count}")
+        print(f"  - Map-Reduce Fallback (Oversized): {map_reduce_count}")
+        print(f"  - Kept Whole (Atomic / As-Is):     {not_decomposed_count}")
         print(f"Report Written To: {report_file}")
 
         if decomposed_records:
@@ -733,36 +514,28 @@ Output ONLY the <patches> block containing any additions needed to address the a
             step = max(1, len(sorted_records) // sample_size)
             audit_sample = sorted_records[::step][:sample_size]
 
-            print(f"\nAUDIT SAMPLE: 50-Concept Verification (Pass 1 vs Refined Pass 2)")
-            print(f"{'Concept Title':<35} | {'Orig W':<7} | {'P1 W':<6} | {'P1 %':<6} | {'P2 W':<6} | {'P2 %':<6} | {'Delta':<7} | {'Chunks'}")
-            print("-" * 95)
+            print(f"\nAUDIT SAMPLE: 50-Concept Verification")
+            print(f"{'Concept Title':<38} | {'Orig W':<7} | {'Post W':<7} | {'Ratio %':<8} | {'Chunks'}")
+            print("-" * 75)
 
-            p1_ratios = []
-            p2_ratios = []
+            ratios = []
             intact_chunks_count = 0
 
             for t, r in audit_sample:
                 ow = r.get("orig_words") or 0
-                p1w = r.get("first_pass_words") or r.get("post_words") or 0
-                p1r = r.get("first_pass_ratio") or r.get("word_ratio") or 100.0
-                p2w = r.get("post_words") or 0
-                p2r = r.get("word_ratio") or 100.0
-                delta = round(p2r - p1r, 1)
+                pw = r.get("post_words") or 0
+                ratio = r.get("word_ratio") or 100.0
                 missing = r.get("missing_chunks") or []
                 chunk_status = "100% OK" if not missing else f"-{len(missing)} lost"
                 if not missing:
                     intact_chunks_count += 1
 
-                p1_ratios.append(p1r)
-                p2_ratios.append(p2r)
+                ratios.append(ratio)
+                print(f"{t[:37]:<38} | {ow:<7} | {pw:<7} | {ratio:>6.1f}% | {chunk_status}")
 
-                delta_str = f"+{delta}%" if delta > 0 else f"{delta}%"
-                print(f"{t[:34]:<35} | {ow:<7} | {p1w:<6} | {p1r:>5.1f}% | {p2w:<6} | {p2r:>5.1f}% | {delta_str:>7} | {chunk_status}")
-
-            avg_p1 = sum(p1_ratios) / len(p1_ratios) if p1_ratios else 0.0
-            avg_p2 = sum(p2_ratios) / len(p2_ratios) if p2_ratios else 0.0
-            print("-" * 95)
-            print(f"Sample Average Length Retention: Pass 1 = {avg_p1:.1f}%  ==>  After Refinement = {avg_p2:.1f}%")
+            avg_ratio = sum(ratios) / len(ratios) if ratios else 0.0
+            print("-" * 75)
+            print(f"Sample Average Length Retention: {avg_ratio:.1f}%")
             print(f"Sample Provenance Integrity:     {intact_chunks_count}/{len(audit_sample)} concepts had 100% chunk retention before safety guard.")
             print("==================================================================\n")
 
