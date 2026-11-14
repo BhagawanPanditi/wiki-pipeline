@@ -266,10 +266,18 @@ async def enrich_graph_via_jaccard(
                     existing_relations.append(new_rel)
                     existing_targets.add(new_rel["target_concept"].lower())
 
-        # Sort all outbound relations: highest Jaccard similarity first
+        # Sort all outbound relations using the same multi-key ranking as Stage 10:
+        # 1. Structural / LLM verified (decomposition parent-child)
+        # 2. Title mentions (concept title appears in key entities)
+        # 3. Jaccard similarity score
+        type_rank = {"title_mention": 3, "llm_verified": 2, "subtopic_decomposition": 2, "entity_overlap": 1}
         existing_relations.sort(
-            key=lambda r: (r.get("jaccard_similarity") if r.get("jaccard_similarity") is not None else -1.0),
-            reverse=True
+            key=lambda r: (
+                1 if r.get("verified_by_llm") else 0,
+                type_rank.get(r.get("link_type", ""), 1),
+                float(r.get("jaccard_similarity") or 0.0),
+            ),
+            reverse=True,
         )
         c["outbound_relations"] = existing_relations
 
