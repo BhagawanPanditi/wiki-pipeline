@@ -5,23 +5,32 @@ using spaCy (en_core_web_sm) with parser and NER disabled for high throughput.
 No domain-specific stoplists or hardcoded noun lists.
 """
 
+import threading
 from functools import lru_cache
 
 _nlp_model = None
+_nlp_lock = threading.Lock()
+
+
+def warmup_lemma():
+    """Explicitly pre-load spaCy pipeline ahead of time."""
+    _nlp()
 
 
 def _nlp():
     """Load and cache the spaCy pipeline. Fails loud if missing."""
     global _nlp_model
     if _nlp_model is None:
-        try:
-            import spacy
-            _nlp_model = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-        except Exception as e:
-            raise RuntimeError(
-                f"spaCy or the 'en_core_web_sm' model is missing: {e}. "
-                "Install via: pip install spacy && python -m spacy download en_core_web_sm"
-            ) from e
+        with _nlp_lock:
+            if _nlp_model is None:
+                try:
+                    import spacy
+                    _nlp_model = spacy.load("en_core_web_sm", disable=["parser", "ner"])
+                except Exception as e:
+                    raise RuntimeError(
+                        f"spaCy or the 'en_core_web_sm' model is missing: {e}. "
+                        "Install via: pip install spacy && python -m spacy download en_core_web_sm"
+                    ) from e
     return _nlp_model
 
 

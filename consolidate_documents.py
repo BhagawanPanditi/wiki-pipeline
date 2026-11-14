@@ -27,7 +27,7 @@ from utils.cli import build_parser, resolve_settings
 from utils.concept_ops import fuse_descriptions
 from utils.corpus import chunking_enabled
 from utils.errors import StageBudget
-from utils.lemma import canonical_title_key
+from utils.lemma import canonical_title_key, warmup_lemma
 from utils.llm_params import call_llm
 from utils.llm_pool import pool_for_stage
 from utils.manifest import verify_stage_manifest, write_stage_manifest
@@ -547,6 +547,9 @@ class WikiDocumentConsolidatorPipeline:
 
         # Display Initial Word Distribution before consolidation
         print_concept_word_distribution(all_raw_concepts, title_label="STAGE 5: BEFORE DOCUMENT CONSOLIDATION")
+
+        # Pre-warm spaCy pipeline once in main thread before launching async tasks
+        warmup_lemma()
 
         settings = self.settings
         pbar = None
