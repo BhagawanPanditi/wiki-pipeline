@@ -285,6 +285,12 @@ def global_consolidate(domain_dir: Path, args: Any):
                             c1, c2 = batch[idx]
                             if verdict.is_same_entity:
                                 t1, t2 = c1["title"].strip(), c2["title"].strip()
+                                # Check combined size: do NOT merge if combined size > 700 words unless one is a thin stub (<50 words)
+                                w1 = len((c1.get("description") or "").split())
+                                w2 = len((c2.get("description") or "").split())
+                                if (w1 + w2) > 700 and min(w1, w2) >= 50:
+                                    # Keep separate to avoid creating oversized monster concepts
+                                    continue
                                 uf.union(t1.casefold(), t2.casefold())
                                 approved_merges += 1
                                 # F-10 & N-10: Record LLM's chosen_canonical_title for both members
@@ -369,7 +375,36 @@ def global_consolidate(domain_dir: Path, args: Any):
             "source_chunks": sorted(list(global_source_chunks)),
         })
 
-    # Save summary and global concepts
+    # Absorb thin stubs (< 50 words) into closest parent/subtopic concept if possible
+    valid_concepts = []
+    absorbed_stubs = 0
+    stubs = [c for c in global_concepts if sum(len(p.get("text", "").split()) for p in c.get("paragraphs", [])) < 50]
+    non_stubs = [c for c in global_concepts if sum(len(p.get("text", "").split()) for p in c.get("paragraphs", [])) >= 50]
+    non_stub_map = {c["title"].lower(): c for c in non_stubs}
+
+    for c in global_concepts:
+        w_cnt = sum(len(p.get("text", "").split()) for p in c.get("paragraphs", []))
+        if w_cnt < 50 and non_stubs:
+            # Try to absorb into a matching non-stub by title overlap or subtopics
+            t_words = set(c["title"].lower().split())
+            best_parent = None
+            for p_cand in non_stubs:
+                cand_words = set(p_cand["title"].lower().split())
+                if t_words & cand_words:
+                    best_parent = p_cand
+                    break
+            if best_parent:
+                # Absorb paragraphs and add title as subtopic
+                best_parent["paragraphs"].extend(c.get("paragraphs", []))
+                best_parent["subtopics"].append(c["title"])
+                absorbed_stubs += 1
+                continue
+        valid_concepts.append(c)
+
+    if absorbed_stubs > 0:
+        print(f"Absorbed {absorbed_stubs} thin stub concepts (<50 words) into parent concepts.")
+        global_concepts = valid_concepts
+
     log_data = {
         "summary": {
             "canonical_docs_evaluated": len(doc_files),

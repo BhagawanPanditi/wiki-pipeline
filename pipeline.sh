@@ -221,11 +221,11 @@ run_domain_pipeline() {
             $THINKING_FLAG \
             --resume "${EXTRA_ARGS[@]}"
 
-    # Stage 7: Subtopic Decomposition (Splits >600 word concepts into pillar + subtopics)
+    # Stage 7: Subtopic Decomposition (Splits >=700 word concepts into pillar + subtopics)
     run_stage 7 "Subtopic Decomposition" \
         python3 decompose_large_concepts.py \
             --wiki_path "$wiki_path" \
-            --word_threshold 600 \
+            --word_threshold 700 \
             $THINKING_FLAG \
             --resume "${EXTRA_ARGS[@]}"
 

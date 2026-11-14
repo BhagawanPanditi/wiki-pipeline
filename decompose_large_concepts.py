@@ -61,7 +61,7 @@ STRUCTURE & SUBTOPIC DECOMPOSITION:
 - <child>: Discrete, focused child concepts covering specific subtopics, components, or mechanisms.
 - Use the provided ABSORBED SUBTOPICS as primary candidate guidance for child concept titles and boundaries when supported by substantive paragraphs in the source.
 - Each <child> must represent ONE cohesive topic. NEVER combine two distinct topics into a compound child (e.g., do NOT join unrelated topics with "and" or "&" such as "Prevalence and Genetic Testing").
-- Titles: Child titles must be 1-6 words, Title Case, explicit and self-contained (e.g. "Workstation Lighting", NOT a vague single word or compound topic).
+- Titles: Child titles must be 1-6 words, Title Case, explicit and self-contained naming exactly ONE specific topic. Follow the pattern "<Subject Noun> <Subtopic Specifier>" (e.g. "<Primary System> <Specific Component>"), NOT a vague single word or compound topic.
 - Each fact appears in the child it belongs to, or in the pillar if it is general background. All facts and sentences must be preserved.
 
 ATTRIBUTION:
@@ -232,8 +232,8 @@ class ConceptDecompositionPipeline(OversizedDecomposerMixin):
         # Since output length is ~90-110% of input, estimated output tokens ~= total_tokens
         total_tokens = sum(count_tokens(p.get("text", "")) for p in paras)
         est_output_tokens = int(total_tokens * 1.15) + 300
-        # If output exceeds 4096 (which max_growth=1 doubles to 8192 max), route to map-reduce
-        if total_tokens > self.single_shot_input_budget() or est_output_tokens > 7000:
+        # If output exceeds 12,000 tokens (~9,000 words), route to map-reduce; otherwise decompose in single shot
+        if total_tokens > self.single_shot_input_budget() or est_output_tokens > 12000:
             return await self.decompose_oversized(client, item, paras)
 
         doc_blocks = []
@@ -671,9 +671,9 @@ Output ONLY the <patches> block integrating these exact facts with their source_
 
 
 def main():
-    parser = build_parser(stage=STAGE, description="Decompose broad composite concepts (>600 words) into focused subtopic concepts", include_resume=True)
-    parser.add_argument("--word_threshold", type=int, default=600,
-                        help="Word count threshold above which concepts are decomposed (default: 600 words).")
+    parser = build_parser(stage=STAGE, description="Decompose broad composite concepts (>=700 words) into focused subtopic concepts", include_resume=True)
+    parser.add_argument("--word_threshold", type=int, default=700,
+                        help="Word count threshold above which concepts are decomposed (default: 700 words).")
     args = parser.parse_args()
     pipeline = ConceptDecompositionPipeline(args)
     asyncio.run(pipeline.run())

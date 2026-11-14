@@ -205,6 +205,45 @@ def parse_macro_scan(text: str) -> MacroScanResult:
 
 # ── XML System Prompt for Deep Verification (Domain-Agnostic) ────────────────
 
+SYSTEM_PROMPT_LINK_SELECTION = """\
+You are an expert technical knowledge graph architect.
+You are given a SOURCE CONCEPT (with its title, brief, and key entities), followed by a numbered list of up to 25 CANDIDATE RELATED CONCEPTS.
+
+TASK:
+1. Select between 8 and 20 of the MOST substantive, relevant, and useful related concepts for a reader studying this source concept.
+2. Discard weak, accidental, or purely incidental associations (e.g. sharing only a generic demographic term, broad tool, or common laboratory test).
+3. For each selected concept, write a concise, active relationship phrase (2 to 6 words) explaining how it specifically connects to the source concept.
+
+OUTPUT FORMAT:
+Output ONLY the <selected_links>...</selected_links> XML block:
+<selected_links>
+<link target="Candidate Concept Title">
+<relation>concise active relationship phrase</relation>
+</link>
+</selected_links>
+"""
+
+
+def parse_xml_selected_links(text: str) -> List[Dict[str, str]]:
+    if not text:
+        return []
+    links = []
+    matches = re.findall(r'<link\s+target="([^"]+)">(.*?)</link>', text, re.DOTALL | re.IGNORECASE)
+    for tgt, body in matches:
+        tgt_clean = tgt.strip()
+        rel_m = re.search(r"<relation>(.*?)</relation>", body, re.DOTALL | re.IGNORECASE)
+        rel_text = rel_m.group(1).strip() if rel_m else "directly related topic"
+        # Sanitize phrase
+        words = rel_text.split()
+        if 2 <= len(words) <= 7 and "(" not in rel_text and ")" not in rel_text:
+            clean_phrase = " ".join(words).rstrip(".,;:")
+        else:
+            clean_phrase = "directly related topic"
+        if tgt_clean:
+            links.append({"target_concept": tgt_clean, "relation": clean_phrase})
+    return links
+
+
 SYSTEM_PROMPT_DEEP_VERIFY = """\
 You are an expert knowledge consolidator performing final quality verification.
 You are given a candidate pair or cluster of concepts with their Canonical Titles, Briefs, and Top Entities.
@@ -1123,11 +1162,155 @@ class FinalConsolidationPipeline:
                     filtered_out.append(r)
             c["outbound_relations"] = filtered_out
 
-        directed_link_stats = self._rank_links_and_inject_rescue_backlinks(
-            final_concepts,
-            primary_cap=primary_cap,
-            rescue_slots=rescue_slots,
-        )
+        # 5b. Unified 25-Candidate Menu Preparation & Single-Call LLM Link Selection
+        print(f"\nDistributing across servers for Final LLM Link Selection & Phrasing (up to 25 candidates per concept)...")
+        link_log_file = self.wiki_path / "final_link_selection_log.json"
+        link_checkpoint: Dict[str, List[Dict[str, str]]] = load_json_log(link_log_file) if getattr(self.args, "resume", False) else {}
+
+        items_to_rank = [c for c in final_concepts if c["title"] not in link_checkpoint]
+        print(f"Concepts needing LLM link selection: {len(items_to_rank)} (already cached: {len(final_concepts) - len(items_to_rank)})")
+
+        if items_to_rank and not getattr(self.args, "skip_llm_descriptions", False):
+            link_settings = resolve_settings(self.args, "link-entities")
+            link_pool = pool_for_stage(self.args, link_settings, "link-entities")
+            link_lock = asyncio.Lock()
+
+            async def on_link_result(item: Dict[str, Any], res: List[Dict[str, str]]):
+                t = item["title"]
+                async with link_lock:
+                    link_checkpoint[t] = res
+                    save_log_sync(link_log_file, link_checkpoint)
+
+            async def run_link_selection(client: Any, c: Dict[str, Any], server_index: int) -> List[Dict[str, str]]:
+                t_src = c["title"]
+                b_src = c.get("brief", "") or get_concept_full_text(c)[:250]
+                ents_src = ", ".join(c.get("entities", [])[:10]) or "None"
+
+                # Priority 1: Decomposition Parent/Child
+                decomp_cands = []
+                # Priority 2: Deep Verify Approved Links
+                deep_cands = []
+                # Priority 3: Same-Document Concepts
+                same_doc_cands = []
+                # Priority 4: TF-IDF Cross-Document Overlap
+                cross_doc_cands = []
+
+                seen_targets = {t_src.lower()}
+
+                for rel in c.get("outbound_relations", []):
+                    tgt = rel.get("target_concept", "").strip()
+                    if not tgt or tgt.lower() in seen_targets:
+                        continue
+                    seen_targets.add(tgt.lower())
+
+                    tgt_obj = concept_by_name.get(tgt.lower())
+                    tgt_brief = tgt_obj.get("brief", "") if tgt_obj else ""
+                    if not tgt_brief and tgt_obj:
+                        tgt_brief = get_concept_full_text(tgt_obj)[:200]
+
+                    shared = rel.get("shared_entities", [])
+                    cand_payload = {
+                        "title": tgt,
+                        "brief": tgt_brief,
+                        "shared_entities": shared,
+                        "link_type": rel.get("link_type", ""),
+                        "same_document": rel.get("same_document", False),
+                        "score": rel.get("hybrid_score", 0.0) or rel.get("jaccard_similarity", 0.0),
+                    }
+
+                    if rel.get("link_type") == "subtopic_decomposition":
+                        decomp_cands.append(cand_payload)
+                    elif rel.get("verified_by_llm"):
+                        deep_cands.append(cand_payload)
+                    elif rel.get("same_document"):
+                        same_doc_cands.append(cand_payload)
+                    else:
+                        cross_doc_cands.append(cand_payload)
+
+                # Sort same-doc and cross-doc candidates by score
+                same_doc_cands.sort(key=lambda x: x["score"], reverse=True)
+                cross_doc_cands.sort(key=lambda x: x["score"], reverse=True)
+
+                # Assemble EXACTLY up to 25 total candidates
+                assembled: List[Dict[str, Any]] = []
+                # First add all Decomposition candidates
+                assembled.extend(decomp_cands)
+                # Next add all Deep Verify candidates
+                for d in deep_cands:
+                    if len(assembled) < 25:
+                        assembled.append(d)
+                # Next bubble up Same-Document candidates
+                for s in same_doc_cands:
+                    if len(assembled) < 25:
+                        assembled.append(s)
+                # Fill remaining slots up to 25 from Cross-Document TF-IDF
+                for x in cross_doc_cands:
+                    if len(assembled) < 25:
+                        assembled.append(x)
+
+                if not assembled:
+                    return []
+
+                # Format candidate list for LLM prompt
+                cand_blocks = []
+                for i, cand in enumerate(assembled, 1):
+                    ents_str = f" [Shared: {', '.join(cand['shared_entities'][:4])}]" if cand['shared_entities'] else ""
+                    doc_tag = " (SAME DOCUMENT)" if cand.get("same_document") else ""
+                    cand_blocks.append(f"{i}. \"{cand['title']}\"{doc_tag}{ents_str}\n   Brief: {cand['brief']}")
+
+                prompt = (
+                    f"SOURCE CONCEPT: \"{t_src}\"\n"
+                    f"Brief: {b_src}\n"
+                    f"Key Entities: {ents_src}\n\n"
+                    f"============================================================\n"
+                    f"CANDIDATE RELATED CONCEPTS ({len(assembled)} total options):\n"
+                    f"============================================================\n"
+                    f"{chr(10).join(cand_blocks)}\n\n"
+                    f"Select between 8 and 20 of the most relevant concepts and output the <selected_links> XML block."
+                )
+
+                raw_text = await call_llm(
+                    client=client,
+                    model=link_settings.model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT_LINK_SELECTION},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=link_settings.max_tokens or 1500,
+                    args=self.args,
+                    task="generate",
+                    max_growth=0,
+                )
+                selected = parse_xml_selected_links(raw_text)
+                return selected if selected else [{"target_concept": c["title"], "relation": "directly related topic"} for c in assembled[:15]]
+
+            try:
+                async with link_pool:
+                    await link_pool.map(
+                        items_to_rank,
+                        run_link_selection,
+                        attempts=link_settings.attempts,
+                        desc="LLM Selecting Final Related Links & Phrases",
+                        key_fn=lambda c: c.get("title", ""),
+                        on_result=on_link_result,
+                    )
+            finally:
+                save_log_sync(link_log_file, link_checkpoint)
+
+        # Apply LLM selected links and phrases back to final concepts
+        for c in final_concepts:
+            t = c["title"]
+            if t in link_checkpoint and link_checkpoint[t]:
+                c["outbound_relations"] = [
+                    {
+                        "target_concept": item["target_concept"],
+                        "relation": item["relation"],
+                        "verified_by_llm": True,
+                        "link_type": "llm_selected",
+                    }
+                    for item in link_checkpoint[t]
+                    if item.get("target_concept", "").lower() != t.lower()
+                ]
 
         print(f"Total surviving concepts after final merge & pruning: {len(final_concepts)}")
         atomic_write_json(self.global_concepts_file, {"concepts": final_concepts})

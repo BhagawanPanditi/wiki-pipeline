@@ -39,7 +39,7 @@ ASSIGN_BATCH_TOKENS = 16000
 ASSIGN_SNIPPET_WORDS = 150        # assignment only needs the gist
 MAX_ASSIGN_PER_BATCH = 120
 
-WORDS_PER_CHILD = 2500            # target children ~ total_words / this
+WORDS_PER_CHILD = 700             # target children ~ total_words / this (aligns with 700w standard)
 MAX_CHILDREN = 10
 MAX_CANDIDATES_IN_REDUCE = 80
 
@@ -50,8 +50,7 @@ You are a knowledge architect. You are shown numbered excerpts that all belong t
 concept in a technical wiki. Propose the distinct SUBTOPICS these excerpts naturally fall into.
 
 RULES:
-- Titles: 1-6 words, Title Case, self-contained and specific (e.g. "String Namespace Methods",
-  NOT just "Methods"). A title must never equal the parent concept title.
+- Titles: 1-6 words, Title Case, self-contained and specific naming exactly ONE topic. Follow the pattern "<Subject Noun> <Subtopic Specifier>" (e.g. "<Primary System> <Specific Component>"). A title must never equal the parent concept title.
 - Subtopics must be mutually distinct, not overlapping rewordings of each other.
 - Output ONLY this XML, no commentary:
 <titles>
